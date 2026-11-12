@@ -384,6 +384,8 @@ pub fn lane_provider(lane: borg_provider::subscriptions::Lane) -> CodingProvider
         Lane::Qwen => CodingProvider::Qwen,
         Lane::OpenRouter => CodingProvider::OpenRouter,
         Lane::Vercel => CodingProvider::Vercel,
+        Lane::Grok => CodingProvider::Grok,
+        Lane::Muse => CodingProvider::Muse,
     }
 }
 

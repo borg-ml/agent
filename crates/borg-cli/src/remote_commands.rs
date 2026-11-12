@@ -50,8 +50,8 @@ use crate::editor_preferences::{
 };
 use crate::sleep_inhibitor::{LidSleepStatus, SleepInhibitor, authorize_lid_sleep};
 use crate::terminal_ui::{
-    BorgTerminal, DictationState, ProviderAuthChoice, ResumeSessionOption, TerminalInputEvent,
-    UiAction, discard_pending_terminal_input, icon_style_for_preference, spawn_terminal_io_worker,
+    BorgTerminal, DictationState, ResumeSessionOption, TerminalInputEvent, UiAction,
+    discard_pending_terminal_input, icon_style_for_preference, spawn_terminal_io_worker,
 };
 use borg_ui::localization::UiLanguage;
 
@@ -3231,25 +3231,18 @@ async fn run_local_agent_session(
             && !configured_route
             && !provider_connection_ready(provider).await;
         if credential_preflight_shown {
-            if provider.uses_native_harness() {
-                terminal.set_notice(format!(
-                    "{} is not connected yet · {}",
-                    provider.label(),
-                    credential_guidance(provider)
-                ));
-            } else {
+            if provider_lane(provider).is_some() {
                 let model = model.clone().or_else(|| {
                     provider
                         .model_catalog()
                         .map(|catalog| catalog.default_model.to_string())
                 });
-                if let Some(model) = model {
-                    terminal.open_provider_auth_picker(provider, model);
-                }
+                terminal.connect_provider(provider, model);
+            } else {
                 terminal.set_notice(format!(
-                    "{} is not connected yet · choose how to sign in, or run `borg login {}`",
+                    "{} is not connected yet · {}",
                     provider.label(),
-                    provider_name(provider)
+                    credential_guidance(provider)
                 ));
             }
         }
@@ -3901,17 +3894,8 @@ async fn run_local_agent_session(
                             "{label} sign-in did not finish: {error:#}. The current login is unchanged."
                         )),
                     }
-                    if outcome.is_ok()
-                        && let Some(model) = login.model
-                    {
-                        let target = lane_provider(login.lane);
-                        let active = terminal.session_provider().unwrap_or(provider);
-                        terminal.close_settings();
-                        dispatch_ui_command(
-                            &ui_interaction_tx,
-                            model_selection_command(session_id, terminal.focused_child(), active, target, model.clone()),
-                        );
-                        terminal.open_effort_picker_for(Some(target), Some(&model));
+                    if outcome.is_ok() {
+                        switch_to_pending_model(terminal, login.lane, session_id, provider, &ui_interaction_tx).await;
                     }
                     terminal_dirty = true;
                 }
@@ -6156,159 +6140,13 @@ async fn run_local_agent_session(
                             terminal
                                 .as_mut()
                                 .expect("terminal")
-                                .open_provider_auth_picker(target, model);
+                                .connect_provider(target, Some(model));
                         } else {
                             dispatch_ui_command(
                                 &ui_interaction_tx,
                                 model_selection_command(session_id, terminal.as_ref().and_then(BorgTerminal::focused_child), active, target, model.clone()),
                             );
                             terminal.as_mut().expect("terminal").open_effort_picker_for(Some(target), Some(&model));
-                        }
-                    }
-                    UiAction::AuthenticateProvider {
-                        provider: target,
-                        model,
-                        choice,
-                    } => {
-                        if matches!(
-                            status,
-                            SessionStatus::Starting
-                                | SessionStatus::Running
-                                | SessionStatus::WaitingForApproval
-                        ) {
-                            terminal.as_mut().expect("terminal").set_notice(
-                                "Interrupt the current turn before connecting a provider."
-                                    .to_string(),
-                            );
-                        } else {
-                            let interactive = match provider_auth_requires_terminal(target, choice).await {
-                                Ok(interactive) => interactive,
-                                Err(error) => {
-                                    terminal.as_mut().expect("terminal").set_notice(format!(
-                                        "Could not check saved login: {error}. Credentials were not changed."
-                                    ));
-                                    continue;
-                                }
-                            };
-                            let lane = provider_lane(target);
-                            if interactive
-                                && matches!(target, CodingProvider::Codex | CodingProvider::Claude)
-                                && matches!(
-                                    choice,
-                                    ProviderAuthChoice::Subscription
-                                        | ProviderAuthChoice::ReconnectSubscription
-                                )
-                                && let Some(lane) = lane
-                            {
-                                let terminal = terminal.as_mut().expect("terminal");
-                                if subscription_login.is_some() {
-                                    terminal.set_notice("Finish the sign-in that is already running first.".to_string());
-                                } else {
-                                    if target == CodingProvider::Codex {
-                                        keep_codex_api_key()?;
-                                    }
-                                    let (login, output) = SubscriptionLogin::start(lane, None, Some(model));
-                                    subscription_login = Some(login);
-                                    subscription_login_output = Some(output);
-                                    terminal.begin_subscription_sign_in(lane);
-                                }
-                                terminal_dirty = true;
-                                continue;
-                            }
-                            if interactive
-                                && matches!(
-                                    choice,
-                                    ProviderAuthChoice::ApiKey | ProviderAuthChoice::ReplaceApiKey
-                                )
-                                && let Some(lane) = lane.filter(|lane| {
-                                    lane.key_lane().is_some() || lane.api_key_lane().is_some()
-                                })
-                            {
-                                let terminal = terminal.as_mut().expect("terminal");
-                                terminal.open_subscription_settings(lane);
-                                terminal.set_notice(format!(
-                                    "Name the {} key and paste it below, save it, then select it.",
-                                    lane.label()
-                                ));
-                                terminal_dirty = true;
-                                continue;
-                            }
-                            if interactive {
-                                shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
-                            }
-                            let outcome = authenticate_provider(target, choice).await;
-                            if outcome.is_ok() {
-                                // Authentication changes are part of the
-                                // provider lifecycle. Drop any retained
-                                // native subscription process so the next
-                                // turn cannot accidentally use the old
-                                // credential context.
-                                lifecycle_executor.stop_session(session_id).await?;
-                            }
-                            if interactive {
-                                let latest_state = store.state(session_id).await?;
-                                let latest = recent_tui_history(
-                                    store.as_ref(),
-                                    session_id,
-                                    latest_state.latest_sequence,
-                                )
-                                .await?;
-                                let mut restored = BorgTerminal::enter(
-                                    &sessions_dir,
-                                    session_id,
-                                    cwd.clone(),
-                                    &agent_config.keybindings,
-                                )?;
-                                restored.set_icon_style(icon_style_for_preference(
-                                    editor_preferences.presentation.icons,
-                                ));
-                                restored.set_local_file_links(true);
-                                restored.set_active_message_behavior(steer_active_turn);
-                                restored.set_key_hints(editor_preferences.interaction.key_hints);
-                                restored.set_configured_model_entries(agent_config.configured_model_entries());
-                                restored.set_commit_model_gateways(agent_config.configured_model_gateways());
-                                restored.set_custom_providers(agent_config.providers.clone());
-                                restored.set_helper_preferences(&editor_preferences.interaction);
-                                restored.set_streaming_refresh_rate(u64::from(editor_preferences.presentation.streaming_refresh_rate_fps));
-                                restored.set_extension_commands(extension_catalog.api_snapshot().commands);
-                                let composer_history = store
-                                    .recent_user_messages(session_id, RICH_TUI_PROMPT_HISTORY_LIMIT)
-                                    .await?;
-                                restored.seed_composer_history(&composer_history);
-                                let (_, agents, histories) = load_subagent_thread_state(
-                                    store.as_ref(),
-                                    &sessions_dir,
-                                    session_id,
-                                )
-                                .await?;
-                                restored.seed_team_roster(&agents);
-                                restored.seed_history(&latest.events);
-                                if let Some(live) = live_transcript_events.as_mut() {
-                                    *live = latest.events.iter().cloned().collect();
-                                }
-                                seed_terminal_subagent_threads(&mut restored, &agents, &histories);
-                                restored.seed_session_state(&latest_state);
-                                restored.restore_composer_draft();
-                                terminal = Some(restored);
-                                crash_context.tui_active.store(true, Ordering::Release);
-                            }
-                            let terminal = terminal.as_mut().expect("terminal");
-                            let active = terminal.session_provider().unwrap_or(provider);
-                            terminal.set_notice(match &outcome {
-                                Ok(message) => message.clone(),
-                                Err(error) => format!("Provider not connected: {error:#}"),
-                            });
-                            if outcome.is_ok() {
-                                if target == CodingProvider::OpenCode && !model.starts_with("opencode-go/") {
-                                    terminal.open_model_picker();
-                                } else {
-                                    dispatch_ui_command(
-                                        &ui_interaction_tx,
-                                        model_selection_command(session_id, terminal.focused_child(), active, target, model.clone()),
-                                    );
-                                    terminal.open_effort_picker_for(Some(target), Some(&model));
-                                }
-                            }
                         }
                     }
                     UiAction::SetEffort(effort) => {
@@ -6377,9 +6215,24 @@ async fn run_local_agent_session(
                         );
                     }
                     UiAction::SwitchAccount { lane, kind, account } => {
-                        let notice = match borg_provider::subscriptions::activate(lane, kind, &account)
-                            .await
+                        let outcome =
+                            borg_provider::subscriptions::activate(lane, kind, &account).await;
+                        if outcome.is_ok()
+                            && lane.auth_provider().is_some()
+                            && !matches!(
+                                status,
+                                SessionStatus::Starting
+                                    | SessionStatus::Running
+                                    | SessionStatus::WaitingForApproval
+                            )
                         {
+                            // Billing may have moved between the subscription
+                            // and a key: drop any retained native process so
+                            // the next turn cannot use the old credentials.
+                            lifecycle_executor.stop_session(session_id).await?;
+                        }
+                        let terminal = terminal.as_mut().expect("terminal");
+                        terminal.set_notice(match outcome {
                             Ok(()) => format!(
                                 "{} turns now use {account}{}.",
                                 lane.label(),
@@ -6392,8 +6245,8 @@ async fn run_local_agent_session(
                                 "Could not switch {} to {account}: {error}",
                                 lane.label()
                             ),
-                        };
-                        terminal.as_mut().expect("terminal").set_notice(notice);
+                        });
+                        switch_to_pending_model(terminal, lane, session_id, provider, &ui_interaction_tx).await;
                         terminal_dirty = true;
                     }
                     UiAction::SetAccountStrategy { lane, strategy } => {
@@ -6449,7 +6302,9 @@ async fn run_local_agent_session(
                                     lane.label()
                                 ),
                             };
-                        terminal.as_mut().expect("terminal").set_notice(notice);
+                        let terminal = terminal.as_mut().expect("terminal");
+                        terminal.set_notice(notice);
+                        switch_to_pending_model(terminal, lane, session_id, provider, &ui_interaction_tx).await;
                         terminal_dirty = true;
                     }
                     UiAction::ConnectAccount { lane, account } => {
@@ -6470,7 +6325,7 @@ async fn run_local_agent_session(
                         if subscription_login.is_some() {
                             terminal.set_notice("Finish the sign-in that is already running first.".to_string());
                         } else {
-                            let (login, output) = SubscriptionLogin::start(lane, Some(account), None);
+                            let (login, output) = SubscriptionLogin::start(lane, account);
                                     subscription_login = Some(login);
                                     subscription_login_output = Some(output);
                             terminal.begin_subscription_sign_in(lane);
@@ -6769,10 +6624,17 @@ async fn run_local_agent_session(
                         let result = agent_config_path.as_deref().context("No agent configuration path is available")
                             .and_then(|path| crate::agent_config::save_custom_provider(path, original.as_ref(), Some((&id, &provider))))
                             .and_then(|next| {
-                                if key_changed { borg_provider::credentials::clear_named_provider_api_key(&id)?; }
+                                if key_changed {
+                                    borg_provider::credentials::clear_named_provider_api_key(&id)?;
+                                    borg_provider::key_accounts::forget_custom(&id)?;
+                                }
                                 if let Some((old_id, _)) = &original && old_id != &id {
-                                    if !key_changed && let Some(key) = borg_provider::credentials::named_provider_api_key(old_id) { borg_provider::credentials::store_named_provider_api_key(&id, &key)?; }
+                                    if !key_changed {
+                                        if let Some(key) = borg_provider::credentials::named_provider_api_key(old_id) { borg_provider::credentials::store_named_provider_api_key(&id, &key)?; }
+                                        borg_provider::key_accounts::rename_custom(old_id, &id)?;
+                                    }
                                     borg_provider::credentials::clear_named_provider_api_key(old_id)?;
+                                    borg_provider::key_accounts::forget_custom(old_id)?;
                                 }
                                 Ok(next)
                             });
@@ -6795,11 +6657,45 @@ async fn run_local_agent_session(
                             Err(error) => terminal.custom_provider_save_result(Some(error.to_string())),
                         }
                     }
+                    UiAction::SwitchCustomKey { provider: id, account } => {
+                        let outcome = borg_provider::key_accounts::activate(borg_provider::KeyStore::Custom(id.clone()), &account).map(|_| ());
+                        live_extension_executor.replace_configured_model_gateways(agent_config.configured_model_gateways());
+                        let terminal = terminal.as_mut().expect("terminal");
+                        terminal.set_commit_model_gateways(agent_config.configured_model_gateways());
+                        terminal.set_notice(match outcome {
+                            Ok(()) => format!("{id} turns now use the {account} key."),
+                            Err(error) => format!("Could not switch {id} to {account}: {error}"),
+                        });
+                    }
+                    UiAction::RemoveCustomKey { provider: id, account } => {
+                        let outcome = borg_provider::key_accounts::remove(borg_provider::KeyStore::Custom(id.clone()), &account);
+                        live_extension_executor.replace_configured_model_gateways(agent_config.configured_model_gateways());
+                        let terminal = terminal.as_mut().expect("terminal");
+                        terminal.set_commit_model_gateways(agent_config.configured_model_gateways());
+                        terminal.set_notice(match outcome {
+                            Ok(()) => format!("Removed the {account} key from {id}."),
+                            Err(error) => format!("Could not remove {account} from {id}: {error}"),
+                        });
+                    }
+                    UiAction::AddCustomKey { provider: id, account, key } => {
+                        let outcome = borg_provider::key_accounts::register(borg_provider::KeyStore::Custom(id.clone()), &account, &key).map(|_| ());
+                        live_extension_executor.replace_configured_model_gateways(agent_config.configured_model_gateways());
+                        let terminal = terminal.as_mut().expect("terminal");
+                        terminal.set_commit_model_gateways(agent_config.configured_model_gateways());
+                        terminal.set_notice(match outcome {
+                            Ok(()) => format!("{id} key {account} saved and selected."),
+                            Err(error) => format!("Could not save {account} for {id}: {error}"),
+                        });
+                    }
                     UiAction::DeleteCustomProvider { id, expected } => {
                         let original = (id.clone(), expected);
                         let result = agent_config_path.as_deref().context("No agent configuration path is available")
                             .and_then(|path| crate::agent_config::save_custom_provider(path, Some(&original), None))
-                            .and_then(|next| { borg_provider::credentials::clear_named_provider_api_key(&id)?; Ok(next) });
+                            .and_then(|next| {
+                                borg_provider::credentials::clear_named_provider_api_key(&id)?;
+                                borg_provider::key_accounts::forget_custom(&id)?;
+                                Ok(next)
+                            });
                         let terminal = terminal.as_mut().expect("terminal");
                         match result {
                             Ok(next) => {
@@ -8581,21 +8477,8 @@ async fn run_local_agent_session(
                                     }
                                 }
                                 "/login" | "/connect" if attachments.is_empty() => {
-                                    if matches!(
-                                        status,
-                                        SessionStatus::Starting
-                                            | SessionStatus::Running
-                                            | SessionStatus::WaitingForApproval
-                                    ) {
-                                        terminal.as_mut().expect("terminal").set_notice(
-                                            "Interrupt the current turn before reconnecting the provider."
-                                        );
-                                    } else {
-                                        let latest_state = store.state(session_id).await?;
-                                        let active = terminal.as_ref().and_then(BorgTerminal::session_provider).unwrap_or(provider);
-                                        let model = latest_state.configuration.as_ref().and_then(|config| config.model.clone()).unwrap_or_else(|| active.model_catalog().map(|catalog| catalog.default_model.to_string()).unwrap_or_default());
-                                        terminal.as_mut().expect("terminal").open_provider_auth_picker(active, model);
-                                    }
+                                    let active = terminal.as_ref().and_then(BorgTerminal::session_provider).unwrap_or(provider);
+                                    terminal.as_mut().expect("terminal").connect_provider(active, None);
                                 }
                                 "/quit" | "/exit" if attachments.is_empty() => {
                                     user_requested_exit = true;
@@ -9310,10 +9193,7 @@ pub(crate) async fn login_command(
     let provider: CodingProvider = provider.into();
     match provider {
         CodingProvider::Codex | CodingProvider::Claude | CodingProvider::OpenCode if api_key => {
-            println!(
-                "{}",
-                authenticate_provider(provider, ProviderAuthChoice::ReplaceApiKey).await?
-            );
+            println!("{}", authenticate_provider(provider, true).await?);
         }
         CodingProvider::Anthropic | CodingProvider::OpenRouter | CodingProvider::Vercel => {
             let path = prompt_and_store_api_key(provider)?;
@@ -9324,10 +9204,7 @@ pub(crate) async fn login_command(
         | CodingProvider::OpenCode
         | CodingProvider::Grok
         | CodingProvider::Muse => {
-            println!(
-                "{}",
-                authenticate_provider(provider, ProviderAuthChoice::ReconnectSubscription).await?
-            );
+            println!("{}", authenticate_provider(provider, false).await?);
         }
         CodingProvider::Kimi | CodingProvider::Glm | CodingProvider::Qwen => {
             let plan = coding_plan_for(provider).expect("matched a coding-plan provider");
@@ -9366,7 +9243,7 @@ pub(crate) async fn accounts_command(json: bool) -> Result<()> {
     let mut rows = Vec::new();
     for lane in Lane::ALL
         .into_iter()
-        .filter(|lane| lane.has_subscriptions())
+        .filter(|lane| lane.named_subscriptions())
     {
         rows.push((
             lane,
@@ -9571,46 +9448,12 @@ async fn provider_connection_ready(provider: CodingProvider) -> bool {
     }
 }
 
-async fn provider_auth_requires_terminal(
-    provider: CodingProvider,
-    choice: ProviderAuthChoice,
-) -> Result<bool> {
-    use borg_provider::credentials;
-    Ok(match choice {
-        ProviderAuthChoice::ReplaceApiKey | ProviderAuthChoice::ReconnectSubscription => true,
-        ProviderAuthChoice::ApiKey => match provider {
-            CodingProvider::Codex => credentials::openai_api_key().is_none(),
-            CodingProvider::OpenCode => credentials::opencode_go_api_key().is_none(),
-            CodingProvider::Claude => {
-                credentials::api_key(credentials::ApiKeyCredential::Anthropic).is_none()
-            }
-            _ => true,
-        },
-        ProviderAuthChoice::Subscription => match provider {
-            CodingProvider::Codex => {
-                !borg_provider::provider::read_codex_subscription_status().await?
-            }
-            CodingProvider::Claude => {
-                !borg_remote::provider_subscription_credentials_present(provider)
-            }
-            _ => true,
-        },
-    })
-}
-
-async fn authenticate_provider(
-    provider: CodingProvider,
-    choice: ProviderAuthChoice,
-) -> Result<String> {
+/// `borg login PROVIDER [--api-key]` in a plain terminal: paste a key and bill
+/// it, or sign in and bill the subscription.
+async fn authenticate_provider(provider: CodingProvider, api: bool) -> Result<String> {
     use borg_provider::credentials::{self, OpenAiAuthMode};
-    let api = matches!(
-        choice,
-        ProviderAuthChoice::ApiKey | ProviderAuthChoice::ReplaceApiKey
-    );
     if api {
-        if provider_auth_requires_terminal(provider, choice).await? {
-            prompt_and_store_api_key(provider)?;
-        }
+        prompt_and_store_api_key(provider)?;
         if provider == CodingProvider::Codex {
             credentials::set_openai_auth_mode(OpenAiAuthMode::ApiKey)?;
             return Ok(
@@ -9631,28 +9474,17 @@ async fn authenticate_provider(
                             .to_string()
                     }
                     Err(error) => format!(
-                        "OpenCode Go key saved. Model list unavailable: {error}. Select the Go connection again to retry."
+                        "OpenCode Go key saved. Model list unavailable: {error}. Run `borg login opencode --api-key` again to retry."
                     ),
                 },
             );
         }
-        if let Some(plan) = coding_plan_for(provider) {
-            // Selecting a plan is what routes the profile at the plan's quota
-            // host; a stored key alone would otherwise sit unused.
-            credentials::set_active_subscription(plan.id())?;
-            return Ok(format!(
-                "{} connected · served directly by Borg, no CLI required.",
-                plan.label()
-            ));
-        }
         return Ok(format!("{} API key saved.", provider.label()));
     }
-    if provider_auth_requires_terminal(provider, choice).await? {
-        if provider == CodingProvider::Codex {
-            keep_codex_api_key()?;
-        }
-        login_provider(provider).await?;
+    if provider == CodingProvider::Codex {
+        keep_codex_api_key()?;
     }
+    login_provider(provider).await?;
     select_subscription_billing(provider)
 }
 
@@ -9684,14 +9516,47 @@ fn select_subscription_billing(provider: CodingProvider) -> Result<String> {
     Ok(format!("Connected {}.", provider.label()))
 }
 
+/// Switch to the model that was waiting for a login on `lane`, once its
+/// provider can actually serve a turn.
+async fn switch_to_pending_model(
+    terminal: &mut BorgTerminal,
+    lane: borg_provider::subscriptions::Lane,
+    session_id: Uuid,
+    fallback: CodingProvider,
+    operations: &mpsc::UnboundedSender<UiInteractionOperation>,
+) {
+    let Some((target, model)) = terminal.pending_model(lane) else {
+        return;
+    };
+    if !provider_connection_ready(target).await {
+        return;
+    }
+    terminal.clear_pending_model();
+    terminal.close_settings();
+    if target == CodingProvider::OpenCode && !model.starts_with("opencode-go/") {
+        terminal.open_model_picker();
+        return;
+    }
+    let active = terminal.session_provider().unwrap_or(fallback);
+    dispatch_ui_command(
+        operations,
+        model_selection_command(
+            session_id,
+            terminal.focused_child(),
+            active,
+            target,
+            model.clone(),
+        ),
+    );
+    terminal.open_effort_picker_for(Some(target), Some(&model));
+}
+
 /// A subscription sign-in running beside the TUI, so the screen stays live
 /// while the provider waits for the browser.
 struct SubscriptionLogin {
     lane: borg_provider::subscriptions::Lane,
     /// The login being added, or `None` to sign the current one in again.
     account: Option<String>,
-    /// The model the user picked before being asked to sign in.
-    model: Option<String>,
     task: tokio::task::JoinHandle<Result<()>>,
 }
 
@@ -9699,7 +9564,6 @@ impl SubscriptionLogin {
     fn start(
         lane: borg_provider::subscriptions::Lane,
         account: Option<String>,
-        model: Option<String>,
     ) -> (Self, mpsc::UnboundedReceiver<String>) {
         let (output_tx, output) = mpsc::unbounded_channel();
         let provider = lane_provider(lane);
@@ -9719,7 +9583,6 @@ impl SubscriptionLogin {
             Self {
                 lane,
                 account,
-                model,
                 task,
             },
             output,

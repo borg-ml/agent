@@ -615,7 +615,7 @@ impl AgentConfig {
                     .api_key_env
                     .as_deref()
                     .and_then(|name| std::env::var(name).ok())
-                    .or_else(|| borg_provider::credentials::named_provider_api_key(provider_id))
+                    .or_else(|| borg_provider::key_accounts::custom_provider_key(provider_id))
                     .or_else(|| provider.api_key.clone())
                     .unwrap_or_default();
                 let endpoint = chat_completions_endpoint(&provider.base_url);

@@ -9,6 +9,9 @@ pub(super) struct ProviderEditor {
     model: Option<ModelEditor>,
     confirm_delete: bool,
     key_changed: bool,
+    /// The next named key, typed on a saved provider's page.
+    login_name: String,
+    login_key: String,
 }
 
 struct ModelEditor {
@@ -63,7 +66,7 @@ pub(super) fn list_rows(providers: &BTreeMap<String, ConfiguredProvider>) -> Vec
                 }
             )
         } else if provider.api_key.is_some()
-            || borg_provider::credentials::named_provider_api_key(id).is_some()
+            || borg_provider::key_accounts::custom_provider_key(id).is_some()
         {
             "saved key".into()
         } else {
@@ -91,7 +94,81 @@ pub(super) fn list_rows(providers: &BTreeMap<String, ConfiguredProvider>) -> Vec
     rows
 }
 
-pub(super) fn editor_rows(editor: &ProviderEditor) -> Vec<SettingRow> {
+/// A saved custom provider's keys, as the rows every provider's logins use.
+fn login_rows(
+    id: &str,
+    editor: &ProviderEditor,
+    confirm_remove: Option<SettingId>,
+) -> Vec<SettingRow> {
+    use SettingId as Id;
+    let accounts =
+        borg_provider::key_accounts::list(borg_provider::KeyStore::Custom(id.to_string()))
+            .unwrap_or_default();
+    let mut rows: Vec<SettingRow> = accounts
+        .iter()
+        .enumerate()
+        .map(|(index, account)| {
+            let row_id = Id::ProviderLogin(index);
+            let mut login = action(
+                row_id,
+                "",
+                &format!(
+                    "{}{} Delete removes it.",
+                    if account.active {
+                        "Turns on this provider use this key now."
+                    } else {
+                        "Enter makes this the key turns spend."
+                    },
+                    if editor.provider.api_key_env.is_some() {
+                        " The environment variable above takes precedence."
+                    } else {
+                        ""
+                    }
+                ),
+                if confirm_remove == Some(row_id) {
+                    format!("Press Delete again to remove {}", account.name)
+                } else {
+                    "API key".to_string()
+                },
+            );
+            login.label = format!(
+                "{} {}",
+                if account.active { "●" } else { "○" },
+                account.name
+            )
+            .into();
+            login
+        })
+        .collect();
+    rows.push(text(
+        Id::ProviderLoginName,
+        "New login name",
+        "Name for the next key: 1-40 letters, digits, '-' or '_'.",
+        &editor.login_name,
+    ));
+    rows.push(row(
+        Id::ProviderLoginKey,
+        "New login key",
+        "The key for that login. It is kept in Borg's credential store, never in a session or a journal.",
+        SettingControl::Secret(if editor.login_key.is_empty() {
+            String::new()
+        } else {
+            "•".repeat(editor.login_key.chars().count().min(24))
+        }),
+    ));
+    rows.push(action(
+        Id::ProviderLoginSave,
+        "Add API key",
+        "Keep this key under the name above and select it. Takes effect at once; nothing else in the draft is saved.",
+        "Save API key",
+    ));
+    rows
+}
+
+pub(super) fn editor_rows(
+    editor: &ProviderEditor,
+    confirm_remove: Option<SettingId>,
+) -> Vec<SettingRow> {
     use SettingId as Id;
     if let Some(model) = &editor.model {
         let optional = |value: Option<u64>| value.map(|v| v.to_string()).unwrap_or_default();
@@ -196,20 +273,6 @@ pub(super) fn editor_rows(editor: &ProviderEditor) -> Vec<SettingRow> {
             "Recommended: environment-variable name, e.g. WORK_API_KEY. Choosing this removes any inline key. Leave both key fields blank for no authentication.",
             provider.api_key_env.as_deref().unwrap_or_default(),
         ),
-        row(
-            Id::ProviderKey,
-            "API key",
-            "Paste a replacement key into your private agent config. Blank keeps the saved key; Clear authentication removes it. Keys stay masked. A new key clears the environment reference.",
-            SettingControl::Secret(provider.api_key.clone().unwrap_or_else(|| {
-                if !editor.key_changed
-                    && borg_provider::credentials::named_provider_api_key(&editor.id).is_some()
-                {
-                    "saved in credential store".into()
-                } else {
-                    String::new()
-                }
-            })),
-        ),
         action(
             Id::ProviderClearAuth,
             "Clear authentication",
@@ -233,6 +296,34 @@ pub(super) fn editor_rows(editor: &ProviderEditor) -> Vec<SettingRow> {
             "Add model…",
         ),
     ];
+    // A saved provider keeps named keys like every other provider; a draft,
+    // or one whose key is inline in the config file, edits the single key.
+    let key_at = rows
+        .iter()
+        .position(|row| row.id == Id::ProviderClearAuth)
+        .expect("the draft offers Clear authentication");
+    match &editor.original {
+        Some((id, _)) if provider.api_key.is_none() => {
+            rows.splice(key_at..key_at, login_rows(id, editor, confirm_remove));
+        }
+        _ => rows.insert(
+            key_at,
+        row(
+            Id::ProviderKey,
+            "API key",
+            "Paste a replacement key into your private agent config. Blank keeps the saved key; Clear authentication removes it. Keys stay masked. A new key clears the environment reference.",
+            SettingControl::Secret(provider.api_key.clone().unwrap_or_else(|| {
+                if !editor.key_changed
+                    && borg_provider::credentials::named_provider_api_key(&editor.id).is_some()
+                {
+                    "saved in credential store".into()
+                } else {
+                    String::new()
+                }
+            })),
+        ),
+        ),
+    }
     for (index, (id, model)) in provider.models.iter().enumerate() {
         rows.push(action(
             Id::ProviderModelEntry(index),
@@ -249,6 +340,23 @@ pub(super) fn editor_rows(editor: &ProviderEditor) -> Vec<SettingRow> {
 }
 
 impl SettingsScreen {
+    /// The removal a Delete on a saved custom provider's key row asks for.
+    pub(super) fn custom_removal(&self, id: SettingId) -> Option<UiAction> {
+        let SettingId::ProviderLogin(index) = id else {
+            return None;
+        };
+        let (provider, _) = self.provider_editor.as_ref()?.original.as_ref()?;
+        let account =
+            borg_provider::key_accounts::list(borg_provider::KeyStore::Custom(provider.clone()))
+                .ok()?
+                .into_iter()
+                .nth(index)?;
+        Some(UiAction::RemoveCustomKey {
+            provider: provider.clone(),
+            account: account.name,
+        })
+    }
+
     pub(super) fn provider_action(&mut self, id: SettingId) -> Option<SettingsEffect> {
         use SettingId as Id;
         match id {
@@ -260,6 +368,8 @@ impl SettingsScreen {
                     model: None,
                     confirm_delete: false,
                     key_changed: false,
+                    login_name: String::new(),
+                    login_key: String::new(),
                 })
             }
             Id::ProviderEntry(index) => {
@@ -271,6 +381,8 @@ impl SettingsScreen {
                     model: None,
                     confirm_delete: false,
                     key_changed: false,
+                    login_name: String::new(),
+                    login_key: String::new(),
                 });
             }
             Id::ProviderBack => {
@@ -279,6 +391,45 @@ impl SettingsScreen {
                 } else {
                     self.provider_editor = None;
                 }
+            }
+            Id::ProviderLogin(index) => {
+                let editor = self.provider_editor.as_ref()?;
+                let (id, _) = editor.original.as_ref()?;
+                let account =
+                    borg_provider::key_accounts::list(borg_provider::KeyStore::Custom(id.clone()))
+                        .ok()?
+                        .into_iter()
+                        .nth(index)?;
+                return Some(if account.active {
+                    SettingsEffect::None
+                } else {
+                    SettingsEffect::Apply(Box::new(UiAction::SwitchCustomKey {
+                        provider: id.clone(),
+                        account: account.name,
+                    }))
+                });
+            }
+            Id::ProviderLoginSave => {
+                let editor = self.provider_editor.as_mut()?;
+                let (id, _) = editor.original.as_ref()?;
+                let notice = if editor.login_name.trim().is_empty() {
+                    Some("Type a name for the new key first.")
+                } else if editor.login_key.trim().is_empty() {
+                    Some("Paste the key for that login first.")
+                } else {
+                    None
+                };
+                if let Some(notice) = notice {
+                    return Some(SettingsEffect::Apply(Box::new(UiAction::Notice(
+                        notice.to_string(),
+                    ))));
+                }
+                let action = UiAction::AddCustomKey {
+                    provider: id.clone(),
+                    account: std::mem::take(&mut editor.login_name).trim().to_string(),
+                    key: std::mem::take(&mut editor.login_key).trim().to_string(),
+                };
+                return Some(SettingsEffect::Apply(Box::new(action)));
             }
             Id::ProviderClearAuth => {
                 let editor = self.provider_editor.as_mut()?;
@@ -378,6 +529,8 @@ impl SettingsScreen {
                 | Id::ProviderEndpoint
                 | Id::ProviderKeyEnv
                 | Id::ProviderKey
+                | Id::ProviderLoginName
+                | Id::ProviderLoginKey
                 | Id::ProviderHeaders
                 | Id::ProviderModelId
                 | Id::ProviderModelName
@@ -423,6 +576,18 @@ impl SettingsScreen {
                         editor.provider.api_key = optional();
                         editor.provider.api_key_env = None;
                         editor.key_changed = true;
+                    }
+                }
+                Id::ProviderLoginName => {
+                    if !value.is_empty() {
+                        borg_provider::subscription_accounts::validate_name(value)
+                            .map_err(|error| error.to_string())?;
+                    }
+                    editor.login_name = value.to_string();
+                }
+                Id::ProviderLoginKey => {
+                    if !value.is_empty() {
+                        editor.login_key = value.to_string();
                     }
                 }
                 Id::ProviderHeaders => {
@@ -505,7 +670,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(screen.custom_providers.is_empty());
-        let rows = editor_rows(screen.provider_editor.as_ref().unwrap());
+        let rows = editor_rows(screen.provider_editor.as_ref().unwrap(), None);
         screen.selected = rows
             .iter()
             .position(|row| row.id == SettingId::ProviderKey)

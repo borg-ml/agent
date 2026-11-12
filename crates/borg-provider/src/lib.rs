@@ -23,7 +23,7 @@ mod env;
 pub mod subprocess;
 
 pub use auth::{ProviderAuthBundle, ProviderAuthFile, ProviderAuthProvider};
-pub use key_accounts::{KeyAccount, KeyLane};
+pub use key_accounts::{KeyAccount, KeyLane, KeyStore};
 pub use provider_bin::{Runtime, command as runtime_command, executable as runtime_executable};
 pub use provider_install::Healed;
 pub use runtime::{

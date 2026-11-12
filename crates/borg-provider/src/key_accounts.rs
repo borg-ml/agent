@@ -101,42 +101,80 @@ impl KeyLane {
     }
 }
 
-/// One subscription key connected under a name.
+/// Where one set of named keys is kept: a built-in key lane, or a custom
+/// OpenAI-compatible provider by its configured id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeyStore {
+    Lane(KeyLane),
+    Custom(String),
+}
+
+impl From<KeyLane> for KeyStore {
+    fn from(lane: KeyLane) -> Self {
+        KeyStore::Lane(lane)
+    }
+}
+
+impl KeyStore {
+    /// Prefix of every credential-store entry of this set.
+    fn id(&self) -> String {
+        match self {
+            KeyStore::Lane(lane) => lane.id().to_string(),
+            KeyStore::Custom(id) => format!("provider:{id}"),
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            KeyStore::Lane(lane) => lane.label().to_string(),
+            KeyStore::Custom(id) => id.clone(),
+        }
+    }
+
+    /// The single key kept before named keys existed, reported as `default`.
+    fn legacy(&self) -> Option<String> {
+        match self {
+            KeyStore::Lane(lane) => credentials::stored_api_key(lane.credential()),
+            KeyStore::Custom(id) => credentials::named_provider_api_key(id),
+        }
+    }
+
+    fn account_key(&self, name: &str) -> String {
+        format!("{}_account_{name}", self.id())
+    }
+
+    fn selection_key(&self) -> String {
+        format!("{}_account", self.id())
+    }
+
+    fn used_key(&self, name: &str) -> String {
+        format!("{}_account_used_{name}", self.id())
+    }
+}
+
+/// One key connected under a name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyAccount {
-    pub lane: KeyLane,
     pub name: String,
     pub active: bool,
 }
 
-fn account_key(lane: KeyLane, name: &str) -> String {
-    format!("{}_account_{name}", lane.id())
-}
-
-fn selection_key(lane: KeyLane) -> String {
-    format!("{}_account", lane.id())
-}
-
-fn used_key(lane: KeyLane, name: &str) -> String {
-    format!("{}_account_used_{name}", lane.id())
-}
-
-/// Every named subscription key for `lane`, with the one whose key the next
-/// turn spends marked active. A lane that only has the single legacy key is
-/// reported as one `default` login, so a user who connected before named
-/// accounts never has to re-enter a key.
-pub fn list(lane: KeyLane) -> Result<Vec<KeyAccount>> {
-    let mut accounts = named(lane)?;
-    if accounts.is_empty() && credentials::stored_api_key(lane.credential()).is_some() {
+/// Every named key in `store`, with the one the next turn spends marked
+/// active. A store that only has the single legacy key is reported as one
+/// `default` login, so a user who connected before named keys never has to
+/// re-enter a key.
+pub fn list(store: impl Into<KeyStore>) -> Result<Vec<KeyAccount>> {
+    let store = store.into();
+    let mut accounts = named(&store)?;
+    if accounts.is_empty() && store.legacy().is_some() {
         accounts.push(KeyAccount {
-            lane,
             name: "default".to_owned(),
             active: true,
         });
     }
     // With no selection stored, the single legacy key is what turns spend, so
     // `default` is the active login rather than an unmarked row.
-    let selected = selected_name(lane)?;
+    let selected = selected_name(store)?;
     for account in &mut accounts {
         account.active = match selected.as_deref() {
             Some(name) => account.name == name,
@@ -148,9 +186,9 @@ pub fn list(lane: KeyLane) -> Result<Vec<KeyAccount>> {
 }
 
 /// The named logins in the store, without the synthesized legacy one.
-fn named(lane: KeyLane) -> Result<Vec<KeyAccount>> {
+fn named(store: &KeyStore) -> Result<Vec<KeyAccount>> {
     let values = credentials::stored_values()?;
-    let prefix = format!("{}_account_", lane.id());
+    let prefix = format!("{}_account_", store.id());
     Ok(values
         .keys()
         .filter_map(|key| {
@@ -160,7 +198,6 @@ fn named(lane: KeyLane) -> Result<Vec<KeyAccount>> {
             // not logins.
             (!name.starts_with("used_") && name != crate::subscription_accounts::STRATEGY).then(
                 || KeyAccount {
-                    lane,
                     name: name.to_owned(),
                     active: false,
                 },
@@ -170,20 +207,21 @@ fn named(lane: KeyLane) -> Result<Vec<KeyAccount>> {
 }
 
 /// The selected login name, if one was ever selected on this host.
-pub fn selected_name(lane: KeyLane) -> Result<Option<String>> {
+pub fn selected_name(store: impl Into<KeyStore>) -> Result<Option<String>> {
     Ok(credentials::stored_values()?
-        .get(&selection_key(lane))
+        .get(&store.into().selection_key())
         .map(|name| name.trim().to_string())
         .filter(|name| !name.is_empty()))
 }
 
-/// The key the next turn spends: the selected login's key. Resolution order is
-/// environment, selected account, legacy single key, so an operator's variable
-/// is never shadowed and an unnamed lane keeps working.
-pub fn selected_key(lane: KeyLane) -> Option<String> {
+/// The selected login's key. Callers resolve the environment first and the
+/// legacy single key last, so an operator's variable is never shadowed and an
+/// unnamed store keeps working.
+pub fn selected_key(store: impl Into<KeyStore>) -> Option<String> {
+    let store = store.into();
     let values = credentials::stored_values().ok()?;
-    let name = values.get(&selection_key(lane))?.trim();
-    let key = values.get(&account_key(lane, name))?;
+    let name = values.get(&store.selection_key())?.trim();
+    let key = values.get(&store.account_key(name))?;
     let key = key.trim();
     (!key.is_empty()).then(|| key.to_string())
 }
@@ -192,93 +230,137 @@ pub fn selected_key(lane: KeyLane) -> Option<String> {
 ///
 /// A usage probe is per subscription: several named logins each report their
 /// own allowance, so the selected key is not enough. `default` falls back to the
-/// lane's single legacy key, which is the login [`list`] synthesizes for a lane
-/// that was connected before named accounts existed.
-pub fn key(lane: KeyLane, name: &str) -> Option<String> {
+/// single legacy key, which is the login [`list`] synthesizes for a store that
+/// was connected before named keys existed.
+pub fn key(store: impl Into<KeyStore>, name: &str) -> Option<String> {
+    let store = store.into();
     let values = credentials::stored_values().ok()?;
     if let Some(key) = values
-        .get(&account_key(lane, name))
+        .get(&store.account_key(name))
         .map(|key| key.trim())
         .filter(|key| !key.is_empty())
     {
         return Some(key.to_string());
     }
-    (name == "default")
-        .then(|| credentials::stored_api_key(lane.credential()))
-        .flatten()
+    (name == "default").then(|| store.legacy()).flatten()
 }
 
-/// The selected key for any credential backed by a key-billed subscription.
+/// The selected key for any credential backed by named keys.
 pub fn selected_key_for_credential(credential: ApiKeyCredential) -> Option<String> {
     KeyLane::for_credential(credential).and_then(selected_key)
+}
+
+/// The key a custom provider spends: its selected named key, or the single key
+/// it was saved with.
+pub fn custom_provider_key(id: &str) -> Option<String> {
+    selected_key(KeyStore::Custom(id.to_string()))
+        .or_else(|| credentials::named_provider_api_key(id))
+}
+
+/// Every credential-store entry of a custom provider's named keys.
+fn custom_entries(id: &str) -> Result<Vec<(String, String)>> {
+    let store = KeyStore::Custom(id.to_string());
+    let selection = store.selection_key();
+    let prefix = format!("{selection}_");
+    Ok(credentials::stored_values()?
+        .into_iter()
+        .filter(|(key, _)| *key == selection || key.starts_with(&prefix))
+        .collect())
+}
+
+/// Forget every named key of a custom provider, as when it is removed or its
+/// authentication is cleared.
+pub fn forget_custom(id: &str) -> Result<()> {
+    let entries = custom_entries(id)?;
+    let keys: Vec<&str> = entries.iter().map(|(key, _)| key.as_str()).collect();
+    if !keys.is_empty() {
+        credentials::clear_values(&keys)?;
+    }
+    Ok(())
+}
+
+/// Move a custom provider's named keys to its new id.
+pub fn rename_custom(from: &str, to: &str) -> Result<()> {
+    let old = KeyStore::Custom(from.to_string()).id();
+    let new = KeyStore::Custom(to.to_string()).id();
+    let moved: Vec<(String, String)> = custom_entries(from)?
+        .into_iter()
+        .map(|(key, value)| (format!("{new}{}", &key[old.len()..]), value))
+        .collect();
+    let pairs: Vec<(&str, &str)> = moved
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    if !pairs.is_empty() {
+        credentials::store_values(&pairs)?;
+    }
+    forget_custom(from)
 }
 
 /// Connect `name` with `key` and select it. The selection is written in the
 /// same locked update as the key, so no turn can observe a name without its
 /// key.
-pub fn register(lane: KeyLane, name: &str, key: &str) -> Result<KeyAccount> {
+pub fn register(store: impl Into<KeyStore>, name: &str, key: &str) -> Result<KeyAccount> {
+    let store = store.into();
     crate::subscription_accounts::validate_name(name)?;
     let key = key.trim();
-    ensure!(!key.is_empty(), "the subscription key cannot be empty");
-    // A lane connected before named accounts keeps its key under `default`, so
-    // adding a second subscription never hides the first.
-    if named(lane)?.is_empty()
-        && let Some(legacy) = credentials::stored_api_key(lane.credential())
+    ensure!(!key.is_empty(), "the key cannot be empty");
+    // A store connected before named keys keeps its key under `default`, so
+    // adding a second key never hides the first.
+    if named(&store)?.is_empty()
+        && let Some(legacy) = store.legacy()
     {
-        credentials::store_values(&[(&account_key(lane, "default"), &legacy)])?;
+        credentials::store_values(&[(&store.account_key("default"), &legacy)])?;
     }
     credentials::store_values(&[
-        (&account_key(lane, name), key),
-        (&selection_key(lane), name),
+        (&store.account_key(name), key),
+        (&store.selection_key(), name),
     ])?;
     Ok(KeyAccount {
-        lane,
         name: name.to_owned(),
         active: true,
     })
 }
 
-/// Point `lane` at another connected subscription key.
-pub fn activate(lane: KeyLane, name: &str) -> Result<KeyAccount> {
+/// Point `store` at another connected key.
+pub fn activate(store: impl Into<KeyStore>, name: &str) -> Result<KeyAccount> {
+    let store = store.into();
     crate::subscription_accounts::validate_name(name)?;
-    let account = list(lane)?
+    let account = list(store.clone())?
         .into_iter()
         .find(|account| account.name == name)
-        .with_context(|| format!("no connected {} subscription named {name}", lane.label()))?;
+        .with_context(|| format!("no connected {} key named {name}", store.label()))?;
     if account.active {
         return Ok(account);
     }
-    credentials::store_values(&[(&selection_key(lane), name)])?;
-    mark_used(lane, name)?;
+    credentials::store_values(&[(&store.selection_key(), name)])?;
+    mark_used(store, name)?;
     Ok(KeyAccount {
-        lane,
         name: account.name,
         active: true,
     })
 }
 
-/// Disconnect a named subscription key. Removing the selected login selects
-/// another connected one, or clears the selection so the legacy key applies.
-pub fn remove(lane: KeyLane, name: &str) -> Result<()> {
+/// Disconnect a named key. Removing the selected login selects another
+/// connected one, or clears the selection so the legacy key applies.
+pub fn remove(store: impl Into<KeyStore>, name: &str) -> Result<()> {
+    let store = store.into();
     crate::subscription_accounts::validate_name(name)?;
-    let accounts = list(lane)?;
+    let accounts = list(store.clone())?;
     let removed = accounts
         .iter()
         .find(|account| account.name == name)
-        .with_context(|| format!("no connected {} subscription named {name}", lane.label()))?;
+        .with_context(|| format!("no connected {} key named {name}", store.label()))?;
     if accounts.len() == 1 && !accounts.iter().any(|account| account.name == "default") {
-        bail!(
-            "cannot remove the only connected {} subscription",
-            lane.label()
-        );
+        bail!("cannot remove the only connected {} key", store.label());
     }
-    credentials::clear_values(&[&account_key(lane, name), &used_key(lane, name)])?;
+    credentials::clear_values(&[&store.account_key(name), &store.used_key(name)])?;
     if removed.active {
         match accounts.iter().find(|account| account.name != name) {
             Some(next) => {
-                credentials::store_values(&[(&selection_key(lane), &next.name)])?;
+                credentials::store_values(&[(&store.selection_key(), &next.name)])?;
             }
-            None => credentials::clear_values(&[&selection_key(lane)])?,
+            None => credentials::clear_values(&[&store.selection_key()])?,
         }
     }
     Ok(())
@@ -286,20 +368,20 @@ pub fn remove(lane: KeyLane, name: &str) -> Result<()> {
 
 /// When this login last served a turn, for balancing lanes whose provider
 /// reports no quota.
-pub fn last_used(lane: KeyLane, name: &str) -> Result<Option<u64>> {
+pub fn last_used(store: impl Into<KeyStore>, name: &str) -> Result<Option<u64>> {
     Ok(credentials::stored_values()?
-        .get(&used_key(lane, name))
+        .get(&store.into().used_key(name))
         .and_then(|value| value.trim().parse::<u64>().ok()))
 }
 
 /// Record that a turn just spent this login, so the next turn prefers another.
-pub fn mark_used(lane: KeyLane, name: &str) -> Result<()> {
+pub fn mark_used(store: impl Into<KeyStore>, name: &str) -> Result<()> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or_default();
     let stamp = now.to_string();
-    credentials::store_values(&[(&used_key(lane, name), stamp.as_str())])?;
+    credentials::store_values(&[(&store.into().used_key(name), stamp.as_str())])?;
     Ok(())
 }
 
@@ -316,6 +398,35 @@ mod tests {
             std::env::remove_var("OPENCODE_GO_API_KEY");
         }
         (guard, home)
+    }
+
+    // A custom endpoint's keys follow it: the selected one is what turns
+    // spend, a rename keeps them, and removing the endpoint forgets them.
+    #[tokio::test]
+    async fn custom_provider_keys_follow_the_provider() {
+        let (_guard, _home) = scratch_home().await;
+        credentials::store_named_provider_api_key("work", "sk-legacy").unwrap();
+        let store = || KeyStore::Custom("work".to_string());
+        register(store(), "second", "sk-second").unwrap();
+        assert_eq!(custom_provider_key("work").as_deref(), Some("sk-second"));
+        activate(store(), "default").unwrap();
+        assert_eq!(custom_provider_key("work").as_deref(), Some("sk-legacy"));
+        rename_custom("work", "office").unwrap();
+        let moved: Vec<_> = list(KeyStore::Custom("office".to_string()))
+            .unwrap()
+            .into_iter()
+            .map(|account| (account.name, account.active))
+            .collect();
+        assert_eq!(
+            moved,
+            [("default".to_string(), true), ("second".to_string(), false)]
+        );
+        forget_custom("office").unwrap();
+        assert!(
+            list(KeyStore::Custom("office".to_string()))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // The switching policy is stored under the logins' own prefix; it must

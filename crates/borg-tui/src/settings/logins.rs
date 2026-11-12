@@ -282,16 +282,18 @@ pub(crate) fn detail_rows(
             },
         ));
     }
-    rows.push(row(
-        Id::LaneName(position),
-        "New login name",
-        "Name for the next login: 1-40 letters, digits, '-' or '_'.".to_string(),
-        SettingControl::Text(editor.name(lane).to_string()),
-    ));
     let key_kinds: Vec<AccountKind> = [AccountKind::Subscription, AccountKind::ApiKey]
         .into_iter()
         .filter(|kind| lane.keys(*kind).is_some())
         .collect();
+    if lane.auth_provider().is_some() || !key_kinds.is_empty() {
+        rows.push(row(
+            Id::LaneName(position),
+            "New login name",
+            "Name for the next login: 1-40 letters, digits, '-' or '_'.".to_string(),
+            SettingControl::Text(editor.name(lane).to_string()),
+        ));
+    }
     if !key_kinds.is_empty() {
         rows.push(row(
             Id::LaneKey(position),
@@ -307,15 +309,38 @@ pub(crate) fn detail_rows(
             }),
         ));
     }
-    if lane.auth_provider().is_some() && view.sign_in.is_none() {
-        rows.push(row(
-            Id::LaneSignIn(position),
-            "Add subscription",
-            format!(
-                "Sign in to another {label} subscription under the name above. Your browser opens; the current login keeps working until the new one succeeds."
-            ),
-            SettingControl::Action("Sign in with browser".to_string()),
-        ));
+    if lane.signs_in() && view.sign_in.is_none() {
+        if subscriptions > 0 || lane.auth_provider().is_none() {
+            rows.push(row(
+                Id::LaneReSignIn(position),
+                if subscriptions > 0 {
+                    "Sign in again"
+                } else {
+                    "Sign in"
+                },
+                format!(
+                    "Sign in to {label} with your browser{}. Borg keeps working while it waits.",
+                    if subscriptions > 0 {
+                        ", renewing the login turns use now"
+                    } else {
+                        ""
+                    }
+                ),
+                SettingControl::Action("Sign in with browser".to_string()),
+            ));
+        }
+        if lane.auth_provider().is_some() {
+            rows.push(row(
+                Id::LaneSignIn(position),
+                "Add subscription",
+                format!(
+                    "Sign in to {} {label} subscription{}. Your browser opens; the current login keeps working until the new one succeeds.",
+                    if subscriptions > 0 { "another" } else { "a" },
+                    if subscriptions > 0 { " under the name above" } else { "" }
+                ),
+                SettingControl::Action("Sign in with browser".to_string()),
+            ));
+        }
     }
     for kind in key_kinds {
         let (label_text, control, description) = match kind {
@@ -411,7 +436,7 @@ pub(crate) fn action(
                 account: account.name.clone(),
             })
         }
-        SettingId::LaneSignIn(position) => {
+        SettingId::LaneSignIn(position) | SettingId::LaneReSignIn(position) => {
             let view = view(lanes, position)?;
             if let Some(sign_in) = &view.sign_in {
                 return sign_in
@@ -425,12 +450,24 @@ pub(crate) fn action(
                     busy.lane.label()
                 )));
             }
-            Some(match named(view.lane, editor) {
-                Ok(account) => UiAction::ConnectAccount {
-                    lane: view.lane,
-                    account,
+            let has_login = view
+                .accounts
+                .iter()
+                .any(|account| account.kind == AccountKind::Subscription);
+            // Renewing, or a first login, needs no name; another one does.
+            let account = match id {
+                SettingId::LaneSignIn(_) if has_login => match named(view.lane, editor) {
+                    Ok(account) => Some(account),
+                    Err(notice) => return Some(notice),
                 },
-                Err(notice) => notice,
+                SettingId::LaneSignIn(_) => {
+                    Some(editor.name(view.lane).trim().to_string()).filter(|name| !name.is_empty())
+                }
+                _ => None,
+            };
+            Some(UiAction::ConnectAccount {
+                lane: view.lane,
+                account,
             })
         }
         SettingId::LaneSaveKey(position, kind) => {

@@ -5,6 +5,16 @@ Git comparison.
 
 ## Unreleased (since 0.20.12)
 
+- The "Connection & billing" picker is gone. Picking a model from a provider
+  that is not connected, `/login`, and the billing badge open that provider's
+  page in Settings › Providers; a model you picked is switched to as soon as a
+  login there can serve it. Grok Build and Muse Code are on the page too, and
+  every subscription provider offers "Sign in again" to renew its login.
+  Saving or selecting a GLM, Kimi or Qwen key now also makes it the active
+  coding plan, so it is actually used. A saved custom endpoint keeps several
+  named keys like every other provider: select one with Enter, remove it with
+  Delete twice, or add another; renaming the endpoint keeps them and removing
+  it forgets them.
 - Settings › Providers is now the one place for every provider's logins. The
   separate Subscriptions section is gone. The overview has one row per
   provider (Claude, ChatGPT, OpenCode Go, GLM, Kimi, Qwen, OpenRouter, Vercel

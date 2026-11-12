@@ -101,6 +101,11 @@ pub(crate) enum SettingId {
     ProviderKeyEnv,
     ProviderKey,
     ProviderClearAuth,
+    /// A saved custom provider's named key, by position.
+    ProviderLogin(usize),
+    ProviderLoginName,
+    ProviderLoginKey,
+    ProviderLoginSave,
     ProviderHeaders,
     ProviderModelAdd,
     ProviderModelEntry(usize),
@@ -124,6 +129,7 @@ pub(crate) enum SettingId {
     LaneName(usize),
     LaneKey(usize),
     LaneSignIn(usize),
+    LaneReSignIn(usize),
     LaneSaveKey(usize, borg_provider::subscriptions::AccountKind),
 
     ModelPin(usize),
@@ -944,8 +950,8 @@ pub(crate) struct SettingsScreen {
 }
 
 impl SettingsScreen {
-    /// Open the Providers page of one built-in provider.
-    pub(crate) fn show_lane(&mut self, lane: borg_provider::subscriptions::Lane) {
+    /// Open the Providers overview.
+    pub(crate) fn show_providers(&mut self) {
         self.set_section(
             SettingsSection::ALL
                 .iter()
@@ -953,6 +959,11 @@ impl SettingsScreen {
                 .unwrap(),
         );
         self.provider_editor = None;
+    }
+
+    /// Open the Providers page of one built-in provider.
+    pub(crate) fn show_lane(&mut self, lane: borg_provider::subscriptions::Lane) {
+        self.show_providers();
         self.open_lane = Some(logins::lane_index(lane));
     }
 
@@ -978,7 +989,7 @@ impl SettingsScreen {
         });
         if let Some(editor) = &self.provider_editor {
             rows.retain(|row| row.section != SettingsSection::Providers);
-            rows.extend(providers::editor_rows(editor));
+            rows.extend(providers::editor_rows(editor, self.confirm_remove));
         } else if let Some(view) = lane_page {
             rows.retain(|row| row.section != SettingsSection::Providers);
             rows.extend(logins::detail_rows(
@@ -1421,7 +1432,8 @@ impl SettingsScreen {
             KeyCode::Esc if self.open_lane.is_some() => self.close_lane(),
             KeyCode::Delete => {
                 if let Some(row) = self.selected_row(rows)
-                    && let Some(action) = logins::removal(row.id, &self.lanes)
+                    && let Some(action) =
+                        logins::removal(row.id, &self.lanes).or_else(|| self.custom_removal(row.id))
                 {
                     if self.confirm_remove == Some(row.id) {
                         self.confirm_remove = None;

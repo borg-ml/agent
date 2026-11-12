@@ -82,6 +82,8 @@ pub enum Lane {
     Qwen,
     OpenRouter,
     Vercel,
+    Grok,
+    Muse,
 }
 
 /// Whether a login spends a subscription's included allowance or is billed per
@@ -93,7 +95,7 @@ pub enum AccountKind {
 }
 
 impl Lane {
-    pub const ALL: [Lane; 8] = [
+    pub const ALL: [Lane; 10] = [
         Lane::Claude,
         Lane::Codex,
         Lane::OpenCode,
@@ -102,6 +104,8 @@ impl Lane {
         Lane::Qwen,
         Lane::OpenRouter,
         Lane::Vercel,
+        Lane::Grok,
+        Lane::Muse,
     ];
 
     /// Storage id, shared with the credential store keys.
@@ -115,6 +119,8 @@ impl Lane {
             Lane::Qwen => "qwen",
             Lane::OpenRouter => "openrouter",
             Lane::Vercel => "vercel",
+            Lane::Grok => "grok",
+            Lane::Muse => "muse",
         }
     }
 
@@ -128,6 +134,8 @@ impl Lane {
             Lane::Qwen => "Qwen Coding Plan",
             Lane::OpenRouter => "OpenRouter",
             Lane::Vercel => "Vercel AI Gateway",
+            Lane::Grok => "Grok Build",
+            Lane::Muse => "Muse Code",
         }
     }
 
@@ -142,14 +150,27 @@ impl Lane {
             "qwen" | "alibaba" => Some(Lane::Qwen),
             "openrouter" => Some(Lane::OpenRouter),
             "vercel" => Some(Lane::Vercel),
+            "grok" | "xai" => Some(Lane::Grok),
+            "muse" | "meta" => Some(Lane::Muse),
             _ => None,
         }
     }
 
-    /// Whether this lane has subscription logins at all, and so quota and a
-    /// switching policy.
+    /// Whether this lane bills a subscription at all.
     pub fn has_subscriptions(self) -> bool {
+        self.named_subscriptions() || matches!(self, Lane::Grok | Lane::Muse)
+    }
+
+    /// Whether this lane keeps several named subscription logins, and so a
+    /// switching policy. Grok Build and Muse Code have one sign-in each, kept
+    /// by their own CLI.
+    pub fn named_subscriptions(self) -> bool {
         self.auth_provider().is_some() || self.key_lane().is_some()
+    }
+
+    /// Whether a subscription is connected by signing in with a browser.
+    pub fn signs_in(self) -> bool {
+        matches!(self, Lane::Claude | Lane::Codex | Lane::Grok | Lane::Muse)
     }
 
     /// The OAuth login registry behind this lane, if it keeps authorities as
@@ -208,24 +229,46 @@ impl Lane {
             Lane::Qwen => "qwen",
             Lane::OpenRouter => "openrouter",
             Lane::Vercel => "vercel",
+            Lane::Grok => "grok",
+            Lane::Muse => "muse",
         }
     }
 
-    /// On a lane with both kinds, which kind turns bill now.
-    fn billing(self) -> AccountKind {
+    /// The coding plan this lane's subscription keys are routed through. Only
+    /// one plan is active on a machine at a time.
+    fn plan(self) -> Option<crate::subscription::Plan> {
+        use crate::subscription::Plan;
+        match self {
+            Lane::Glm => Some(Plan::GlmCoding),
+            Lane::Kimi => Some(Plan::KimiCode),
+            Lane::Qwen => Some(Plan::QwenCoding),
+            _ => None,
+        }
+    }
+
+    /// Which kind of login turns bill now, or `None` when the lane is not in
+    /// use (a coding plan other than this one is active).
+    fn billing(self) -> Option<AccountKind> {
+        if let Some(plan) = self.plan() {
+            return crate::subscription::active_for(plan).map(|_| AccountKind::Subscription);
+        }
         let api = match self {
             Lane::Claude => crate::credentials::claude_uses_api_key(),
             Lane::Codex => crate::credentials::openai_uses_api_key(),
             _ => !self.has_subscriptions(),
         };
-        if api {
+        Some(if api {
             AccountKind::ApiKey
         } else {
             AccountKind::Subscription
-        }
+        })
     }
 
+    /// Bill turns on this lane to logins of `kind`.
     fn set_billing(self, kind: AccountKind) -> Result<()> {
+        if let Some(plan) = self.plan() {
+            return crate::credentials::set_active_subscription(plan.id()).map(|_| ());
+        }
         let api = kind == AccountKind::ApiKey;
         match self {
             Lane::Claude => crate::credentials::set_claude_uses_api_key(api).map(|_| ()),
@@ -342,7 +385,7 @@ pub fn stored_accounts(lane: Lane) -> Vec<Account> {
         .into_iter()
         .chain(keys)
         .map(|mut account| {
-            account.active &= account.kind == billing;
+            account.active &= Some(account.kind) == billing;
             account
         })
         .collect()
@@ -363,9 +406,10 @@ pub async fn activate(lane: Lane, kind: AccountKind, name: &str) -> Result<()> {
     lane.set_billing(kind)
 }
 
-/// Connect a named key. It is selected among the lane's keys of that kind, but
-/// billing only moves to it when the user selects it, so adding a pay-per-use
-/// key never silently stops spending a subscription.
+/// Connect a named key. A subscription key is selected and routed at once; an
+/// API key is selected among the lane's keys, but billing only moves to it when
+/// the user selects it, so adding a pay-per-use key never silently stops
+/// spending a subscription.
 pub fn add_key(lane: Lane, kind: AccountKind, name: &str, key: &str) -> Result<()> {
     let key_lane = lane.keys(kind).with_context(|| {
         format!(
@@ -373,7 +417,13 @@ pub fn add_key(lane: Lane, kind: AccountKind, name: &str, key: &str) -> Result<(
             lane.label()
         )
     })?;
-    key_accounts::register(key_lane, name, key).map(|_| ())
+    key_accounts::register(key_lane, name, key)?;
+    // A subscription key is selected as it is added, so it must also be the
+    // one turns are routed through.
+    if kind == AccountKind::Subscription {
+        lane.set_billing(kind)?;
+    }
+    Ok(())
 }
 
 /// Disconnect a named key. An OAuth login owns a directory of rotating tokens,

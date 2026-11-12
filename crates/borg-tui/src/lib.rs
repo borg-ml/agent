@@ -117,8 +117,6 @@ use borg_ui::KeybindingConfig;
 
 const INLINE_VIEWPORT_HEIGHT: u16 = 24;
 const HORIZONTAL_MARGIN: u16 = 0;
-/// The connection picker entry that opens the provider's settings page.
-const MANAGE_LOGINS: &str = "manage-logins";
 const BORG_ORANGE: Color = Color::Rgb(255, 142, 36);
 const BORG_ORANGE_HOVER: Color = Color::Rgb(255, 184, 92);
 const RUNNING_STATUS_PEACH: Color = Color::Rgb(255, 132, 112);
@@ -1067,13 +1065,6 @@ pub enum UiAction {
     SetHorizontalMargin(u16),
     SetComposerMaxHeight(u16),
     SetShowFooter(bool),
-    /// The user picked a model from a provider whose credentials are missing
-    /// and chose how to supply them.
-    AuthenticateProvider {
-        provider: CodingProvider,
-        model: String,
-        choice: ProviderAuthChoice,
-    },
     SetEffort(String),
     SetPermissionMode(PermissionMode),
     SetResponseLanguage(ResponseLanguage),
@@ -1098,15 +1089,32 @@ pub enum UiAction {
         lane: borg_provider::subscriptions::Lane,
         strategy: borg_provider::subscriptions::Strategy,
     },
-    /// Sign in to an additional subscription login under a name.
+    /// Sign in to a subscription: an additional login under a name, or the
+    /// provider's current login again when no name is given.
     ConnectAccount {
         lane: borg_provider::subscriptions::Lane,
-        account: String,
+        account: Option<String>,
     },
     /// Store an additional named key: a subscription key or an API key.
     AddKeyAccount {
         lane: borg_provider::subscriptions::Lane,
         kind: borg_provider::subscriptions::AccountKind,
+        account: String,
+        key: String,
+    },
+    /// Make one named key of a custom provider the one it spends.
+    SwitchCustomKey {
+        provider: String,
+        account: String,
+    },
+    /// Disconnect a named key of a custom provider.
+    RemoveCustomKey {
+        provider: String,
+        account: String,
+    },
+    /// Keep another named key for a custom provider and select it.
+    AddCustomKey {
+        provider: String,
         account: String,
         key: String,
     },
@@ -1984,7 +1992,7 @@ pub struct BorgTerminal {
     picker: Option<Picker>,
     /// Model the user picked from a provider that still needs credentials;
     /// applied once the auth picker resolves.
-    pending_auth_model: Option<(CodingProvider, String)>,
+    pending_model: Option<(CodingProvider, String)>,
     /// The subscription sign-in the host is running, shown on its lane.
     subscription_sign_in: Option<(borg_provider::subscriptions::Lane, crate::settings::SignIn)>,
     /// True once the enable-dictation flow has completed (mirrors the durable
@@ -2195,17 +2203,7 @@ enum PickerKind {
     Rewind,
     MessageActions,
     Commands,
-    ProviderAuth,
     Goal,
-}
-
-/// How the user chose to authenticate a provider they selected a model from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProviderAuthChoice {
-    Subscription,
-    ApiKey,
-    ReconnectSubscription,
-    ReplaceApiKey,
 }
 
 impl Picker {
@@ -3523,7 +3521,7 @@ impl BorgTerminal {
             replaying_history: false,
             history_page_loading: false,
             picker: None,
-            pending_auth_model: None,
+            pending_model: None,
             subscription_sign_in: None,
             dictation_enabled: false,
             dictation_enable_flow: false,
@@ -3703,7 +3701,7 @@ impl BorgTerminal {
         self.replaying_history = false;
         self.history_page_loading = false;
         self.picker = None;
-        self.pending_auth_model = None;
+        self.pending_model = None;
         self.dictation_enable_flow = false;
         self.keybindings_open = false;
         self.slash_selection = 0;
@@ -6790,77 +6788,49 @@ impl BorgTerminal {
             .map(|config| config.provider)
     }
 
-    /// Asks how to authenticate `provider` before switching to `model`.
-    /// Dismissing the picker leaves the session on its current model.
-    pub fn open_provider_auth_picker(&mut self, provider: CodingProvider, model: String) {
-        let mut options = match provider {
-            CodingProvider::Codex => vec![
-                PickerOption::new("ChatGPT subscription · included allowance", "subscription"),
-                PickerOption::new("OpenAI API key · pay per use", "api-key"),
-                PickerOption::new("Sign in to ChatGPT…", "reconnect-subscription"),
-                PickerOption::new("Add or replace OpenAI API key…", "replace-api-key"),
-            ],
-            CodingProvider::OpenCode => vec![
-                PickerOption::new("OpenCode Go · subscription key", "api-key"),
-                PickerOption::new("Add or replace Go key…", "replace-api-key"),
-            ],
-            CodingProvider::Claude => vec![
-                PickerOption::new("Claude subscription · included allowance", "subscription"),
-                PickerOption::new("Anthropic API key · pay per use", "api-key"),
-                PickerOption::new("Sign in to Claude…", "reconnect-subscription"),
-                PickerOption::new("Add or replace Anthropic API key…", "replace-api-key"),
-            ],
-            CodingProvider::Grok => vec![PickerOption::new(
-                "Connect Grok Build subscription…",
-                "reconnect-subscription",
-            )],
-            CodingProvider::Muse => vec![PickerOption::new(
-                "Connect Muse Code subscription…",
-                "reconnect-subscription",
-            )],
-            _ => vec![PickerOption::new(
-                format!("Add {} API key…", provider.label()),
-                "api-key",
-            )],
-        };
-        for option in &mut options {
-            option.preview = Some(match option.value.as_str() {
-                "subscription" if provider == CodingProvider::Codex => "Use your saved ChatGPT login. If needed, Borg opens the subscription sign-in flow.",
-                "api-key" if provider == CodingProvider::Codex => "Use your saved OpenAI key, or enter one privately. Requests are billed to your OpenAI API account. Your ChatGPT login is kept.",
-                "subscription" if provider == CodingProvider::Claude => "Use your saved Claude login. If needed, Borg opens the subscription sign-in flow.",
-                "api-key" if provider == CodingProvider::Claude => "Use your saved Anthropic key, or enter one privately. Requests are billed to your Anthropic Console credits. Your Claude login is kept.",
-                "api-key" | "replace-api-key" if provider == CodingProvider::OpenCode => "Get your subscription key at opencode.ai/auth. Go models use your Go allowance; select one in /model.",
-                "reconnect-subscription" if provider == CodingProvider::Grok => "Opens the Grok Build sign-in. SuperGrok and X Premium Plus plans are supported; set XAI_API_KEY to use the API instead.",
-                "reconnect-subscription" if provider == CodingProvider::Muse => "Opens Muse Code account sign-in. META_API_KEY and stored API keys override subscription login and use pay-as-you-go billing.",
-                _ => "Credentials are entered privately and are never added to the conversation.",
-            }.to_string());
+    /// Open `provider`'s page in Settings › Providers so the user can sign in,
+    /// add a key or pick the login it bills. With `model`, that model is
+    /// switched to as soon as a login is ready.
+    pub fn connect_provider(&mut self, provider: CodingProvider, model: Option<String>) {
+        self.pending_model = model.map(|model| (provider, model));
+        match borg_remote::provider_usage::provider_lane(provider) {
+            Some(lane) => {
+                self.open_subscription_settings(lane);
+                if let Some((_, model)) = &self.pending_model {
+                    self.set_notice(format!(
+                        "Connect {} to use {model}: sign in, or save and select a key.",
+                        lane.label()
+                    ));
+                }
+            }
+            None => {
+                self.open_settings();
+                self.settings
+                    .as_mut()
+                    .expect("settings just opened")
+                    .show_providers();
+            }
         }
-        if let Some(lane) = borg_remote::provider_usage::provider_lane(provider) {
-            let mut manage = PickerOption::new(
-                format!("Manage {} logins and keys…", lane.label()),
-                MANAGE_LOGINS,
-            );
-            manage.preview = Some(
-                "Open this provider in Settings › Providers to add, select or remove its logins and keys, and see what each has left.".to_string(),
-            );
-            options.push(manage);
-        }
-        options.push(PickerOption::new("Cancel", "cancel"));
-        self.pending_auth_model = Some((provider, model));
-        self.picker = Some(Picker {
-            kind: PickerKind::ProviderAuth,
-            title: "Connection & billing",
-            options,
-            selected: 0,
-            query: None,
-            viewport_offset: Cell::new(0),
-        });
+    }
+
+    /// The model waiting for a login on `lane`, with the provider it runs on.
+    pub fn pending_model(
+        &self,
+        lane: borg_provider::subscriptions::Lane,
+    ) -> Option<(CodingProvider, String)> {
+        self.pending_model.clone().filter(|(provider, _)| {
+            borg_remote::provider_usage::provider_lane(*provider) == Some(lane)
+        })
+    }
+
+    /// The waiting model was switched to, or no longer applies.
+    pub fn clear_pending_model(&mut self) {
+        self.pending_model = None;
     }
 
     /// Open the fullscreen settings screen at one provider's page.
     pub fn open_subscription_settings(&mut self, lane: borg_provider::subscriptions::Lane) {
         self.picker = None;
-        self.pending_auth_model = None;
         let mut settings = SettingsScreen::default();
         settings.show_lane(lane);
         self.settings = Some(settings);
@@ -6956,7 +6926,22 @@ impl BorgTerminal {
                         AccountStrategy::Drain => Strategy::Drain,
                     })
                     .unwrap_or_else(|| borg_provider::subscriptions::strategy(*lane));
-                let accounts = borg_provider::subscriptions::stored_accounts(*lane)
+                let mut stored = borg_provider::subscriptions::stored_accounts(*lane);
+                // Grok Build and Muse Code keep their one sign-in in their own
+                // CLI; the host's capability says whether it is there.
+                if !lane.named_subscriptions()
+                    && lane.has_subscriptions()
+                    && capability.is_some_and(|capability| capability.authenticated)
+                {
+                    stored.push(borg_provider::subscriptions::Account {
+                        lane: *lane,
+                        kind: AccountKind::Subscription,
+                        name: "default".to_string(),
+                        active: true,
+                        path: None,
+                    });
+                }
+                let accounts = stored
                     .into_iter()
                     .map(|account| {
                         // Quota belongs to subscriptions; a key that shares a
@@ -8302,17 +8287,10 @@ impl BorgTerminal {
                             .is_some_and(|area| area.contains(pointer))
                         {
                             // The billing lane decides which credentials the
-                            // next turn spends, so switching it goes through the
-                            // connection picker rather than re-authenticating
-                            // behind the user's back.
-                            if let (Some(provider), Some(model)) = (
-                                self.session_provider(),
-                                self.transcript
-                                    .config
-                                    .as_ref()
-                                    .and_then(|config| config.model.clone()),
-                            ) {
-                                self.open_provider_auth_picker(provider, model);
+                            // next turn spends; the provider's page is where
+                            // the login, and with it the billing, is chosen.
+                            if let Some(provider) = self.session_provider() {
+                                self.connect_provider(provider, None);
                             }
                             return Ok(UiAction::None);
                         }
@@ -9633,7 +9611,7 @@ impl BorgTerminal {
             }
             PickerKind::Model => match picker.selected_value().as_str() {
                 "/connect-go" => {
-                    self.open_provider_auth_picker(CodingProvider::OpenCode, String::new());
+                    self.connect_provider(CodingProvider::OpenCode, None);
                     UiAction::None
                 }
                 "/login" => UiAction::Submit {
@@ -9654,33 +9632,6 @@ impl BorgTerminal {
                 }
                 model => UiAction::SetModel(model.to_string()),
             },
-            PickerKind::ProviderAuth => {
-                let selected = picker.selected_value();
-                if selected == MANAGE_LOGINS {
-                    if let Some((provider, _)) = self.pending_auth_model.take()
-                        && let Some(lane) = borg_remote::provider_usage::provider_lane(provider)
-                    {
-                        self.open_subscription_settings(lane);
-                    }
-                    return Ok(UiAction::None);
-                }
-                let choice = match selected.as_str() {
-                    "subscription" => Some(ProviderAuthChoice::Subscription),
-                    "api-key" => Some(ProviderAuthChoice::ApiKey),
-                    "reconnect-subscription" => Some(ProviderAuthChoice::ReconnectSubscription),
-                    "replace-api-key" => Some(ProviderAuthChoice::ReplaceApiKey),
-                    _ => None,
-                };
-                let model = self.pending_auth_model.take();
-                match (choice, model) {
-                    (Some(choice), Some((provider, model))) => UiAction::AuthenticateProvider {
-                        provider,
-                        model,
-                        choice,
-                    },
-                    _ => UiAction::None,
-                }
-            }
             PickerKind::Effort => UiAction::SetEffort(picker.selected_value()),
             PickerKind::Permission => {
                 UiAction::SetPermissionMode(match picker.selected_value().as_str() {
@@ -12705,7 +12656,6 @@ impl BorgTerminal {
                 KeyCode::Enter => self.run_selected_picker(),
                 KeyCode::Esc => {
                     self.picker = None;
-                    self.pending_auth_model = None;
                     self.dictation_enable_flow = false;
                     Ok(UiAction::None)
                 }
