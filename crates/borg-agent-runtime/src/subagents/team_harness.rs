@@ -62,7 +62,11 @@ const INSPECT_TOOL_TEXT: usize = 1200;
 fn clipped(text: &str) -> String {
     let text = crate::secret_scrub::scrub_secrets(text);
     match text.char_indices().nth(INSPECT_TOOL_TEXT) {
-        Some((end, _)) => format!("{}… [{} more chars]", &text[..end], text[end..].chars().count()),
+        Some((end, _)) => format!(
+            "{}… [{} more chars]",
+            &text[..end],
+            text[end..].chars().count()
+        ),
         None => text.to_string(),
     }
 }
@@ -70,10 +74,22 @@ fn clipped(text: &str) -> String {
 /// A tool call or result for `inspect_agent { include_tools }`.
 fn tool_event(event: &SessionEvent) -> Option<Value> {
     let body = match &event.kind {
-        SessionEventKind::ToolStarted { tool_call_id, name, input, parent_tool_call_id, .. } => json!({
+        SessionEventKind::ToolStarted {
+            tool_call_id,
+            name,
+            input,
+            parent_tool_call_id,
+            ..
+        } => json!({
             "type": "tool_started", "tool_call_id": tool_call_id, "name": name,
             "input": clipped(&input.to_string()), "nested": parent_tool_call_id.is_some()}),
-        SessionEventKind::ToolCompleted { tool_call_id, output, is_error, parent_tool_call_id, .. } => json!({
+        SessionEventKind::ToolCompleted {
+            tool_call_id,
+            output,
+            is_error,
+            parent_tool_call_id,
+            ..
+        } => json!({
             "type": "tool_completed", "tool_call_id": tool_call_id, "is_error": is_error,
             "output": clipped(output), "nested": parent_tool_call_id.is_some()}),
         _ => return None,
@@ -917,7 +933,11 @@ mod observation_tests {
         let message = SessionEvent::new(
             Uuid::nil(),
             9,
-            SessionEventKind::StatusChanged { status: crate::SessionStatus::Ready, lifecycle: None, detail: None },
+            SessionEventKind::StatusChanged {
+                status: crate::SessionStatus::Ready,
+                lifecycle: None,
+                detail: None,
+            },
         );
         assert!(tool_event(&message).is_none());
     }

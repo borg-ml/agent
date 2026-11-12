@@ -3680,7 +3680,10 @@ async fn run_agent_session_store_kernel_inner(
                 Vec::new()
             };
             if !live_jobs.is_empty() && next_ready_detail.is_none() {
-                let labels = live_jobs.iter().map(|watch| watch.label.clone()).collect::<Vec<_>>();
+                let labels = live_jobs
+                    .iter()
+                    .map(|watch| watch.label.clone())
+                    .collect::<Vec<_>>();
                 next_ready_detail = Some(format!(
                     "Waiting on {} watcher(s): {}",
                     live_jobs.len(),
