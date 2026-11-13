@@ -20,6 +20,12 @@ Git comparison.
   PostgreSQL treat the dead server as running, so Borg could not open its
   journal until the files were deleted by hand. Borg now removes a lock that
   predates the current boot when its process cannot be that server.
+- A session whose journal references an image that is no longer in the
+  attachment store (for example, one lost to a power cut before it reached
+  disk) now resumes. The message is delivered with an
+  `[image unavailable: <name>]` placeholder where the image was. Before this,
+  the session host exited on startup and `borg resume` restarted it every two
+  seconds indefinitely.
 
 - Resuming a long thread with many subagents no longer stalls for seconds
   before the first frame. Both the background session host and the terminal

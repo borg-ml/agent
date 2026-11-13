@@ -5448,17 +5448,18 @@ impl SubagentCoordinator {
                 format!("participant:{}", message.author_id),
             ),
         };
-        let attachments =
-            resolve_message_attachments(&self.journal_root, &message.body.attachments).await?;
+        // This message is already durable, so a blob lost since it was sent
+        // (an unclean shutdown before the store reached disk, say) must cost
+        // only that image. Failing here would fail the whole inbox read and,
+        // on resume, the session host with it.
+        let (attachments, unavailable) =
+            resolve_replayed_message_attachments(&self.journal_root, &message.body.attachments)
+                .await;
+        let body = with_unavailable_image_notes(message.body.text, &unavailable);
         Ok(TeamInboxMessage {
             message_id: message.id,
-            text: attributed_team_message(
-                &actor,
-                &reply_target,
-                &message.body.text,
-                Some(message.id),
-            ),
-            report_text: message.body.text,
+            text: attributed_team_message(&actor, &reply_target, &body, Some(message.id)),
+            report_text: body,
             sender_session_id: message.author_id,
             delivery: match mode {
                 DeliveryMode::Boundary | DeliveryMode::Wake => PromptDelivery::Steer,
@@ -13192,16 +13193,34 @@ async fn write_attachment_blob(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let temporary = parent.join(format!(".{}.tmp", Uuid::new_v4()));
-    tokio::fs::write(&temporary, bytes)
+    // The message that names this blob is committed to the journal right
+    // after, so the bytes and the directory entry must both be on disk first:
+    // otherwise a power cut leaves a durable reference to an image that never
+    // landed.
+    let mut file = tokio::fs::File::create(&temporary)
+        .await
+        .with_context(|| format!("failed to write {}", temporary.display()))?;
+    file.write_all(bytes)
         .await
         .with_context(|| format!("failed to write {}", temporary.display()))?;
     #[cfg(unix)]
-    tokio::fs::set_permissions(&temporary, Permissions::from_mode(0o600))
+    file.set_permissions(Permissions::from_mode(0o600))
         .await
         .with_context(|| format!("failed to secure {}", temporary.display()))?;
+    file.sync_all()
+        .await
+        .with_context(|| format!("failed to flush {}", temporary.display()))?;
+    drop(file);
     tokio::fs::rename(&temporary, path)
         .await
         .with_context(|| format!("failed to publish {}", path.display()))?;
+    #[cfg(unix)]
+    tokio::fs::File::open(parent)
+        .await
+        .with_context(|| format!("failed to open {}", parent.display()))?
+        .sync_all()
+        .await
+        .with_context(|| format!("failed to flush {}", parent.display()))?;
     Ok(())
 }
 
@@ -13325,6 +13344,45 @@ async fn resolve_message_attachments(
         resolved.push(attachment_blob_path(journal_root, attachment));
     }
     Ok(resolved)
+}
+
+/// Resolve the images of a message that is already in the journal.
+///
+/// Unlike [`resolve_message_attachments`], which gates a send, this never
+/// fails: an image whose blob is missing or no longer verifies is left out and
+/// named in the returned notes, so the recipient still gets the text and a
+/// visible placeholder instead of unverified bytes or nothing at all.
+async fn resolve_replayed_message_attachments(
+    journal_root: &Path,
+    attachments: &[MessageAttachment],
+) -> (Vec<PathBuf>, Vec<String>) {
+    let mut resolved = Vec::with_capacity(attachments.len());
+    let mut unavailable = Vec::new();
+    for attachment in attachments {
+        match load_message_attachment(journal_root, attachment).await {
+            Ok(_) => resolved.push(attachment_blob_path(journal_root, attachment)),
+            Err(error) => {
+                tracing::warn!(
+                    image = %attachment.name,
+                    sha256 = %attachment.sha256,
+                    error = %format!("{error:#}"),
+                    "delivering message without an image that is unavailable on this host"
+                );
+                unavailable.push(attachment.name.clone());
+            }
+        }
+    }
+    (resolved, unavailable)
+}
+
+fn with_unavailable_image_notes(mut text: String, unavailable: &[String]) -> String {
+    for name in unavailable {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&format!("[image unavailable: {name}]"));
+    }
+    text
 }
 
 fn message_tool(name: &str, description: &str) -> Value {

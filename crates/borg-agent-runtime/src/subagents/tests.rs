@@ -8390,6 +8390,39 @@ async fn a_tampered_attachment_fails_verification_instead_of_being_delivered() {
     );
 }
 
+/// A message already in the journal must survive losing one of its blobs:
+/// replay drops that image behind a visible placeholder and keeps the rest,
+/// rather than failing the inbox read and, with it, the session host.
+#[tokio::test]
+async fn a_replayed_message_with_a_lost_blob_keeps_its_text_and_other_images() {
+    let root = tempdir().expect("journal root");
+    let kept = root.path().join("kept.png");
+    let lost = root.path().join("lost.png");
+    std::fs::write(&kept, sample_png()).expect("write kept image");
+    let mut other = sample_png();
+    other.extend_from_slice(b"distinct");
+    std::fs::write(&lost, &other).expect("write lost image");
+    let captured = capture_message_attachments(root.path(), &[kept, lost])
+        .await
+        .expect("capture images");
+    assert_eq!(captured.len(), 2);
+    std::fs::remove_file(attachment_blob_path(root.path(), &captured[1]))
+        .expect("lose the second blob");
+
+    let (resolved, unavailable) =
+        resolve_replayed_message_attachments(root.path(), &captured).await;
+    assert_eq!(resolved, vec![attachment_blob_path(root.path(), &captured[0])]);
+    assert_eq!(unavailable, vec![captured[1].name.clone()]);
+    assert_eq!(
+        with_unavailable_image_notes("look at these".to_string(), &unavailable),
+        format!("look at these\n[image unavailable: {}]", captured[1].name)
+    );
+    assert_eq!(
+        with_unavailable_image_notes(String::new(), &unavailable),
+        format!("[image unavailable: {}]", captured[1].name)
+    );
+}
+
 /// The capture boundary is what stops a message attachment from becoming a
 /// way to read arbitrary files, so it refuses on content rather than on name.
 #[tokio::test]
