@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.20.12)
+## Unreleased (since 0.21.0)
+
+## 0.21.0 (2026-11-13)
 
 - On Windows, reading Borg's output through a pipe (`borg doctor | more`, a
   script, CI) no longer hangs after Borg exits. The session cluster Borg
