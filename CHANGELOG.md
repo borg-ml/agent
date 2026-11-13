@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.21.0)
+## Unreleased (since 0.21.1)
+
+## 0.21.1 (2026-11-13)
 
 - On Windows, sending a message no longer fails with "HOME missing for
   Claude authority", and Borg finds your Claude, ChatGPT and OpenCode logins,
