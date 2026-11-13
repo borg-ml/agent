@@ -2142,7 +2142,7 @@ impl AgentTurnExecutor for ConsultingExecutor {
             .call(
                 "consult_model",
                 json!({
-                    "profile": "claude-fable-5-1@high",
+                    "profile": "claude-fable-5-2@high",
                     "prompt": "Review the selected interface and call out hidden risks."
                 }),
             )
@@ -15282,10 +15282,10 @@ fn consultation_profiles_resolve_aliases_and_catalog_models() {
         )
     );
     assert_eq!(
-        resolve_consultation_profile("claude-fable-5-1@high").unwrap(),
+        resolve_consultation_profile("claude-fable-5-2@high").unwrap(),
         (
             CodingProvider::Claude,
-            Some("claude-fable-5-1".to_string()),
+            Some("claude-fable-5-2".to_string()),
             Some("high".to_string())
         )
     );

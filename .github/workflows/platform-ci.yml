@@ -90,6 +90,8 @@ jobs:
         run: |
           $binary = Resolve-Path "target/${{ matrix.target }}/release/borg.exe"
           $env:BORG_HOME = Join-Path $env:RUNNER_TEMP "borg-doctor-home"
+          # The workflow points Borg at the CI server; this step needs the managed cluster.
+          Remove-Item Env:BORG_SESSIONS_URL
           if (-not (Get-Command pg_ctl -ErrorAction SilentlyContinue)) {
             $env:Path = "$(Join-Path $env:RUNNER_TEMP 'postgres/pgsql/bin');$env:Path"
           }
@@ -97,9 +99,11 @@ jobs:
           $finished = Wait-Job $job -Timeout 120
           $output = Receive-Job $job | Out-String
           $output
+          $started = Test-Path (Join-Path $env:BORG_HOME "pgdata\postmaster.pid")
           cmd /c "pg_ctl -D `"$env:BORG_HOME\pgdata`" -m fast -w stop > NUL 2>&1"
           if (-not $finished) { throw "borg doctor's output pipe stayed open after Borg exited" }
-          if ($output -notmatch "Durable session store: ready") { throw "borg doctor did not start its session cluster" }
+          if (-not $started -or $output -notmatch "Durable session store: ready") { throw "borg doctor did not start its session cluster" }
+          exit 0
       - name: Package and extract-smoke the Unix archive
         if: matrix.archive == 'tar'
         shell: bash

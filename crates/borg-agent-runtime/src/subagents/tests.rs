@@ -4019,10 +4019,10 @@ fn persistent_peer_defaults_to_the_opposite_provider_and_stable_sidecar_profile(
     );
 
     let (provider, model, effort) =
-        resolve_persistent_peer_profile(CodingProvider::Codex, Some("claude-fable-5-1@high"))
+        resolve_persistent_peer_profile(CodingProvider::Codex, Some("claude-fable-5-2@high"))
             .unwrap();
     assert_eq!(provider, CodingProvider::Claude);
-    assert_eq!(model.as_deref(), Some("claude-fable-5-1"));
+    assert_eq!(model.as_deref(), Some("claude-fable-5-2"));
     assert_eq!(effort.as_deref(), Some("high"));
 
     let (provider, model, effort) =

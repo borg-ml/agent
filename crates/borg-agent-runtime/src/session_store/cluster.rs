@@ -184,6 +184,8 @@ impl ManagedCluster {
                 let initdb = locate_binary("initdb")?;
                 self.initialize(&initdb).await?;
             }
+            #[cfg(target_os = "linux")]
+            self.remove_preboot_locks()?;
             if !self.is_running(&pg_ctl).await? {
                 self.start(&pg_ctl).await?;
             }
@@ -469,10 +471,24 @@ impl ManagedCluster {
             .ok()
     }
 
-    // Borg used to unlink a stale postmaster.pid here. Removed: the check it
-    // made was weaker than the one the postmaster already makes on startup,
-    // and unlinking on a false negative destroys the interlock that stops a
-    // second postmaster attaching to one data directory.
+    #[cfg(target_os = "linux")]
+    fn remove_preboot_locks(&self) -> Result<()> {
+        let Some(boot) = std::fs::read_to_string("/proc/stat").ok().and_then(|stat| {
+            stat.lines()
+                .find_map(|line| line.strip_prefix("btime "))?
+                .parse::<u64>()
+                .ok()
+        }) else {
+            return Ok(());
+        };
+        for path in [
+            self.data_dir.join("postmaster.pid"),
+            self.socket_dir.join(format!(".s.PGSQL.{}.lock", self.port)),
+        ] {
+            remove_preboot_lock(&path, boot)?;
+        }
+        Ok(())
+    }
 
     /// Run `pg_ctl start`, distinguishing a failed launch from a failed call.
     ///
@@ -889,6 +905,63 @@ fn gave_up(last: Option<anyhow::Error>) -> anyhow::Error {
     }
 }
 
+// PID reuse after reboot fools both pg_ctl status and PostgreSQL's kill(pid, 0)
+// check. Only discard a previous boot's lock, under the Borg startup lock.
+#[cfg(target_os = "linux")]
+fn remove_preboot_lock(path: &Path, boot: u64) -> Result<()> {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return Ok(());
+    };
+    let mut lines = raw.lines();
+    let Some(pid) = lines.next().and_then(|line| line.parse::<u32>().ok()) else {
+        return Ok(());
+    };
+    let Some(started) = lines.nth(1).and_then(|line| line.parse::<u64>().ok()) else {
+        return Ok(());
+    };
+    if pid == 0 || started == 0 || started >= boot {
+        return Ok(());
+    }
+    if !pid_may_hold_lock(path, pid) {
+        tracing::warn!(path = %path.display(), "removing a PostgreSQL lock from a previous boot");
+        return std::fs::remove_file(path)
+            .with_context(|| format!("could not remove pre-boot lock {}", path.display()));
+    }
+    Ok(())
+}
+
+/// Whether `pid` could be the postmaster that wrote the lock at `path`.
+///
+/// Fails closed (answers yes) whenever /proc cannot settle it, which also
+/// protects a live server after a clock jump.
+///
+/// `/proc/{pid}/exe` is only readable for our own processes, so a reused PID
+/// that belongs to root or a system user cannot be inspected that way. Early
+/// boot hands out PIDs in nearly the same order each time, so that reuse is
+/// the common case after a crash. The owner check covers it: a postmaster runs
+/// as its data directory's owner, and the lock file is created by it, so a
+/// process owned by anyone else cannot be the one holding this lock.
+#[cfg(target_os = "linux")]
+fn pid_may_hold_lock(path: &Path, pid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let proc_dir = match std::fs::metadata(format!("/proc/{pid}")) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    let Ok(lock) = std::fs::metadata(path) else {
+        return true;
+    };
+    if proc_dir.uid() != lock.uid() {
+        return false;
+    }
+    match std::fs::read_link(format!("/proc/{pid}/exe")) {
+        Ok(exe) => exe.file_name().is_none_or(|name| name == "postgres"),
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
 /// Holds the startup lock. Releasing it is the file closing.
 struct StartupGuard {
     _file: std::fs::File,
@@ -1055,6 +1128,47 @@ fn install_hint() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn preboot_locks_recover_reused_pids_without_removing_current_locks() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("postmaster.pid");
+        // This test process is alive but is not a postmaster.
+        let pid = std::process::id();
+        for (contents, removed) in [
+            (format!("{pid}\n/data\n99\n"), true),
+            (format!("{pid}\n/data\n100\n"), false),
+            (format!("{pid}\n/data\n101\n"), false),
+            (format!("{pid}\n/data\n0\n"), false),
+            (format!("{pid}\n/data\ninvalid\n"), false),
+        ] {
+            std::fs::write(&path, contents).unwrap();
+            remove_preboot_lock(&path, 100).unwrap();
+            assert_eq!(!path.exists(), removed);
+        }
+    }
+
+    // The reuse that actually happens after a crash: early-boot PIDs land on
+    // root or system-user processes, whose /proc/{pid}/exe we cannot read.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn preboot_locks_recover_pids_reused_by_another_user() {
+        use std::os::unix::fs::MetadataExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("postmaster.pid");
+        std::fs::write(&path, "1\n/data\n99\n").unwrap();
+        let ours = std::fs::metadata(&path).unwrap().uid();
+        let Ok(init) = std::fs::metadata("/proc/1") else {
+            return;
+        };
+        if init.uid() == ours {
+            return; // e.g. a container running as root; nothing foreign to test with
+        }
+        remove_preboot_lock(&path, 100).unwrap();
+        assert!(!path.exists());
+    }
 
     // The freeze this guards: pg_ctl was run with piped stdout/stderr, and the
     // postmaster inherits those handles on Windows, so waiting for the pipe to
@@ -1260,7 +1374,7 @@ mod tests {
         let message = format!("{error:#}");
         assert!(message.contains("BORG_SESSIONS_URL"));
         assert!(
-            message.contains("Install PostgreSQL"),
+            message.contains("Re-run the Borg installer"),
             "the error must say how to get a server, got: {message}"
         );
     }

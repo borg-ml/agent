@@ -14,6 +14,12 @@ Git comparison.
   elsewhere) even in a terminal opened before the install, and Homebrew's
   `postgresql@NN` and Postgres.app, which are not linked into `bin`. When none
   is found, Borg says to re-run the installer, which now sets PostgreSQL up.
+- On Linux, Borg's session store starts again after a reboot or power loss.
+  The lock files the old PostgreSQL left behind name a process ID that early
+  boot often hands to some other process, which made both `pg_ctl` and
+  PostgreSQL treat the dead server as running, so Borg could not open its
+  journal until the files were deleted by hand. Borg now removes a lock that
+  predates the current boot when its process cannot be that server.
 
 - Resuming a long thread with many subagents no longer stalls for seconds
   before the first frame. Both the background session host and the terminal
