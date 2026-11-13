@@ -5,6 +5,9 @@ Git comparison.
 
 ## Unreleased (since 0.21.1)
 
+- Updated the QUIC networking libraries (quinn-proto, quinn-udp) and rustix to
+  fix security advisories RUSTSEC-2026-0523, -0524, -0538 and -0486.
+
 ## 0.21.1 (2026-11-13)
 
 - On Windows, sending a message no longer fails with "HOME missing for
