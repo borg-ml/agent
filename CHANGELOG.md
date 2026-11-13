@@ -5,6 +5,14 @@ Git comparison.
 
 ## Unreleased (since 0.21.0)
 
+- Signing in to Claude with a subscription works on Windows. Borg refused
+  with "Borg native device persistence requires verified private filesystem
+  ACL support on this platform" because Windows had no way to keep its
+  per-install device ID private. It now stores it like Linux and macOS do,
+  under `~/.config/borg/claude-subscription`, readable only by your account:
+  Borg gives what it creates a user-only ACL, and refuses a device file that
+  other accounts can read or a path that runs through a junction or symlink.
+
 ## 0.21.0 (2026-11-13)
 
 - On Windows, reading Borg's output through a pipe (`borg doctor | more`, a

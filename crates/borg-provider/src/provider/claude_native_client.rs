@@ -1036,7 +1036,366 @@ fn open_directory(
     Ok(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
-#[cfg(not(unix))]
+/// Windows counterpart of the Unix rules above, expressed in ACLs. SYSTEM and
+/// Administrators can read any file on Windows (as root can on Unix), and
+/// they own and fully control every profile by default, so they are trusted
+/// alongside the current user. Any other principal may not write to the home
+/// or `.config`, and may have no access at all to Borg's private directories
+/// or the device file. What Borg creates gets a protected, user-only DACL.
+/// Every component is held open without `FILE_SHARE_DELETE`, so none can be
+/// renamed or swapped for a reparse point between the check and the use.
+#[cfg(windows)]
+fn private_device_id(home: &Path) -> Result<String> {
+    use std::io::{Read, Write};
+    ensure!(home.is_absolute(), "Borg metadata home must be absolute");
+    let user = windows_acl::current_user_sid()?;
+    let mut held = vec![windows_acl::open_checked(home, false, &user)?];
+    let mut dir = home.to_path_buf();
+    for (name, private) in [
+        (".config", false),
+        ("borg", true),
+        ("claude-subscription", true),
+    ] {
+        dir.push(name);
+        if private {
+            windows_acl::create_private_dir(&dir, &user)?;
+        } else {
+            std::fs::create_dir(&dir).or_else(|error| match error.kind() {
+                std::io::ErrorKind::AlreadyExists => Ok(()),
+                _ => Err(error),
+            })?;
+        }
+        held.push(windows_acl::open_checked(&dir, private, &user)?);
+    }
+    let lock = windows_acl::open_private_file(&dir.join("device-id.lock"), true, &user)?
+        .context("cannot open Borg device metadata lock")?;
+    lock.lock()?;
+    let path = dir.join("device-id");
+    if let Some(mut file) = windows_acl::open_private_file(&path, false, &user)? {
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file).take(65).read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() == 64
+                && bytes
+                    .iter()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b)),
+            "invalid Borg device ID; refusing replacement"
+        );
+        return String::from_utf8(bytes).context("invalid Borg device ID");
+    }
+    let mut random = [0; 32];
+    getrandom::fill(&mut random).map_err(|_| anyhow::anyhow!("Borg device entropy unavailable"))?;
+    let id = hex::encode(random);
+    let mut file = windows_acl::create_private_file(&path, &user)?;
+    file.write_all(id.as_bytes())?;
+    file.sync_all()?;
+    Ok(id)
+}
+
+#[cfg(windows)]
+mod windows_acl {
+    use anyhow::{Context, Result, ensure};
+    use std::{
+        ffi::{OsStr, c_void},
+        fs::File,
+        os::windows::{ffi::OsStrExt, io::FromRawHandle},
+        path::Path,
+        ptr::{null, null_mut},
+    };
+    use windows_sys::Win32::{
+        Foundation::{
+            CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, GENERIC_READ, GENERIC_WRITE,
+            GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+        },
+        Security::{
+            ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
+            Authorization::{
+                ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+                GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
+            },
+            DACL_SECURITY_INFORMATION, GetAce, GetTokenInformation, INHERIT_ONLY_ACE,
+            OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+            TOKEN_QUERY, TOKEN_USER, TokenUser,
+        },
+        Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateDirectoryW, CreateFileW,
+            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            GetFileInformationByHandle, OPEN_ALWAYS, OPEN_EXISTING, READ_CONTROL,
+        },
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+
+    const SYSTEM: &str = "S-1-5-18";
+    const ADMINISTRATORS: &str = "S-1-5-32-544";
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+    // Any right that lets a principal change the object or what it contains.
+    const WRITE_RIGHTS: u32 = 0x0002 // FILE_WRITE_DATA / FILE_ADD_FILE
+        | 0x0004 // FILE_APPEND_DATA / FILE_ADD_SUBDIRECTORY
+        | 0x0010 // FILE_WRITE_EA
+        | 0x0040 // FILE_DELETE_CHILD
+        | 0x0100 // FILE_WRITE_ATTRIBUTES
+        | 0x0001_0000 // DELETE
+        | 0x0004_0000 // WRITE_DAC
+        | 0x0008_0000 // WRITE_OWNER
+        | 0x1000_0000 // GENERIC_ALL
+        | 0x4000_0000; // GENERIC_WRITE
+
+    fn wide(path: &Path) -> Vec<u16> {
+        OsStr::new(path).encode_wide().chain([0]).collect()
+    }
+
+    fn sid_string(sid: PSID) -> Result<String> {
+        let mut text = null_mut();
+        // SAFETY: `sid` points into a buffer owned by the caller; the string is
+        // freed with LocalFree as ConvertSidToStringSidW requires.
+        unsafe {
+            ensure!(
+                ConvertSidToStringSidW(sid, &mut text) != 0,
+                "cannot read Windows SID"
+            );
+            let len = (0..).take_while(|&i| *text.add(i) != 0).count();
+            let value = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
+            LocalFree(text.cast());
+            Ok(value)
+        }
+    }
+
+    pub(super) fn current_user_sid() -> Result<String> {
+        // SAFETY: the token handle is closed below, and TOKEN_USER is read only
+        // from a buffer GetTokenInformation reported as large enough.
+        unsafe {
+            let mut token: HANDLE = null_mut();
+            ensure!(
+                OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) != 0,
+                "cannot open the Windows process token"
+            );
+            let mut buffer = vec![0u64; 64];
+            let mut needed = 0;
+            let ok = GetTokenInformation(
+                token,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                (buffer.len() * 8) as u32,
+                &mut needed,
+            );
+            CloseHandle(token);
+            ensure!(ok != 0, "cannot read the Windows user SID");
+            sid_string((*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid)
+        }
+    }
+
+    /// A security descriptor granting only `user` full control, protected from
+    /// inheritance and inherited by anything created inside it.
+    struct UserOnly(PSECURITY_DESCRIPTOR);
+
+    impl UserOnly {
+        fn new(user: &str) -> Result<Self> {
+            let sddl: Vec<u16> = format!("D:P(A;OICI;FA;;;{user})")
+                .encode_utf16()
+                .chain([0])
+                .collect();
+            let mut descriptor = null_mut();
+            // SAFETY: `sddl` is NUL-terminated; the descriptor is freed in Drop.
+            let ok = unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    null_mut(),
+                )
+            };
+            ensure!(ok != 0, "cannot build a private Windows ACL");
+            Ok(Self(descriptor))
+        }
+
+        fn attributes(&self) -> SECURITY_ATTRIBUTES {
+            SECURITY_ATTRIBUTES {
+                nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: self.0,
+                bInheritHandle: 0,
+            }
+        }
+    }
+
+    impl Drop for UserOnly {
+        fn drop(&mut self) {
+            // SAFETY: allocated by ConvertStringSecurityDescriptorToSecurityDescriptorW.
+            unsafe { LocalFree(self.0) };
+        }
+    }
+
+    pub(super) fn create_private_dir(path: &Path, user: &str) -> Result<()> {
+        let descriptor = UserOnly::new(user)?;
+        let attributes = descriptor.attributes();
+        let path = wide(path);
+        // SAFETY: the path is NUL-terminated and `attributes` outlives the call.
+        let created = unsafe { CreateDirectoryW(path.as_ptr(), &attributes) } != 0;
+        ensure!(
+            created || unsafe { GetLastError() } == ERROR_ALREADY_EXISTS,
+            "cannot create Borg private metadata directory"
+        );
+        Ok(())
+    }
+
+    fn open(
+        path: &Path,
+        access: u32,
+        disposition: u32,
+        attributes: Option<&SECURITY_ATTRIBUTES>,
+    ) -> std::io::Result<File> {
+        let path = wide(path);
+        // SAFETY: the path is NUL-terminated, `attributes` outlives the call,
+        // and a valid handle is owned by the returned File.
+        let handle = unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                access | READ_CONTROL | FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                attributes.map_or(null(), |attributes| attributes),
+                disposition,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { File::from_raw_handle(handle) })
+    }
+
+    /// Open a directory and check it is a real directory with a safe ACL.
+    pub(super) fn open_checked(path: &Path, private: bool, user: &str) -> Result<File> {
+        let file = open(path, 0, OPEN_EXISTING, None)
+            .context("unsafe/unreadable Borg metadata directory")?;
+        let info = information(&file)?;
+        ensure!(
+            info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0
+                && info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+            "unsafe/unreadable Borg metadata directory"
+        );
+        ensure!(
+            check_acl(&file, user, private)?,
+            "unsafe Borg metadata directory permissions: {}",
+            path.display()
+        );
+        Ok(file)
+    }
+
+    /// Open (or, with `create`, open-or-create) a private file; `None` when
+    /// it does not exist and `create` is false.
+    pub(super) fn open_private_file(path: &Path, create: bool, user: &str) -> Result<Option<File>> {
+        let descriptor = UserOnly::new(user)?;
+        let attributes = descriptor.attributes();
+        let (access, disposition) = if create {
+            (GENERIC_READ | GENERIC_WRITE, OPEN_ALWAYS)
+        } else {
+            (GENERIC_READ, OPEN_EXISTING)
+        };
+        let file = match open(path, access, disposition, create.then_some(&attributes)) {
+            Ok(file) => file,
+            Err(error) if !create && error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) => {
+                return Ok(None);
+            }
+            Err(error) => anyhow::bail!("cannot open Borg device metadata: {error}"),
+        };
+        check_private_file(&file, user)?;
+        Ok(Some(file))
+    }
+
+    pub(super) fn create_private_file(path: &Path, user: &str) -> Result<File> {
+        let descriptor = UserOnly::new(user)?;
+        let attributes = descriptor.attributes();
+        let file = open(path, GENERIC_WRITE, CREATE_NEW, Some(&attributes))
+            .context("cannot create Borg device metadata")?;
+        check_private_file(&file, user)?;
+        Ok(file)
+    }
+
+    fn check_private_file(file: &File, user: &str) -> Result<()> {
+        let info = information(file)?;
+        ensure!(
+            info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) == 0
+                && info.nNumberOfLinks == 1
+                && check_acl(file, user, true)?,
+            "unsafe Borg device metadata file"
+        );
+        Ok(())
+    }
+
+    fn information(file: &File) -> Result<BY_HANDLE_FILE_INFORMATION> {
+        use std::os::windows::io::AsRawHandle;
+        // SAFETY: the handle is open for FILE_READ_ATTRIBUTES.
+        unsafe {
+            let mut info = std::mem::zeroed();
+            ensure!(
+                GetFileInformationByHandle(file.as_raw_handle(), &mut info) != 0,
+                "cannot inspect Borg metadata path"
+            );
+            Ok(info)
+        }
+    }
+
+    /// The owner must be trusted. Untrusted principals may hold no access at
+    /// all when `private`, and no write access otherwise. Deny entries only
+    /// remove access and inherit-only entries do not apply to this object;
+    /// any other entry kind is refused rather than interpreted.
+    fn check_acl(file: &File, user: &str, private: bool) -> Result<bool> {
+        use std::os::windows::io::AsRawHandle;
+        let trusted = |sid: &str| sid == user || sid == SYSTEM || sid == ADMINISTRATORS;
+        let mut owner: PSID = null_mut();
+        let mut dacl: *mut ACL = null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+        // SAFETY: owner and dacl point into `descriptor`, freed below; ACEs are
+        // read only through GetAce within the ACL's own count.
+        unsafe {
+            let status = GetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut descriptor,
+            );
+            ensure!(status == 0, "cannot read the Borg metadata ACL");
+            let verdict = (|| -> Result<bool> {
+                // A null DACL grants everyone full access.
+                if dacl.is_null() || !trusted(&sid_string(owner)?) {
+                    return Ok(false);
+                }
+                for index in 0..(*dacl).AceCount as u32 {
+                    let mut ace: *mut c_void = null_mut();
+                    ensure!(
+                        GetAce(dacl, index, &mut ace) != 0,
+                        "cannot read the Borg metadata ACL"
+                    );
+                    let header = &*ace.cast::<ACE_HEADER>();
+                    if header.AceFlags as u32 & INHERIT_ONLY_ACE != 0
+                        || header.AceType == ACCESS_DENIED_ACE_TYPE
+                    {
+                        continue;
+                    }
+                    if header.AceType != ACCESS_ALLOWED_ACE_TYPE {
+                        return Ok(false);
+                    }
+                    let allowed = &*ace.cast::<ACCESS_ALLOWED_ACE>();
+                    let sid = sid_string((&raw const allowed.SidStart).cast_mut().cast())?;
+                    if !trusted(&sid) && (private || allowed.Mask & WRITE_RIGHTS != 0) {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            })();
+            LocalFree(descriptor);
+            verdict
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn private_device_id(_: &Path) -> Result<String> {
     anyhow::bail!(
         "Borg native device persistence requires verified private filesystem ACL support on this platform"
@@ -1391,6 +1750,52 @@ mod tests {
         assert!(private_device_id(home.path()).is_err());
         let other = tempfile::tempdir().unwrap();
         symlink(home.path().join(".config"), other.path().join(".config")).unwrap();
+        assert!(private_device_id(other.path()).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn device_is_stable_private_and_rejects_junction_paths() {
+        let run = |program: &str, args: &[&std::ffi::OsStr]| {
+            assert!(
+                std::process::Command::new(program)
+                    .args(args)
+                    .stdout(std::process::Stdio::null())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        let home = tempfile::tempdir().unwrap();
+        let id = private_device_id(home.path()).unwrap();
+        assert_eq!(id.len(), 64);
+        assert_eq!(id, private_device_id(home.path()).unwrap());
+        assert!(
+            id.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        );
+        // Everyone (S-1-1-0) may read the device file: no longer private.
+        let path = home
+            .path()
+            .join(".config/borg/claude-subscription/device-id");
+        run(
+            "icacls",
+            &[path.as_os_str(), "/grant".as_ref(), "*S-1-1-0:R".as_ref()],
+        );
+        assert!(private_device_id(home.path()).is_err());
+        let other = tempfile::tempdir().unwrap();
+        let link = other.path().join(".config");
+        let target = home.path().join(".config");
+        run(
+            "cmd",
+            &[
+                "/c".as_ref(),
+                "mklink".as_ref(),
+                "/J".as_ref(),
+                link.as_os_str(),
+                target.as_os_str(),
+            ],
+        );
         assert!(private_device_id(other.path()).is_err());
     }
 }
