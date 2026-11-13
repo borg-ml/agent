@@ -43,6 +43,17 @@ use crate::cli::{
 use crate::remote_commands::{print_local_workspaces, run_local_agent, run_remote_command};
 
 fn main() -> Result<()> {
+    // Borg locates every per-user file (credentials, config, skills, the
+    // Claude authority) through HOME, which Windows does not set; its home is
+    // USERPROFILE. Set HOME from it, as Git for Windows does, so those lookups
+    // and the children that inherit HOME work. Still single-threaded here.
+    #[cfg(windows)]
+    if std::env::var_os("HOME").is_none_or(|home| home.is_empty())
+        && let Some(profile) = std::env::var_os("USERPROFILE").filter(|p| !p.is_empty())
+    {
+        // SAFETY: no other thread exists yet to read the environment.
+        unsafe { std::env::set_var("HOME", profile) };
+    }
     // The Linux computer-use worker is a synchronous JSONL loop that Borg
     // re-executes itself as; it needs no async runtime.
     #[cfg(target_os = "linux")]

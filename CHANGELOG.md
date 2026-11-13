@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.21.0)
 
+- On Windows, sending a message no longer fails with "HOME missing for
+  Claude authority", and Borg finds your Claude, ChatGPT and OpenCode logins,
+  config, skills and extensions. Borg looks these up under HOME, which
+  Windows does not set; it now uses your profile folder (USERPROFILE) when
+  HOME is unset, as Git for Windows does.
 - Signing in to Claude with a subscription works on Windows. Borg refused
   with "Borg native device persistence requires verified private filesystem
   ACL support on this platform" because Windows had no way to keep its
