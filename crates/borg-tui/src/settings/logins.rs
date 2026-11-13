@@ -458,7 +458,7 @@ pub(crate) fn action(
             let account = match id {
                 SettingId::LaneSignIn(_) if has_login => match named(view.lane, editor) {
                     Ok(account) => Some(account),
-                    Err(notice) => return Some(notice),
+                    Err(notice) => return Some(UiAction::Notice(notice)),
                 },
                 SettingId::LaneSignIn(_) => {
                     Some(editor.name(view.lane).trim().to_string()).filter(|name| !name.is_empty())
@@ -474,7 +474,7 @@ pub(crate) fn action(
             let view = view(lanes, position)?;
             let account = match named(view.lane, editor) {
                 Ok(account) => account,
-                Err(notice) => return Some(notice),
+                Err(notice) => return Some(UiAction::Notice(notice)),
             };
             let key = editor.key(view.lane).trim();
             if key.is_empty() {
@@ -494,13 +494,16 @@ pub(crate) fn action(
     }
 }
 
-fn named(lane: Lane, editor: &AccountEditor) -> std::result::Result<String, UiAction> {
+/// The notice the user must see when the name is missing, as text rather than
+/// a `UiAction`: a whole action in an `Err` costs every caller's frame for the
+/// largest variant in the enum.
+fn named(lane: Lane, editor: &AccountEditor) -> std::result::Result<String, String> {
     let name = editor.name(lane).trim();
     if name.is_empty() {
-        return Err(UiAction::Notice(format!(
+        return Err(format!(
             "Type a name for the new {} login first.",
             lane.label()
-        )));
+        ));
     }
     Ok(name.to_string())
 }

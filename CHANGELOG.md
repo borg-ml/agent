@@ -9,6 +9,13 @@ Git comparison.
   script, CI) no longer hangs after Borg exits. The session cluster Borg
   starts kept Borg's own stdout open for as long as it ran, so the reader
   waited on PostgreSQL instead of on Borg.
+- On Windows, Borg starts its session cluster on an account with
+  administrator rights (how CI runners and many developer machines run). Borg
+  handed `initdb` a directory it had already created, and `initdb` then tries
+  to change that directory's permissions, which Windows refuses to an
+  administrator token (`initdb: could not change permissions of directory ...
+  Permission denied`, PostgreSQL bug #17164). `initdb` now creates the
+  directory itself, and Borg renames the result into place as before.
 - Borg finds the PostgreSQL the installer sets up (under
   `%LOCALAPPDATA%\Borg\postgres` on Windows, `~/.local/share/borg/postgres`
   elsewhere) even in a terminal opened before the install, and Homebrew's

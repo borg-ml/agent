@@ -8411,7 +8411,10 @@ async fn a_replayed_message_with_a_lost_blob_keeps_its_text_and_other_images() {
 
     let (resolved, unavailable) =
         resolve_replayed_message_attachments(root.path(), &captured).await;
-    assert_eq!(resolved, vec![attachment_blob_path(root.path(), &captured[0])]);
+    assert_eq!(
+        resolved,
+        vec![attachment_blob_path(root.path(), &captured[0])]
+    );
     assert_eq!(unavailable, vec![captured[1].name.clone()]);
     assert_eq!(
         with_unavailable_image_notes("look at these".to_string(), &unavailable),

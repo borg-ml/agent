@@ -250,6 +250,14 @@ impl ManagedCluster {
     /// drops this future -- leaves a directory that every later run reads as a
     /// finished cluster. Building in a sibling and renaming makes the cluster
     /// appear in one step or not at all.
+    ///
+    /// The directory passed to `-D` must not exist yet. `initdb` fixes the
+    /// permissions of an existing empty directory before writing anything, and
+    /// on Windows that `chmod` fails with `Permission denied` when the process
+    /// runs under an administrator token (PostgreSQL bug #17164) -- which is how
+    /// GitHub's Windows runners run. A directory it creates itself is not
+    /// chmodded, so the cluster is built one level below the staging directory
+    /// and only that level is renamed into place.
     async fn initialize(&self, initdb: &Path) -> Result<()> {
         let Some(parent) = self.data_dir.parent() else {
             bail!("{} has no parent directory", self.data_dir.display());
@@ -263,7 +271,7 @@ impl ManagedCluster {
         // A private directory with a random name, so nothing here can collide
         // with, or delete, a path some other run owns. Dropping it removes it,
         // which covers every failure and cancellation below.
-        let staging = tempfile::Builder::new()
+        let staging_root = tempfile::Builder::new()
             .prefix(".pgdata-initdb-")
             .tempdir_in(parent)
             .with_context(|| {
@@ -272,6 +280,9 @@ impl ManagedCluster {
                     parent.display()
                 )
             })?;
+        // Absent, so `initdb` creates it; the guard above removes it with
+        // everything in it on any failure or cancellation below.
+        let staging = staging_root.path().join("data");
         tracing::info!(data_dir = %self.data_dir.display(), "initialising the Borg session cluster");
         // Trust auth is safe here and only here: the cluster listens on
         // loopback and a unix socket inside Borg's own home directory, and it
@@ -283,7 +294,7 @@ impl ManagedCluster {
             // interrupt the staging directory, which the guard then removes.
             .kill_on_drop(true)
             .arg("-D")
-            .arg(staging.path())
+            .arg(&staging)
             .arg("-U")
             .arg(ROLE)
             .arg("--auth-local=trust")
@@ -300,23 +311,20 @@ impl ManagedCluster {
                 last_error_line(&output.stderr)
             );
         }
-        // Past here the directory is moved rather than deleted, so ownership
-        // of it leaves the guard.
-        let staging = staging.keep();
         // Fails rather than overwrites when another process got there first,
         // which is the outcome we wanted and is re-checked as such. An
         // existing data directory is never removed: it may be a cluster this
         // Borg does not know about, and losing it is unrecoverable.
-        if std::fs::rename(&staging, &self.data_dir).is_err() {
-            // Only ever the directory this call created.
-            std::fs::remove_dir_all(&staging).ok();
+        if let Err(error) = std::fs::rename(&staging, &self.data_dir) {
             if self.is_initialized() {
                 return Ok(());
             }
-            bail!(
-                "could not move the new cluster into {}",
-                self.data_dir.display()
-            );
+            return Err(error).with_context(|| {
+                format!(
+                    "could not move the new cluster into {}",
+                    self.data_dir.display()
+                )
+            });
         }
         Ok(())
     }
