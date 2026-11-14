@@ -3,8 +3,20 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.21.1)
+## Unreleased (since 0.21.2)
 
+## 0.21.2 (2026-11-14)
+
+- A Claude or ChatGPT login can be removed: press Delete on it in
+  Settings › Providers, or run `borg accounts remove claude NAME`. Removing a
+  login Borg created deletes the credentials it stored; a login that belongs to
+  another tool is only forgotten. The last login on a provider is kept, since
+  signing out is the provider's own job.
+- Connecting another subscription no longer demands a name. Leave the field
+  blank and the login is called "Profile 1", "Profile 2", and so on, and names
+  may now contain spaces.
+- The confusing "New login key" field is now "Key to connect" and says what it
+  does: paste the key there, then use the button below to add it.
 - Updated the QUIC networking libraries (quinn-proto, quinn-udp) and rustix to
   fix security advisories RUSTSEC-2026-0523, -0524, -0538 and -0486.
 

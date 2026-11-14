@@ -223,7 +223,12 @@ pub(crate) fn detail_rows(
     }
     for (index, account) in view.accounts.iter().enumerate() {
         let id = Id::LaneAccount(position, index);
-        let removable = lane.keys(account.kind).is_some();
+        let removable = view
+            .accounts
+            .iter()
+            .filter(|other| other.kind == account.kind)
+            .count()
+            > 1;
         let state = if account.active {
             "Turns on this provider use this login now."
         } else if account.kind == AccountKind::ApiKey && lane.has_subscriptions() {
@@ -290,16 +295,19 @@ pub(crate) fn detail_rows(
         rows.push(row(
             Id::LaneName(position),
             "New login name",
-            "Name for the next login: 1-40 letters, digits, '-' or '_'.".to_string(),
+            format!(
+                "Optional name for the login below, up to 40 letters, digits, spaces, '-' or '_'. Leave it blank to call it {}.",
+                default_name(view.accounts.iter().map(|account| account.name.as_str()))
+            ),
             SettingControl::Text(editor.name(lane).to_string()),
         ));
     }
     if !key_kinds.is_empty() {
         rows.push(row(
             Id::LaneKey(position),
-            "New login key",
+            "Key to connect",
             format!(
-                "The key for that login. {}It is kept in Borg's credential store, never in a session or a journal.",
+                "Paste the key here, then use the button below to add it under the name above. {}It is kept in Borg's credential store, never in a session or a journal.",
                 if lane == Lane::OpenCode { "Get it at opencode.ai/auth. " } else { "" }
             ),
             SettingControl::Secret(if editor.key(lane).is_empty() {
@@ -333,11 +341,13 @@ pub(crate) fn detail_rows(
             rows.push(row(
                 Id::LaneSignIn(position),
                 "Add subscription",
-                format!(
-                    "Sign in to {} {label} subscription{}. Your browser opens; the current login keeps working until the new one succeeds.",
-                    if subscriptions > 0 { "another" } else { "a" },
-                    if subscriptions > 0 { " under the name above" } else { "" }
-                ),
+                match subscriptions {
+                    0 => format!("Sign in to a {label} subscription. Your browser opens."),
+                    _ => format!(
+                        "Sign in to another {label} subscription and keep it as {}. Your browser opens; the current login keeps working until the new one succeeds.",
+                        named(view, editor)
+                    ),
+                },
                 SettingControl::Action("Sign in with browser".to_string()),
             ));
         }
@@ -412,8 +422,13 @@ pub(crate) fn removal(id: SettingId, lanes: &[LaneView]) -> Option<UiAction> {
     };
     let view = view(lanes, position)?;
     let account = view.accounts.get(index)?;
-    view.lane.keys(account.kind)?;
-    Some(UiAction::RemoveAccount {
+    // The lane keeps one login of each kind to spend, so the last one stays.
+    let same_kind = view
+        .accounts
+        .iter()
+        .filter(|other| other.kind == account.kind)
+        .count();
+    (same_kind > 1).then(|| UiAction::RemoveAccount {
         lane: view.lane,
         kind: account.kind,
         account: account.name.clone(),
@@ -456,10 +471,7 @@ pub(crate) fn action(
                 .any(|account| account.kind == AccountKind::Subscription);
             // Renewing, or a first login, needs no name; another one does.
             let account = match id {
-                SettingId::LaneSignIn(_) if has_login => match named(view.lane, editor) {
-                    Ok(account) => Some(account),
-                    Err(notice) => return Some(UiAction::Notice(notice)),
-                },
+                SettingId::LaneSignIn(_) if has_login => Some(named(view, editor)),
                 SettingId::LaneSignIn(_) => {
                     Some(editor.name(view.lane).trim().to_string()).filter(|name| !name.is_empty())
                 }
@@ -472,10 +484,7 @@ pub(crate) fn action(
         }
         SettingId::LaneSaveKey(position, kind) => {
             let view = view(lanes, position)?;
-            let account = match named(view.lane, editor) {
-                Ok(account) => account,
-                Err(notice) => return Some(UiAction::Notice(notice)),
-            };
+            let account = named(view, editor);
             let key = editor.key(view.lane).trim();
             if key.is_empty() {
                 return Some(UiAction::Notice(format!(
@@ -494,18 +503,31 @@ pub(crate) fn action(
     }
 }
 
-/// The notice the user must see when the name is missing, as text rather than
-/// a `UiAction`: a whole action in an `Err` costs every caller's frame for the
-/// largest variant in the enum.
-fn named(lane: Lane, editor: &AccountEditor) -> std::result::Result<String, String> {
-    let name = editor.name(lane).trim();
-    if name.is_empty() {
-        return Err(format!(
-            "Type a name for the new {} login first.",
-            lane.label()
-        ));
+/// The name the next login takes: what the user typed, or a free default so
+/// connecting one never requires naming it.
+fn named(view: &LaneView, editor: &AccountEditor) -> String {
+    let typed = editor.name(view.lane).trim();
+    if typed.is_empty() {
+        default_name(view.accounts.iter().map(|account| account.name.as_str()))
+    } else {
+        typed.to_string()
     }
-    Ok(name.to_string())
+}
+
+/// The first free "Profile N" among `names`, the name a login gets when the
+/// field is left blank.
+pub(crate) fn default_name<'a>(names: impl Iterator<Item = &'a str>) -> String {
+    let names: Vec<&str> = names.collect();
+    for index in 1.. {
+        let candidate = format!("Profile {index}");
+        if !names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(&candidate))
+        {
+            return candidate;
+        }
+    }
+    unreachable!("some number is free")
 }
 
 #[cfg(test)]
@@ -598,15 +620,16 @@ mod tests {
             Some(UiAction::SwitchAccount { kind: AccountKind::ApiKey, account, .. }) if account == "default"
         ));
         assert!(action(SettingId::LaneAccount(0, 0), &lanes, &editor).is_none());
-        // An OAuth login owns rotating tokens and cannot be removed here.
-        assert!(removal(SettingId::LaneAccount(0, 0), &lanes).is_none());
+        // Either kind of login is removable while another of its kind stays.
         assert!(matches!(
-            removal(SettingId::LaneAccount(0, 2), &lanes),
+            removal(SettingId::LaneAccount(0, 1), &lanes),
             Some(UiAction::RemoveAccount {
-                kind: AccountKind::ApiKey,
+                kind: AccountKind::Subscription,
                 ..
             })
         ));
+        // The only key on the lane is the one turns fall back to.
+        assert!(removal(SettingId::LaneAccount(0, 2), &lanes).is_none());
     }
 
     // While a browser sign-in is pending, its lane offers the page again
@@ -643,10 +666,10 @@ mod tests {
         ));
     }
 
-    // Adding a login must not fire with half the input; a key needs both the
-    // name and the key before anything is written.
+    // Adding a login must not fire with half the input, and an unnamed one
+    // still gets a name of its own rather than a collision.
     #[test]
-    fn adding_a_key_requires_its_name_and_key() {
+    fn adding_a_key_needs_the_key_and_names_itself() {
         let lanes = [LaneView {
             lane: Lane::OpenRouter,
             strategy: Strategy::Drain,
@@ -660,6 +683,14 @@ mod tests {
             action(save, &lanes, &editor),
             Some(UiAction::Notice(_))
         ));
+        edit(&mut editor, SettingId::LaneKey(position), "sk-or")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            action(save, &lanes, &editor),
+            Some(UiAction::AddKeyAccount { account, .. }) if account == "Profile 1"
+        ));
+        editor.keys[lane_index(Lane::OpenRouter)].clear();
         edit(&mut editor, SettingId::LaneName(position), "home")
             .unwrap()
             .unwrap();
@@ -680,5 +711,15 @@ mod tests {
             row.id,
             SettingId::LaneSignIn(_) | SettingId::LaneStrategy(_)
         )));
+    }
+
+    // Two logins added without a name must not land on the same one.
+    #[test]
+    fn an_unnamed_login_takes_the_first_free_profile_name() {
+        assert_eq!(default_name(["default", "work"].into_iter()), "Profile 1");
+        assert_eq!(
+            default_name(["Profile 1", "profile 2"].into_iter()),
+            "Profile 3"
+        );
     }
 }

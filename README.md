@@ -37,11 +37,14 @@ existing installation.
 ## Quick start
 
 ```sh
-borg login codex      # or: claude, opencode, openrouter, ... (see below)
 borg                  # start a session in the current directory
 borg resume           # pick up the latest session; `borg resume <id>` for one
 borg doctor           # check storage and provider readiness
 ```
+
+Connecting a provider is **Settings › Providers** inside a session (or
+`/login`); `borg login codex` and the rest of the commands below are the
+scripted equivalent.
 
 Inside a session, type a request; `/help` lists the controls and Ctrl-C twice
 exits (the session stays resumable). For an edge-to-edge TUI in Ghostty, see the
@@ -49,8 +52,15 @@ exits (the session stays resumable). For an edge-to-edge TUI in Ghostty, see the
 
 ## Connecting providers
 
-`borg login` with no argument lists every provider and whether it is connected.
-Inside a session, `/login` switches connections and `/model` switches models.
+Connecting, switching and disconnecting providers is a settings screen:
+**Settings › Providers** shows every provider, which logins it has, what each
+one has left, and lets you add, select or remove one without remembering a
+command. The same screen is reachable in a session with `/login`, and `/model`
+switches models.
+
+The commands below do exactly what the screen does; they exist for scripts,
+remote shells and agents, not because connecting a provider should need a
+terminal.
 
 | Provider | Connect | Notes |
 | --- | --- | --- |
@@ -68,14 +78,21 @@ are stored in `~/.borg/credentials.json` (mode 0600); an environment variable
 for the same key takes precedence. Subscription limits never switch you to API
 billing automatically, and the footer shows the active billing mode.
 
-Several Claude or ChatGPT subscriptions can stay connected at once. Give each
-sign-in its own name:
+Several Claude or ChatGPT subscriptions can stay connected at once. On a
+provider's page in Settings › Providers, *Add subscription* connects another
+one: name it, or leave the name blank and it takes the next free `Profile N`.
+Enter moves the next turns to a login, and Delete removes one, deleting the
+credentials Borg stored for it (a login that belongs to another tool is only
+forgotten). The last login on a provider is kept, because signing out is the
+provider's own job.
+
+The same four verbs from a terminal, for scripts:
 
 ```sh
 borg login claude --account work
-borg login codex --account personal
 borg accounts                       # every login, with what is left and when it resets
 borg accounts use claude work       # the login turns bill from now on
+borg accounts remove claude work    # forget it, and the credentials Borg stored
 ```
 
 Each named login keeps its own authority under `~/.borg/accounts/`, so one
@@ -86,10 +103,10 @@ another login of the same provider and never moves a turn to API-key billing. A
 login connected before named accounts appear as `default`.
 
 By default a turn moves to the login of the same provider that has the most
-quota left, so an exhausted subscription no longer stops the work; settings has
-a Subscriptions page with every login, its remaining windows, and a
-per-provider Manual/Automatic switch, and `borg accounts` shows the same
-picture from a terminal. Plans billed by a key rather than a sign-in
+quota left, so an exhausted subscription no longer stops the work. The
+provider's page in Settings › Providers shows each login's remaining windows
+and its Manual/Most headroom/Soonest reset switch; `borg accounts` prints the
+same picture. Plans billed by a key rather than a sign-in
 (OpenCode Go, GLM Coding, Kimi Code, Qwen Coding) keep several named keys and
 spread turns over them.
 

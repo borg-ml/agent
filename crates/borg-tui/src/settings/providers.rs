@@ -143,13 +143,16 @@ fn login_rows(
     rows.push(text(
         Id::ProviderLoginName,
         "New login name",
-        "Name for the next key: 1-40 letters, digits, '-' or '_'.",
+        &format!(
+            "Optional name for the key below, up to 40 letters, digits, spaces, '-' or '_'. Leave it blank to call it {}.",
+            super::logins::default_name(accounts.iter().map(|account| account.name.as_str()))
+        ),
         &editor.login_name,
     ));
     rows.push(row(
         Id::ProviderLoginKey,
-        "New login key",
-        "The key for that login. It is kept in Borg's credential store, never in a session or a journal.",
+        "Key to connect",
+        "Paste the key here, then use the button below to add it under the name above. It is kept in Borg's credential store, never in a session or a journal.",
         SettingControl::Secret(if editor.login_key.is_empty() {
             String::new()
         } else {
@@ -410,23 +413,27 @@ impl SettingsScreen {
                 });
             }
             Id::ProviderLoginSave => {
+                let id = self.provider_editor.as_ref()?.original.as_ref()?.0.clone();
+                let accounts =
+                    borg_provider::key_accounts::list(borg_provider::KeyStore::Custom(id.clone()))
+                        .unwrap_or_default();
                 let editor = self.provider_editor.as_mut()?;
-                let (id, _) = editor.original.as_ref()?;
-                let notice = if editor.login_name.trim().is_empty() {
-                    Some("Type a name for the new key first.")
-                } else if editor.login_key.trim().is_empty() {
-                    Some("Paste the key for that login first.")
-                } else {
-                    None
-                };
-                if let Some(notice) = notice {
+                if editor.login_key.trim().is_empty() {
                     return Some(SettingsEffect::Apply(Box::new(UiAction::Notice(
-                        notice.to_string(),
+                        "Paste the key for that login first.".to_string(),
                     ))));
                 }
+                let typed = std::mem::take(&mut editor.login_name).trim().to_string();
+                let account = if typed.is_empty() {
+                    super::logins::default_name(
+                        accounts.iter().map(|account| account.name.as_str()),
+                    )
+                } else {
+                    typed
+                };
                 let action = UiAction::AddCustomKey {
-                    provider: id.clone(),
-                    account: std::mem::take(&mut editor.login_name).trim().to_string(),
+                    provider: id,
+                    account,
                     key: std::mem::take(&mut editor.login_key).trim().to_string(),
                 };
                 return Some(SettingsEffect::Apply(Box::new(action)));

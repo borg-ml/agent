@@ -204,6 +204,9 @@ async fn run() -> Result<()> {
             Some(AccountsCommand::Use { provider, account }) => {
                 remote_commands::use_account_command(provider, account).await
             }
+            Some(AccountsCommand::Remove { provider, account }) => {
+                remote_commands::remove_account_command(provider, account).await
+            }
             Some(AccountsCommand::Strategy { provider, strategy }) => {
                 remote_commands::strategy_account_command(provider, strategy).await
             }

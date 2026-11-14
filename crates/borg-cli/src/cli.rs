@@ -1475,6 +1475,13 @@ pub(crate) enum AccountsCommand {
         /// Account name as shown by `borg accounts`.
         account: String,
     },
+    /// Forget a connected account and the credentials Borg stored for it.
+    Remove {
+        #[arg(value_enum)]
+        provider: SubscriptionProviderArg,
+        /// Account name as shown by `borg accounts`.
+        account: String,
+    },
     /// Choose whether turns may switch between this provider's logins.
     Strategy {
         #[arg(value_enum)]

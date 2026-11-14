@@ -26,6 +26,9 @@ pub struct SubscriptionAccount {
 }
 
 pub fn validate_name(name: &str) -> Result<&str> {
+    // A space is allowed inside a name so a login can be called "Profile 2";
+    // it never appears at either end, where it would be invisible and would
+    // make two names that read the same differ.
     let valid = !name.is_empty()
         && name.len() <= 40
         && name
@@ -33,11 +36,16 @@ pub fn validate_name(name: &str) -> Result<&str> {
             .next()
             .is_some_and(|first| first.is_ascii_alphanumeric())
         && name.chars().all(|character| {
-            character.is_ascii_alphanumeric() || character == '-' || character == '_'
-        });
+            character.is_ascii_alphanumeric()
+                || character == '-'
+                || character == '_'
+                || character == ' '
+        })
+        && !name.ends_with(' ')
+        && !name.contains("  ");
     ensure!(
         valid,
-        "subscription account name must be 1-40 ASCII letters, digits, '-' or '_'"
+        "login name must be 1-40 ASCII letters, digits, spaces, '-' or '_'"
     );
     Ok(name)
 }
@@ -302,6 +310,61 @@ pub async fn activate(provider: ProviderAuthProvider, name: &str) -> Result<Subs
     })
 }
 
+/// Forget a connected login, and with it the credentials Borg stored in its own
+/// accounts directory. A login that predates named accounts lives wherever the
+/// provider keeps it (such as `~/.claude`), so removing it only forgets the
+/// entry: those files belong to whatever wrote them.
+pub fn remove(provider: ProviderAuthProvider, name: &str) -> Result<()> {
+    validate_name(name)?;
+    let accounts = stored(provider)?;
+    let removed = accounts
+        .iter()
+        .find(|account| account.name == name)
+        .with_context(|| format!("no connected {} login named {name}", provider.as_str()))?;
+    // The lane always keeps one login to spend; removing the last one is a
+    // sign-out, which the user does in the provider's own client.
+    ensure!(
+        accounts.len() > 1,
+        "cannot remove the only connected {} login",
+        provider.as_str()
+    );
+    ensure!(
+        !(removed.active && env_override(provider).is_some()),
+        "an environment override selects this {} login; unset it before removing one",
+        provider.as_str()
+    );
+    credentials::clear_values(&[&account_key(provider, name)])?;
+    if removed.active
+        && let Some(next) = accounts.iter().find(|account| account.name != name)
+    {
+        write_selection(provider, &next.name, &next.path)?;
+    }
+    if let Some(directory) = owned_directory(provider, name, &removed.path) {
+        match std::fs::remove_dir_all(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("delete {}", directory.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The directory Borg created for `name`, when `path` is the login it wrote
+/// there. Anything else -- a legacy login, a login another tool owns -- is not
+/// Borg's to delete.
+fn owned_directory(provider: ProviderAuthProvider, name: &str, path: &Path) -> Option<PathBuf> {
+    let owned = new_account_path(provider, name).ok()?;
+    if !same_path(&owned, path) {
+        return None;
+    }
+    match provider {
+        ProviderAuthProvider::Claude => Some(owned),
+        ProviderAuthProvider::Openai => owned.parent().map(Path::to_path_buf),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,8 +440,9 @@ mod tests {
             "../escape",
             ".hidden",
             "a/b",
-            "a b",
-            "trailing/",
+            " leading",
+            "trailing ",
+            "double  space",
             &"x".repeat(41),
         ] {
             assert!(
@@ -391,6 +455,41 @@ mod tests {
                 .unwrap()
                 .ends_with("accounts/openai/work-2_x/auth.json")
         );
+        // A login the user never named is called "Profile 2".
+        assert!(
+            new_account_path(ProviderAuthProvider::Claude, "Profile 2")
+                .unwrap()
+                .ends_with("accounts/claude/Profile 2")
+        );
+    }
+
+    // Removing the login turns spend has to leave the lane on another one, and
+    // delete only the credentials Borg wrote itself.
+    #[tokio::test]
+    async fn removing_the_selected_login_selects_another_and_deletes_the_owned_files() {
+        let (_guard, home) = scratch_home().await;
+        let legacy = home.path().join("claude");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join(".credentials.json"), b"{}").unwrap();
+        credentials::set_claude_subscription_config_dir(&legacy).unwrap();
+        let work = new_account_path(ProviderAuthProvider::Claude, "work").unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join(".credentials.json"), b"{}").unwrap();
+        register(ProviderAuthProvider::Claude, "work", &work)
+            .await
+            .unwrap();
+
+        remove(ProviderAuthProvider::Claude, "work").unwrap();
+
+        assert!(!work.exists(), "the removed login's files stayed behind");
+        assert_eq!(
+            credentials::claude_subscription_config_dir().unwrap(),
+            Some(legacy.clone()),
+            "removing the selected login must select the one that is left"
+        );
+        // The last login is never removed: that is a sign-out, not a switch.
+        assert!(remove(ProviderAuthProvider::Claude, "default").is_err());
+        assert!(legacy.exists(), "a login Borg did not create was deleted");
     }
 
     // An operator override must fail loudly instead of being silently ignored

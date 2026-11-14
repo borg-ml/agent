@@ -9319,6 +9319,28 @@ pub(crate) async fn use_account_command(
     Ok(())
 }
 
+/// `borg accounts remove`: forget a connected login, deleting the credentials
+/// Borg stored for it.
+pub(crate) async fn remove_account_command(
+    provider: crate::cli::SubscriptionProviderArg,
+    account: String,
+) -> Result<()> {
+    let lane: borg_provider::subscriptions::Lane = provider.into();
+    borg_provider::subscriptions::remove(
+        lane,
+        borg_provider::subscriptions::AccountKind::Subscription,
+        &account,
+    )?;
+    println!("Removed the {account} {} login.", lane.label());
+    let accounts = borg_remote::provider_usage::subscription_accounts(lane_provider(lane)).await;
+    print_account_rows(
+        lane,
+        &accounts,
+        borg_provider::subscriptions::strategy(lane),
+    );
+    Ok(())
+}
+
 /// `borg accounts strategy`: choose whether turns may switch between the
 /// several logins of one provider on their own.
 pub(crate) async fn strategy_account_command(

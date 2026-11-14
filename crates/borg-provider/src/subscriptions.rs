@@ -426,14 +426,15 @@ pub fn add_key(lane: Lane, kind: AccountKind, name: &str, key: &str) -> Result<(
     Ok(())
 }
 
-/// Disconnect a named key. An OAuth login owns a directory of rotating tokens,
-/// so it is removed by signing that login out, not here.
+/// Disconnect a login, whichever registry keeps it: a key is dropped from its
+/// store, an OAuth login is forgotten together with the credentials Borg wrote
+/// for it.
 pub fn remove(lane: Lane, kind: AccountKind, name: &str) -> Result<()> {
-    let key_lane = lane.keys(kind).with_context(|| {
-        format!(
-            "{} logins own rotating credentials; sign in to another login instead of removing one",
-            lane.label()
-        )
-    })?;
-    key_accounts::remove(key_lane, name)
+    match (kind, lane.auth_provider(), lane.keys(kind)) {
+        (_, _, Some(key_lane)) => key_accounts::remove(key_lane, name),
+        (AccountKind::Subscription, Some(provider), None) => {
+            crate::subscription_accounts::remove(provider, name)
+        }
+        _ => bail!("{} keeps no such login", lane.label()),
+    }
 }

@@ -90,9 +90,9 @@ never moves to API-key billing, and no adapter keeps account state.
 
 Usage is read per account and published with the provider capability snapshot:
 `get_provider_capabilities`, the volatile provider appendix and `borg accounts`
-all report each login's remaining windows and reset times. `select_provider_account`
-(agents), `borg accounts use` (humans) and the settings Subscriptions page change
-which login the next turn bills. Switching only chooses another login of the same provider; it never
+all report each login's remaining windows and reset times. The provider's page in
+Settings › Providers (humans), `select_provider_account` (agents) and
+`borg accounts use` (scripts) change which login the next turn bills. Switching only chooses another login of the same provider; it never
 moves a turn to API-key billing.
 
 ## Model and replay contract
