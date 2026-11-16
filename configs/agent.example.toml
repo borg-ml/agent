@@ -177,6 +177,13 @@ check_interval_hours = 24
 # [compaction.budgets."claude/claude-opus-5"]
 # reserve_tokens = 40000
 # keep_recent_tokens = 250000
+#
+# `context_window_tokens` caps the window a model is treated as having. Context
+# and the compaction request then stay below it exactly as they would on a model
+# whose real window is that size, with both other numbers sized from the cap.
+#
+# [compaction.budgets."claude/claude-haiku-5-5"]
+# context_window_tokens = 100000
 
 # A session left idle is compacted shortly before its prompt cache expires, so
 # the next turn reads a short summary instead of re-reading the whole context

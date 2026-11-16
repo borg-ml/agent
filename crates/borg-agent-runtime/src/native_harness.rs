@@ -373,17 +373,37 @@ impl NativeHarness {
         model: &str,
         context_window_tokens: u64,
     ) -> EffectiveCompactionBudget {
-        if self.configured_model_aliases.contains(model)
-            && let Some((configured_provider, configured_model)) = model.split_once('/')
-        {
-            return self.compaction.resolve(
-                configured_provider,
-                configured_model,
-                context_window_tokens,
-            );
-        }
+        let (provider, model) = self.compaction_key(provider, model);
         self.compaction
-            .resolve(provider.config_alias(), model, context_window_tokens)
+            .resolve(provider, model, context_window_tokens)
+    }
+
+    fn compaction_key<'a>(
+        &self,
+        provider: crate::CodingProvider,
+        model: &'a str,
+    ) -> (&'a str, &'a str) {
+        if self.configured_model_aliases.contains(model)
+            && let Some(parts) = model.split_once('/')
+        {
+            return parts;
+        }
+        (provider.config_alias(), model)
+    }
+
+    /// The window this model runs against: the provider's, lowered to a
+    /// configured `context_window_tokens` ceiling.
+    fn capped_window(
+        &self,
+        provider: crate::CodingProvider,
+        model: &str,
+        window: Option<u64>,
+    ) -> Option<u64> {
+        let (provider, model) = self.compaction_key(provider, model);
+        match (window, self.compaction.context_window_cap(provider, model)) {
+            (Some(window), Some(cap)) => Some(window.min(cap)),
+            (window, cap) => window.or(cap),
+        }
     }
 
     pub(crate) fn replace_configured_model_gateways(
@@ -1002,10 +1022,11 @@ impl NativeHarness {
         // advertised window once so the first round can compact from an
         // estimate. A route that states no window is left to the post-round
         // check rather than compacted against a guess.
-        let mut route_window_tokens = self
-            .model_client
-            .context_window(turn.provider, &model)
-            .await;
+        let mut route_window_tokens = self.capped_window(
+            turn.provider,
+            &model,
+            self.model_client.context_window(turn.provider, &model).await,
+        );
         // Every request this turn sends, compaction included, shares these
         // fields, so each one extends the prefix the previous one cached.
         let mut request_template = ModelTurnRequest {
@@ -1316,11 +1337,15 @@ impl NativeHarness {
             // A response may omit window metadata (notably the public API).
             // Keep the window already resolved for this route instead of
             // shrinking post-round compaction back to the generic fallback.
-            result.usage.context_window_tokens = result
-                .usage
-                .context_window_tokens
-                .filter(|window| *window > 0)
-                .or(route_window_tokens);
+            result.usage.context_window_tokens = self.capped_window(
+                turn.provider,
+                &model,
+                result
+                    .usage
+                    .context_window_tokens
+                    .filter(|window| *window > 0)
+                    .or(route_window_tokens),
+            );
             route_window_tokens = result.usage.context_window_tokens;
             absorb_usage(&mut usage, &result.usage);
             // Goals can change inside the tool loop. Account model rounds now,
@@ -2104,13 +2129,12 @@ impl NativeHarness {
         progress: Option<mpsc::UnboundedSender<NativeCompactionProgress>>,
     ) -> Result<(String, ProviderCallUsage)> {
         let window = match observed_context_window_tokens.filter(|window| *window > 0) {
-            Some(window) => window,
-            None => self
-                .model_client
-                .context_window(provider, model)
-                .await
-                .unwrap_or(NATIVE_ASSUMED_CONTEXT_WINDOW_TOKENS),
+            Some(window) => Some(window),
+            None => self.model_client.context_window(provider, model).await,
         };
+        let window = self
+            .capped_window(provider, model, window)
+            .unwrap_or(NATIVE_ASSUMED_CONTEXT_WINDOW_TOKENS);
         let mut usage = ProviderCallUsage::default();
         if let Some(prefix) =
             prefix.filter(|prefix| prefix.provider == provider && prefix.model == model)

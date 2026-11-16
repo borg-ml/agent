@@ -16,6 +16,11 @@ Git comparison.
   instead of waiting for the limit to reset. Scouts follow their own `[scout]`
   fallback, which also never took effect before. Consult-peer sidecars stay on
   their provider.
+- A compaction budget can cap a model's context window with
+  `context_window_tokens`, for example `100000` under
+  `[compaction.budgets."claude/claude-haiku-5-5"]`. Borg then compacts and
+  sizes the compaction request as if the model's window were that size, so the
+  context stays under it.
 
 ## 0.21.2 (2026-11-14)
 

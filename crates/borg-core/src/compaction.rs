@@ -62,11 +62,17 @@ impl CompactionBudgetSource {
 pub struct CompactionBudgetOverride {
     pub reserve_tokens: Option<u64>,
     pub keep_recent_tokens: Option<u64>,
+    /// Treat the model's window as at most this many tokens, so context, and
+    /// the compaction request itself, stay below it as they would on a model
+    /// whose real window is this size.
+    pub context_window_tokens: Option<u64>,
 }
 
 impl CompactionBudgetOverride {
     pub const fn is_empty(&self) -> bool {
-        self.reserve_tokens.is_none() && self.keep_recent_tokens.is_none()
+        self.reserve_tokens.is_none()
+            && self.keep_recent_tokens.is_none()
+            && self.context_window_tokens.is_none()
     }
 }
 
@@ -81,6 +87,8 @@ pub enum CompactionPolicyError {
     EmptyOverride { key: String },
     /// A reserve of zero disables the guard the budget exists to provide.
     ZeroReserve { key: String },
+    /// A window of zero leaves no room for any request.
+    ZeroWindow { key: String },
     /// The pair cannot fit a context window that is already known.
     ExceedsWindow {
         key: String,
@@ -98,7 +106,12 @@ impl std::fmt::Display for CompactionPolicyError {
             ),
             Self::EmptyOverride { key } => write!(
                 formatter,
-                "compaction budget `{key}` sets neither reserve_tokens nor keep_recent_tokens"
+                "compaction budget `{key}` sets none of reserve_tokens, keep_recent_tokens or \
+                 context_window_tokens"
+            ),
+            Self::ZeroWindow { key } => write!(
+                formatter,
+                "compaction budget `{key}` sets context_window_tokens = 0"
             ),
             Self::ZeroReserve { key } => write!(
                 formatter,
@@ -147,7 +160,15 @@ impl CompactionBudgetPolicy {
             if value.reserve_tokens == Some(0) {
                 return Err(CompactionPolicyError::ZeroReserve { key: key.clone() });
             }
-            let Some(&window) = known_windows.get(key) else {
+            if value.context_window_tokens == Some(0) {
+                return Err(CompactionPolicyError::ZeroWindow { key: key.clone() });
+            }
+            let known = known_windows.get(key).copied();
+            let window = match (known, value.context_window_tokens) {
+                (Some(known), Some(cap)) => Some(known.min(cap)),
+                (known, cap) => known.or(cap),
+            };
+            let Some(window) = window else {
                 continue;
             };
             let reserve = value
@@ -172,6 +193,13 @@ impl CompactionBudgetPolicy {
         self.overrides.is_empty()
     }
 
+    /// The configured ceiling on this model's context window, if any.
+    pub fn context_window_cap(&self, provider: &str, model: &str) -> Option<u64> {
+        self.overrides
+            .get(&budget_key(provider, model))
+            .and_then(|configured| configured.context_window_tokens)
+    }
+
     /// Resolve the budget for one model against the window the provider
     /// actually reported. Each number falls back independently, so an override
     /// that sets only one leaves the other on its percentage default.
@@ -183,6 +211,9 @@ impl CompactionBudgetPolicy {
     ) -> EffectiveCompactionBudget {
         let key = budget_key(provider, model);
         let configured = self.overrides.get(&key).copied().unwrap_or_default();
+        let context_window_tokens = configured
+            .context_window_tokens
+            .map_or(context_window_tokens, |cap| cap.min(context_window_tokens));
 
         let (reserve_tokens, reserve_source) = match configured.reserve_tokens {
             Some(tokens) => (tokens, CompactionBudgetSource::ModelOverride),
@@ -343,6 +374,7 @@ mod tests {
                 CompactionBudgetOverride {
                     reserve_tokens: Some(20_000),
                     keep_recent_tokens: None,
+                    context_window_tokens: None,
                 },
             )]),
             &BTreeMap::new(),
@@ -377,6 +409,7 @@ mod tests {
                 CompactionBudgetOverride {
                     reserve_tokens: Some(150_000),
                     keep_recent_tokens: Some(100_000),
+                    context_window_tokens: None,
                 },
             )]),
             &BTreeMap::new(),
@@ -403,6 +436,7 @@ mod tests {
                 CompactionBudgetOverride {
                     reserve_tokens: Some(0),
                     keep_recent_tokens: None,
+                    context_window_tokens: None,
                 },
             )]),
             &BTreeMap::new(),
@@ -428,6 +462,7 @@ mod tests {
                 CompactionBudgetOverride {
                     reserve_tokens: Some(30_000),
                     keep_recent_tokens: Some(30_000),
+                    context_window_tokens: None,
                 },
             )]),
             &BTreeMap::from([("local/qwen".to_string(), 32_768)]),
@@ -436,6 +471,29 @@ mod tests {
             too_big,
             Err(CompactionPolicyError::ExceedsWindow { .. })
         ));
+    }
+
+    /// A window ceiling must govern the trigger the same way a real window of
+    /// that size would, or context grows past the limit the operator set.
+    #[test]
+    fn a_window_ceiling_compacts_as_a_window_of_that_size() {
+        let policy = CompactionBudgetPolicy::new(
+            BTreeMap::from([(
+                "claude/claude-haiku-5-5".to_string(),
+                CompactionBudgetOverride {
+                    context_window_tokens: Some(100_000),
+                    ..Default::default()
+                },
+            )]),
+            &BTreeMap::new(),
+        )
+        .expect("valid policy");
+        let budget = policy.resolve("claude", "claude-haiku-5-5", 1_000_000);
+        assert_eq!(
+            budget,
+            EffectiveCompactionBudget::defaults_for_window(100_000)
+        );
+        assert!(budget.should_compact(90_000));
     }
 
     /// OpenRouter model ids contain a slash of their own, so a naive split
@@ -449,6 +507,7 @@ mod tests {
                 CompactionBudgetOverride {
                     reserve_tokens: Some(12_000),
                     keep_recent_tokens: None,
+                    context_window_tokens: None,
                 },
             )]),
             &BTreeMap::new(),
