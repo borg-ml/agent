@@ -4621,6 +4621,7 @@ async fn sibling_messages_use_the_shared_team_directory() {
         received.recv().await.unwrap(),
         HostCommand::TeamPrompt {
             delivery: PromptDelivery::Queue,
+            wake: false,
             ..
         }
     ));
@@ -5149,6 +5150,7 @@ async fn cross_workspace_child_messages_use_the_root_manager_and_child_journal()
                 attachments: message.attachments,
                 output_schema: None,
                 delivery: PromptDelivery::Steer,
+                wake: false,
             });
             receipt.unwrap().message_id
         } else {
@@ -5167,6 +5169,7 @@ async fn cross_workspace_child_messages_use_the_root_manager_and_child_journal()
             attachments: vec![PathBuf::from("/must/not/open")],
             output_schema: Some(json!({"forged": true})),
             delivery: PromptDelivery::Queue,
+            wake: false,
         };
         crate::send_local_session_command(&socket, child, retry.clone())
             .await
@@ -5323,6 +5326,7 @@ async fn child_message_handoff_is_message_only_and_preserves_idle_delivery() {
         attachments: vec![],
         output_schema: None,
         delivery: PromptDelivery::Steer,
+        wake: false,
     };
     for command in [
         HostCommand::Prompt {
@@ -5607,6 +5611,7 @@ async fn explicitly_addressed_sessions_get_an_authorized_cross_workspace_channel
             session_id,
             message_id: delivered_id,
             delivery: PromptDelivery::Steer,
+            wake: false,
             ..
         } if session_id == recipient && delivered_id == message_id
     ));
@@ -5648,6 +5653,7 @@ async fn explicitly_addressed_sessions_get_an_authorized_cross_workspace_channel
             session_id,
             message_id: delivered_id,
             delivery: PromptDelivery::Steer,
+            wake: true,
             ..
         } if session_id == sender && reply["message_id"] == delivered_id.to_string()
     ));

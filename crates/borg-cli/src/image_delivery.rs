@@ -64,6 +64,7 @@ pub(crate) async fn run(files: Vec<PathBuf>, session: Option<Uuid>) -> Result<()
             attachments: paths,
             output_schema: None,
             delivery: borg_remote::PromptDelivery::Steer,
+            wake: false,
         }).await?;
         println!(
             "{}",

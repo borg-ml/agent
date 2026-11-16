@@ -2241,7 +2241,16 @@ impl Transcript {
             self.runtime_processes
                 .iter()
                 .filter(|(process_id, process)| {
-                    !watch_ids.contains(process_id)
+                    // A backgrounded shell shares its id with the job that
+                    // tracks it; only a `watch` tool's own process is not a shell.
+                    (!watch_ids.contains(process_id)
+                        || process.tool_index.is_some_and(|index| {
+                            matches!(
+                                self.order.get(index),
+                                Some(TranscriptEntry::Operation(Operation { source, .. }))
+                                    if tool_can_start_background_process(source)
+                            )
+                        }))
                         && process.running
                         && process
                             .tool_index

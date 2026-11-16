@@ -18207,6 +18207,24 @@ fn watcher_process_is_counted_as_a_watcher_not_a_shell() {
         transcript.active_shell_rows(),
         vec![("pid 4242  cargo test".to_string(), Some(0))]
     );
+
+    // A backgrounded shell is tracked by a job carrying its own id; it stays a shell.
+    let mut watches = transcript.watches.clone();
+    watches.push(WatchSummary {
+        watch_id: shell_process_id,
+        label: "run tests".to_string(),
+        command: "exec_command".to_string(),
+        running: true,
+        started_at: Utc::now(),
+        last_event_at: None,
+        event_count: 0,
+    });
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        5,
+        SessionEventKind::WatchesChanged { watches },
+    ));
+    assert_eq!(transcript.shell_status().as_deref(), Some("1 shell"));
 }
 
 /// A watch and a send_message prepared in parallel: the watch's process started

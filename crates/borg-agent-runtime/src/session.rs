@@ -3882,6 +3882,7 @@ async fn run_agent_session_store_kernel_inner(
                                                     attachments: message.attachments,
                                                     output_schema: None,
                                                     delivery: message.delivery,
+                                                    wake: message.wake,
                                                 })
                                             }
                                             Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -4129,6 +4130,7 @@ async fn run_agent_session_store_kernel_inner(
                         attachments,
                         output_schema,
                         delivery,
+                        ..
                     }) if command_session_id == session_id => {
                         team_message_ids.insert(message_id);
                         deferred_commands.push_front(HostCommand::Prompt {
@@ -6858,9 +6860,15 @@ async fn run_agent_session_store_kernel_inner(
                             attachments,
                             output_schema,
                             delivery,
+                            wake,
                             ..
                         } => {
                             team_message_ids.insert(message_id);
+                            // A waking team message, like a person's, does not
+                            // wait behind a blocking action.
+                            if wake {
+                                watches.background_actions();
+                            }
                             // Take the whole run of team traffic waiting behind
                             // this one and requeue it in order, rather than
                             // pushing each note to the front in turn. Per-note
@@ -6890,9 +6898,13 @@ async fn run_agent_session_store_kernel_inner(
                                     attachments,
                                     output_schema,
                                     delivery,
+                                    wake,
                                     ..
                                 } = next
                                 {
+                                    if wake {
+                                        watches.background_actions();
+                                    }
                                     team_message_ids.insert(message_id);
                                     batch.push(HostCommand::Prompt {
                                         session_id,
@@ -6940,6 +6952,9 @@ async fn run_agent_session_store_kernel_inner(
                                 None => commands.try_recv().ok(),
                             } {
                                 let team = matches!(waiting, HostCommand::TeamPrompt { .. });
+                                if matches!(waiting, HostCommand::TeamPrompt { session_id: target, wake: true, .. } if target == session_id) {
+                                    watches.background_actions();
+                                }
                                 match waiting {
                                     HostCommand::TeamPrompt {
                                         session_id: command_session_id,
@@ -7736,6 +7751,7 @@ async fn run_agent_session_store_kernel_inner(
                                 attachments: message.attachments,
                                 output_schema: None,
                                 delivery: message.delivery,
+                                wake: message.wake,
                             });
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {}
@@ -12242,6 +12258,7 @@ fn defer_root_inbox_behind_current_command(
             attachments: message.attachments,
             output_schema: None,
             delivery: message.delivery,
+            wake: message.wake,
         });
     }
 }

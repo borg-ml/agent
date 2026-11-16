@@ -5,6 +5,13 @@ Git comparison.
 
 ## Unreleased (since 0.21.2)
 
+- The footer shows "n shells" again for commands running in the background.
+  A backgrounded command was being counted only as a watcher.
+- A message from another agent that asks for a turn (`send_message` with
+  `wake: true`, or `followup_task`) now moves the recipient's blocking action
+  to the background, as a message you type does, instead of waiting for that
+  action to finish. The action keeps running.
+
 ## 0.21.2 (2026-11-14)
 
 - A Claude or ChatGPT login can be removed: press Delete on it in

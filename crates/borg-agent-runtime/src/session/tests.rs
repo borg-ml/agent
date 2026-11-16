@@ -3288,6 +3288,7 @@ async fn in_flight_usage_limit_does_not_park_a_new_route() {
                 attachments: Vec::new(),
                 output_schema: None,
                 delivery: PromptDelivery::Queue,
+                wake: false,
             })
             .await
             .unwrap();
@@ -5560,6 +5561,7 @@ async fn legacy_user_stop_does_not_block_background_wake_after_actor_restart() {
             attachments: Vec::new(),
             output_schema: None,
             delivery: PromptDelivery::Steer,
+            wake: false,
         })
         .await
         .unwrap();
@@ -9996,6 +9998,7 @@ fn resumed_team_backlog_is_deferred_behind_the_triggering_user_prompt() {
             report_text: "old report".to_string(),
             sender_session_id: Uuid::new_v4(),
             delivery: PromptDelivery::Queue,
+            wake: false,
             attachments: Vec::new(),
         })
         .collect();
@@ -10157,6 +10160,7 @@ async fn setup_recall_returns_all_pending_prompts_in_submission_order() {
                 attachments: Vec::new(),
                 output_schema: None,
                 delivery: PromptDelivery::Steer,
+                wake: false,
             })
             .await
             .unwrap();
@@ -14390,6 +14394,7 @@ async fn resumed_provider_turn_receives_team_messages_that_wake_an_idle_root() {
             attachments: Vec::new(),
             output_schema: None,
             delivery: PromptDelivery::Queue,
+            wake: false,
         })
         .await
         .unwrap();
@@ -19907,6 +19912,7 @@ impl AgentTurnExecutor for YieldingExecutor {
                             attachments: Vec::new(),
                             output_schema: None,
                             delivery: PromptDelivery::Queue,
+                            wake: false,
                         })
                         .await
                         .unwrap();
@@ -20061,6 +20067,7 @@ async fn assert_watcher_yield_blocks_automatic_turns(queue_reports: bool) {
                 attachments: Vec::new(),
                 output_schema: None,
                 delivery: PromptDelivery::Queue,
+                wake: false,
             })
             .await
             .unwrap();
@@ -20083,6 +20090,7 @@ async fn assert_watcher_yield_blocks_automatic_turns(queue_reports: bool) {
             attachments: Vec::new(),
             output_schema: None,
             delivery: PromptDelivery::Steer,
+            wake: false,
         }
     } else {
         HostCommand::Prompt {
@@ -20173,6 +20181,7 @@ async fn a_team_report_wakes_a_root_without_an_active_goal() {
             attachments: Vec::new(),
             output_schema: None,
             delivery: PromptDelivery::Queue,
+            wake: false,
         })
         .await
         .unwrap();
@@ -20614,6 +20623,7 @@ async fn assert_immediate_interrupt(control_backlog: usize) {
                     attachments: Vec::new(),
                     output_schema: None,
                     delivery: PromptDelivery::Steer,
+                    wake: false,
                 };
                 tokio::select! {
                     biased;
@@ -21363,6 +21373,7 @@ async fn followup_after_interrupt_starts_another_turn() {
         attachments: Vec::new(),
         output_schema: None,
         delivery: PromptDelivery::Steer,
+        wake: false,
     };
     command_tx.send(team_prompt("first task")).await.unwrap();
     tokio::time::timeout(EVENT_TIMEOUT, turn_started.notified())
@@ -21667,6 +21678,7 @@ async fn stop_holds_waiting_internal_input_until_later_input() {
             attachments: Vec::new(),
             output_schema: None,
             delivery,
+            wake: false,
         };
     command_tx
         .send(team_prompt(
@@ -24051,6 +24063,7 @@ async fn peer_receipts_survive_disabled_subagents_stop_and_replay() {
                     attachments: Vec::new(),
                     output_schema: None,
                     delivery: PromptDelivery::Steer,
+                    wake: false,
                 })
                 .await
                 .unwrap();

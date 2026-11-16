@@ -1543,6 +1543,10 @@ pub enum HostCommand {
         attachments: Vec<PathBuf>,
         output_schema: Option<Value>,
         delivery: PromptDelivery,
+        /// The sender asked for a turn: like a person's message, it moves a
+        /// blocking action to the background instead of waiting behind it.
+        #[serde(default)]
+        wake: bool,
     },
     ReplaceRecalledPrompt {
         session_id: Uuid,

@@ -4735,6 +4735,8 @@ pub(crate) struct TeamInboxMessage {
     pub report_text: String,
     pub sender_session_id: Uuid,
     pub delivery: PromptDelivery,
+    /// The sender asked for a turn, not just to be read at the next boundary.
+    pub wake: bool,
     /// Verified local files for this message's images, ready to hand to the
     /// recipient's prompt. Resolved from durable digests, never from a path
     /// the sender supplied.
@@ -5283,6 +5285,7 @@ impl SubagentCoordinator {
                     report_text: message.to_string(),
                     sender_session_id: actor_session_id,
                     delivery: prompt_delivery,
+                    wake: delivery_mode == DeliveryMode::Wake,
                     attachments: attachment_paths,
                 },
                 None,
@@ -5387,6 +5390,7 @@ impl SubagentCoordinator {
                 report_text: message.to_string(),
                 sender_session_id: actor_session_id,
                 delivery: prompt_delivery,
+                wake: delivery_mode == DeliveryMode::Wake,
                 attachments: attachment_paths,
             },
             Some(receipt),
@@ -5465,6 +5469,7 @@ impl SubagentCoordinator {
                 DeliveryMode::Boundary | DeliveryMode::Wake => PromptDelivery::Steer,
                 DeliveryMode::NextTurn | DeliveryMode::Notify => PromptDelivery::Queue,
             },
+            wake: mode == DeliveryMode::Wake,
             attachments,
         })
     }
@@ -7167,6 +7172,7 @@ impl SubagentCoordinator {
                     attachments: message.attachments,
                     output_schema: None,
                     delivery: message.delivery,
+                    wake: message.wake,
                 })
                 .await
                 .map_err(|_| anyhow::anyhow!("subagent command channel closed while waking"))?;
@@ -7709,6 +7715,7 @@ impl SubagentCoordinator {
             report_text: message,
             sender_session_id: actor_session_id,
             delivery,
+            wake: false,
             attachments: Vec::new(),
         };
         let root_session_id = self.table.lock().await.root_session_id;
@@ -8203,6 +8210,7 @@ impl SubagentCoordinator {
                     attachments: message.attachments,
                     output_schema: None,
                     delivery: message.delivery,
+                    wake: message.wake,
                 },
             )
             .await
@@ -13618,6 +13626,7 @@ async fn send_prompt(
             attachments: message.attachments.clone(),
             output_schema: None,
             delivery: message.delivery,
+            wake: message.wake,
         }),
     )
     .await;
