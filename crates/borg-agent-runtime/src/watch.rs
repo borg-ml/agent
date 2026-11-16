@@ -349,15 +349,6 @@ impl Watches {
         }
     }
 
-    /// Background every action still holding the foreground.
-    pub fn background_actions(&self) {
-        for signal in self.foreground.lock().unwrap().values() {
-            if let Some(signal) = signal.upgrade() {
-                signal.notify_one();
-            }
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub async fn run_action(
         &self,

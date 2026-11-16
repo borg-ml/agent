@@ -66,6 +66,10 @@ const MAX_CONTEXT_LENGTH_RECOVERIES: usize = 2;
 /// Escape can feel unresponsive.
 const INTERRUPT_TOOL_CANCEL_DRAIN: Duration = Duration::from_millis(300);
 
+/// How often a held teammate wake asks the running action to background. An
+/// action that finishes sooner than this simply returns its result.
+const WAKE_BACKGROUND_RETRY: Duration = Duration::from_millis(50);
+
 /// Attempts per compaction request, including the first.
 const COMPACTION_ATTEMPTS: usize = 3;
 /// Backstop for one attempt. Passes normally take about a minute; this only
@@ -1815,6 +1819,10 @@ impl NativeHarness {
                                         .iter()
                                         .chain(&pending_steer)
                                         .any(|steer| !steer.admission.is_recalled()),
+                                    queued_steer
+                                        .iter()
+                                        .chain(&pending_steer)
+                                        .any(CapturedSteer::wakes),
                                 )
                                 .await?
                             }
@@ -3992,10 +4000,15 @@ struct CapturedSteer {
     admission: borg_provider::provider::SteerAdmission,
     human: bool,
     preempt: bool,
+    wake: bool,
     ack: SteerAck,
 }
 
 impl CapturedSteer {
+    fn wakes(&self) -> bool {
+        self.wake && !self.admission.is_recalled()
+    }
+
     /// Take a steer without admitting it. Non-steer controls yield `None`.
     fn from_control(control: AgentTurnControl) -> Option<Self> {
         match control {
@@ -4006,6 +4019,7 @@ impl CapturedSteer {
                 admission,
                 human,
                 preempt,
+                wake,
                 ack,
             } => Some(Self {
                 message_id,
@@ -4014,6 +4028,7 @@ impl CapturedSteer {
                 admission,
                 human,
                 preempt,
+                wake,
                 ack,
             }),
             _ => None,
@@ -4544,6 +4559,7 @@ async fn execute_tool(
     controls: &mut Option<mpsc::Receiver<AgentTurnControl>>,
     usage: &mut ProviderCallUsage,
     input_parked: bool,
+    wake_parked: bool,
 ) -> Result<(String, bool, Vec<CapturedSteer>)> {
     // Team reports and Borg's own notices wait for this call; only a person's
     // redirect skips tools that have not started.
@@ -4822,6 +4838,7 @@ async fn execute_tool(
         call_cancel,
         !effectful_batch,
         ends_on_input,
+        wake_parked || carried.iter().any(CapturedSteer::wakes),
         controls,
         || runtime.agent_tools.background_action(&tool_call.id),
     )
@@ -4835,6 +4852,7 @@ async fn await_tool_with_controls(
     call_cancel: Option<CancellationToken>,
     cancel_on_steer: bool,
     ends_on_input: bool,
+    mut wake_held: bool,
     controls: &mut Option<mpsc::Receiver<AgentTurnControl>>,
     background_on_steer: impl Fn(),
 ) -> Result<(String, bool, Vec<CapturedSteer>)> {
@@ -4897,13 +4915,17 @@ async fn await_tool_with_controls(
                             background_on_steer();
                         }
                     }
+                    wake_held |= captured.wakes();
                     // Held unadmitted until the caller journals it. A turn that
                     // dies here drops the admission with it, and the session
                     // retries the steer rather than reporting it delivered.
                     pending_steer.push(captured);
                 }
                 None => {}
-            }
+            },
+            // A teammate's wake backgrounds the action once it has registered
+            // its foreground wait, whether the wake came first or during it.
+            _ = tokio::time::sleep(WAKE_BACKGROUND_RETRY), if wake_held => background_on_steer(),
         }
     }
 }
@@ -7505,6 +7527,7 @@ mod tests {
                         attachments: vec![PathBuf::from(text)],
                         admission: admission.clone(),
                         preempt: true,
+                        wake: false,
                         human: false,
                         ack,
                     })
@@ -7636,6 +7659,7 @@ mod tests {
                         attachments: Vec::new(),
                         admission: borg_provider::provider::SteerAdmission::pending(),
                         preempt: true,
+                        wake: false,
                         human: false,
                         ack,
                     }
@@ -7684,6 +7708,7 @@ mod tests {
                 Some(call_cancel),
                 false,
                 false,
+                false,
                 &mut None,
                 || {},
             )
@@ -7703,6 +7728,7 @@ mod tests {
             Some(cancel.clone()),
             false,
             false,
+            false,
             &mut None,
             || {},
         )
@@ -7718,6 +7744,7 @@ mod tests {
         let (_, is_error, _) = await_tool_with_controls(
             async { bail!("tool failed") },
             Some(cancel.clone()),
+            false,
             false,
             false,
             &mut None,
@@ -7817,6 +7844,7 @@ mod tests {
                     &events_tx,
                     &mut Some(control_rx),
                     &mut ProviderCallUsage::default(),
+                    false,
                     false,
                 )
                 .await
@@ -7939,6 +7967,7 @@ mod tests {
                     &mut Some(control_rx),
                     &mut ProviderCallUsage::default(),
                     false,
+                    false,
                 )
                 .await
             });
@@ -7980,6 +8009,7 @@ mod tests {
                             attachments: Vec::new(),
                             admission: borg_provider::provider::SteerAdmission::pending(),
                             preempt: false,
+                            wake: false,
                             human,
                             ack,
                         })
@@ -8048,15 +8078,59 @@ mod tests {
         }
     }
 
+    // A teammate's wake that was already held when a blocking action started
+    // must still move it to the background rather than wait for it to finish.
+    #[tokio::test]
+    async fn a_wake_held_before_a_blocking_action_backgrounds_it() {
+        let (notices, _notice_rx) = mpsc::channel(4);
+        let watches = crate::watch::Watches::new(
+            crate::native_process::ProcessManager::default(),
+            notices,
+            Uuid::new_v4(),
+        );
+        let (_finish, finished) = tokio::sync::oneshot::channel::<Value>();
+        let cancel = CancellationToken::new();
+        let call = watches.run_action(
+            "blocking-action",
+            "command",
+            "exec",
+            async move { Ok(finished.await?) },
+            cancel.clone(),
+            None,
+        );
+        let (output, is_error, steers) = tokio::time::timeout(
+            Duration::from_secs(1),
+            await_tool_with_controls(
+                call,
+                Some(cancel.clone()),
+                false,
+                false,
+                true,
+                &mut None,
+                || watches.background_action("blocking-action"),
+            ),
+        )
+        .await
+        .expect("a held wake must not wait for the action")
+        .unwrap();
+        assert!(!is_error && steers.is_empty(), "{output}");
+        assert!(!cancel.is_cancelled());
+        let output: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(output["background"], true);
+    }
+
     // A human redirect must not wait for a blocking action's deadline, kill
     // effects already in flight, or report the steer delivered before its fold.
     #[tokio::test]
     async fn steering_backgrounds_effectful_actions_without_cancelling_them() {
-        for (human, preempt, recalled) in [
-            (true, false, false),
-            (false, true, false),
-            (false, false, false),
-            (true, true, true),
+        for (human, preempt, wake, recalled) in [
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, false, false),
+            (true, true, false, true),
+            // A teammate's wake backgrounds the action without redirecting.
+            (false, false, true, false),
+            (false, false, true, true),
         ] {
             let (notices, _notice_rx) = mpsc::channel(4);
             let watches = crate::watch::Watches::new(
@@ -8082,6 +8156,7 @@ mod tests {
                 Some(cancel.clone()),
                 false,
                 false,
+                false,
                 &mut controls,
                 || watches.background_action("blocking-action"),
             ));
@@ -8099,11 +8174,12 @@ mod tests {
                     admission: admission.clone(),
                     human,
                     preempt,
+                    wake,
                     ack,
                 })
                 .await
                 .unwrap();
-            let redirects = (human || preempt) && !recalled;
+            let redirects = (human || preempt || wake) && !recalled;
             if !redirects {
                 assert!(futures::poll!(&mut waiting).is_pending());
                 finish
@@ -8161,6 +8237,7 @@ mod tests {
                 Some(call_cancel),
                 false,
                 false,
+                false,
                 &mut Some(control_rx),
                 || {},
             )
@@ -8175,6 +8252,7 @@ mod tests {
                 attachments: Vec::new(),
                 admission: admission.clone(),
                 preempt: true,
+                wake: false,
                 human: false,
                 ack,
             })
@@ -8237,6 +8315,7 @@ mod tests {
                     Some(call_cancel),
                     true,
                     false,
+                    false,
                     &mut Some(control_rx),
                     || {},
                 )
@@ -8252,6 +8331,7 @@ mod tests {
                         attachments: vec![PathBuf::from(text)],
                         admission: borg_provider::provider::SteerAdmission::pending(),
                         preempt: true,
+                        wake: false,
                         human: false,
                         ack,
                     })
@@ -8515,6 +8595,7 @@ mod tests {
                                 attachments: Vec::new(),
                                 admission: borg_provider::provider::SteerAdmission::pending(),
                                 preempt: true,
+                                wake: false,
                                 human: false,
                                 ack,
                             }
@@ -8868,6 +8949,7 @@ mod tests {
                     attachments: Vec::new(),
                     admission: borg_provider::provider::SteerAdmission::pending(),
                     preempt: true,
+                    wake: false,
                     human: false,
                     ack,
                 })
@@ -13059,6 +13141,7 @@ mod tests {
                         attachments: Vec::new(),
                         admission: borg_provider::provider::SteerAdmission::pending(),
                         preempt: false,
+                        wake: false,
                         human: false,
                         ack: ack_tx,
                     })
@@ -13478,6 +13561,7 @@ mod tests {
                     admission: borg_provider::provider::SteerAdmission::pending(),
                     // Background input waits for the generation boundary.
                     preempt: false,
+                    wake: false,
                     human: false,
                     ack,
                 })
@@ -13596,6 +13680,7 @@ mod tests {
                     attachments: Vec::new(),
                     admission: recalled,
                     preempt: false,
+                    wake: false,
                     human: true,
                     ack: stale_ack,
                 })
@@ -13612,6 +13697,7 @@ mod tests {
                     attachments: Vec::new(),
                     admission: borg_provider::provider::SteerAdmission::pending(),
                     preempt: false,
+                    wake: false,
                     human: true,
                     ack,
                 })
@@ -13721,6 +13807,7 @@ mod tests {
                 attachments: Vec::new(),
                 admission: admission.clone(),
                 preempt: false,
+                wake: false,
                 human: true,
                 ack,
             })
@@ -13728,7 +13815,7 @@ mod tests {
             Ok(json!({ "reason": "input_pending" }))
         };
         let (output, is_error, captured) =
-            await_tool_with_controls(call, None, false, false, &mut controls, || {})
+            await_tool_with_controls(call, None, false, false, false, &mut controls, || {})
                 .await
                 .unwrap();
         assert_eq!(
@@ -13771,6 +13858,7 @@ mod tests {
                 attachments: Vec::new(),
                 admission: borg_provider::provider::SteerAdmission::pending(),
                 preempt: false,
+                wake: false,
                 human,
                 ack,
             })
@@ -13786,6 +13874,7 @@ mod tests {
                     Some(cancel),
                     true,
                     true,
+                    false,
                     &mut controls,
                     || {},
                 ),
@@ -13873,6 +13962,7 @@ mod tests {
                                 attachments: Vec::new(),
                                 admission: borg_provider::provider::SteerAdmission::pending(),
                                 preempt: false,
+                                wake: false,
                                 human: true,
                                 ack,
                             })
@@ -13904,6 +13994,7 @@ mod tests {
                                 attachments: Vec::new(),
                                 admission: borg_provider::provider::SteerAdmission::pending(),
                                 preempt: true,
+                                wake: false,
                                 human: true,
                                 ack,
                             })
@@ -13984,6 +14075,7 @@ mod tests {
                                 attachments: Vec::new(),
                                 admission: borg_provider::provider::SteerAdmission::pending(),
                                 preempt: false,
+                                wake: false,
                                 human: true,
                                 ack,
                             })
@@ -14022,6 +14114,7 @@ mod tests {
                         attachments: Vec::new(),
                         admission: borg_provider::provider::SteerAdmission::pending(),
                         preempt: false,
+                        wake: false,
                         human: false,
                         ack,
                     })
@@ -14042,6 +14135,7 @@ mod tests {
                     attachments: Vec::new(),
                     admission: self.admission.clone(),
                     preempt: false,
+                    wake: false,
                     human: self.human,
                     ack,
                 })

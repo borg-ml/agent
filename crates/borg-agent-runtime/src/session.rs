@@ -523,6 +523,7 @@ impl QueuedPrompt {
 #[derive(Clone)]
 struct PendingSteer {
     prompt: QueuedPrompt,
+    wake: bool,
     acknowledgement_id: Uuid,
     admission: SteerAdmission,
     state: PendingSteerState,
@@ -3057,6 +3058,9 @@ async fn run_agent_session_store_kernel_inner(
 
     let mut deferred_commands = VecDeque::new();
     let mut team_message_ids = HashSet::new();
+    // Team messages whose sender asked for a turn: their steer backgrounds a
+    // blocking action instead of waiting behind it.
+    let mut waking_message_ids = HashSet::new();
     // A provider can acknowledge a turn and then terminate without producing
     // any answer. Retry that narrowly-defined, side-effect-free failure once;
     // all other failures remain durable as failed messages instead of being
@@ -6864,10 +6868,8 @@ async fn run_agent_session_store_kernel_inner(
                             ..
                         } => {
                             team_message_ids.insert(message_id);
-                            // A waking team message, like a person's, does not
-                            // wait behind a blocking action.
                             if wake {
-                                watches.background_actions();
+                                waking_message_ids.insert(message_id);
                             }
                             // Take the whole run of team traffic waiting behind
                             // this one and requeue it in order, rather than
@@ -6903,7 +6905,7 @@ async fn run_agent_session_store_kernel_inner(
                                 } = next
                                 {
                                     if wake {
-                                        watches.background_actions();
+                                        waking_message_ids.insert(message_id);
                                     }
                                     team_message_ids.insert(message_id);
                                     batch.push(HostCommand::Prompt {
@@ -6952,8 +6954,8 @@ async fn run_agent_session_store_kernel_inner(
                                 None => commands.try_recv().ok(),
                             } {
                                 let team = matches!(waiting, HostCommand::TeamPrompt { .. });
-                                if matches!(waiting, HostCommand::TeamPrompt { session_id: target, wake: true, .. } if target == session_id) {
-                                    watches.background_actions();
+                                if let HostCommand::TeamPrompt { message_id, wake: true, .. } = &waiting {
+                                    waking_message_ids.insert(*message_id);
                                 }
                                 match waiting {
                                     HostCommand::TeamPrompt {
@@ -7082,6 +7084,7 @@ async fn run_agent_session_store_kernel_inner(
                             for (index, (prompt, admission, acknowledgement_id, will_send)) in
                                 admitted.into_iter().enumerate()
                             {
+                                let wake = waking_message_ids.remove(&prompt.message_id);
                                 let sent = will_send
                                     && dispatch_steer(
                                         &control_tx,
@@ -7090,10 +7093,12 @@ async fn run_agent_session_store_kernel_inner(
                                         admission.clone(),
                                         acknowledgement_id, launch.capabilities.frames_steers_for(launch.provider, launch.model.as_deref()),
                                         prompt.actor == EventActor::User,
+                                        wake,
                                     )
                                     .await;
                                 pending_steers.push_back(PendingSteer {
                                     prompt,
+                                    wake,
                                     acknowledgement_id,
                                     admission,
                                     state: if sent {
@@ -7437,7 +7442,7 @@ async fn run_agent_session_store_kernel_inner(
                                             text,
                                             attachments: Vec::new(),
                                             admission: SteerAdmission::pending(),
-                                            preempt: false,
+                                            preempt: false, wake: false,
                                             human: false,
                                             ack,
                                         })
@@ -7734,7 +7739,7 @@ async fn run_agent_session_store_kernel_inner(
                         permit.send(AgentTurnControl::Steer {
                             message_id: Uuid::new_v4(), text: team.role_prompt(session_id),
                             attachments: Vec::new(), admission: SteerAdmission::pending(),
-                            preempt: false, human: false, ack,
+                            preempt: false, wake: false, human: false, ack,
                         });
                     }
                     role_notice_pending = false;
@@ -12534,6 +12539,7 @@ async fn dispatch_steer(
     acknowledgement_id: Uuid,
     reply_prompt: bool,
     human: bool,
+    wake: bool,
 ) -> bool {
     let (ack, result) = oneshot::channel();
     let text = if reply_prompt && prompt.actor == EventActor::User {
@@ -12551,6 +12557,7 @@ async fn dispatch_steer(
             // Native generation uses human priority. The Claude CLI keeps boundary
             // folding rather than cancelling the command with priority `now`.
             preempt: false,
+            wake,
             human,
             ack,
         })
@@ -12645,6 +12652,7 @@ async fn retry_pending_steers(
         acknowledgement_id,
         reply_prompt,
         human,
+        indices.iter().any(|&index| pending_steers[index].wake),
     )
     .await
     {

@@ -327,6 +327,9 @@ pub enum AgentTurnControl {
         /// running turn after the tool in flight instead of folding the
         /// message into the current task (Claude Code's priority `now`).
         preempt: bool,
+        /// A teammate asked for a turn: a blocking action moves to the
+        /// background, but generation and unstarted tools are left alone.
+        wake: bool,
         /// Sent by a person, who is owed a visible reply. Team reports and
         /// steers Borg writes itself are not.
         human: bool,

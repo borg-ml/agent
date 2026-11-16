@@ -1107,6 +1107,7 @@ async fn accepted_steers_settle_in_fifo_order_when_acknowledgements_arrive_out_o
         let admission = SteerAdmission::pending();
         assert!(admission.accept());
         PendingSteer {
+            wake: false,
             prompt: QueuedPrompt {
                 message_id,
                 text: message_id.to_string(),
@@ -1229,6 +1230,7 @@ async fn claude_steers_stay_pending_input_until_the_cli_reports_consumption() {
         let admission = SteerAdmission::pending();
         assert!(admission.accept());
         PendingSteer {
+            wake: false,
             prompt: QueuedPrompt {
                 message_id,
                 text: message_id.to_string(),
@@ -6366,6 +6368,7 @@ async fn a_fold_marker_settles_every_steer_batched_under_one_acknowledgement() {
     let folded_in = Uuid::new_v4();
     let acknowledgement_id = Uuid::new_v4();
     let steer = |message_id: Uuid| PendingSteer {
+        wake: false,
         prompt: QueuedPrompt {
             message_id,
             text: "batched".to_string(),
@@ -9608,6 +9611,7 @@ fn only_an_uncommitted_steer_is_withdrawable_from_the_active_turn() {
     let team_id = Uuid::new_v4();
     let steer =
         |message_id: Uuid, state: PendingSteerState, admission: SteerAdmission| PendingSteer {
+            wake: false,
             prompt: QueuedPrompt {
                 message_id,
                 text: "steer".to_string(),
@@ -17637,6 +17641,7 @@ async fn shared_steer_batch_retries_and_targeted_recall_preserve_siblings() {
     let mut pending = VecDeque::new();
     for text in ["first", "second"] {
         pending.push_back(PendingSteer {
+            wake: false,
             prompt: QueuedPrompt {
                 message_id: Uuid::new_v4(),
                 text: text.into(),
@@ -17689,6 +17694,7 @@ second"
     third.text = "third".into();
     third.attachments.clear();
     pending.push_back(PendingSteer {
+        wake: false,
         prompt: third,
         acknowledgement_id: Uuid::new_v4(),
         admission: SteerAdmission::pending(),
@@ -18810,6 +18816,7 @@ fn collapsed_recovery_journal_still_places_prompts_before_their_replies() {
 async fn human_mid_turn_steers_keep_human_priority_and_frame_only_human_batches() {
     fn steer(text: &str, actor: EventActor) -> PendingSteer {
         PendingSteer {
+            wake: false,
             prompt: QueuedPrompt {
                 message_id: Uuid::new_v4(),
                 text: text.into(),
@@ -24931,6 +24938,7 @@ async fn recall_replacement_withdraws_held_steer_before_provider_claim() {
     let (events, _receiver) = mpsc::channel(32);
     let admission = SteerAdmission::pending();
     let mut steers = VecDeque::from([PendingSteer {
+        wake: false,
         prompt: QueuedPrompt {
             message_id: original,
             text: "held".into(),
