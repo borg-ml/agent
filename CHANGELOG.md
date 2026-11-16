@@ -11,6 +11,11 @@ Git comparison.
   `wake: true`, or `followup_task`) now moves the recipient's blocking action
   to the background, as a message you type does, instead of waiting for that
   action to finish. The action keeps running.
+- Subagents now follow the `[models] fallback` chain when their model hits a
+  usage limit, for example moving off Fable 5.2 when its limit is reached,
+  instead of waiting for the limit to reset. Scouts follow their own `[scout]`
+  fallback, which also never took effect before. Consult-peer sidecars stay on
+  their provider.
 
 ## 0.21.2 (2026-11-14)
 

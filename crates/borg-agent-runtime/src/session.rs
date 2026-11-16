@@ -6335,11 +6335,10 @@ async fn run_agent_session_store_kernel_inner(
                                 provider_error_usage_limit_reset_delay(&error);
                             // With a fallback chain any usage limit, including a
                             // weekly or billing one, moves the turn to the next
-                            // route instead of stopping it.
-                            // Managed workers must keep the director-selected route, not inherit
-                            // the interactive session's fallback providers/models/efforts.
+                            // route instead of stopping it. Managed workers and scouts
+                            // follow their chain too: a limited model otherwise parks
+                            // them until it resets.
                             let chain_fallback = !selection_changed
-                                && dispatcher.parent_session_id().await.is_none()
                                 && !launch.capabilities.model_fallback.is_empty()
                                 && provider_error_is_usage_limited(&error)
                                 && !interrupted;
@@ -13457,9 +13456,6 @@ pub(crate) async fn apply_session_config(
         crate::SessionConfigAction::SetResponseLanguage { language } => {
             next.response_language = language;
         }
-    }
-    if atomic_child {
-        next.capabilities.model_fallback.clear();
     }
     if next.provider == CodingProvider::Claude && next.effort.is_none() {
         next.effort = Some(borg_provider::claude_default_effort().to_string());

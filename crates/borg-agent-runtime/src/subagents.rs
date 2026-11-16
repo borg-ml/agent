@@ -5953,7 +5953,6 @@ impl SubagentCoordinator {
         );
         let message = required_message(&request.message)?;
         let mut launch = self.root_launch.clone();
-        launch.capabilities.model_fallback.clear();
         launch.capabilities.desktop = request.desktop;
         if parent_session_id != self.root_session_id {
             let parent = self
@@ -6900,7 +6899,6 @@ impl SubagentCoordinator {
             };
             if let Some((snapshot, revived_from)) = wake {
                 let mut launch = self.root_launch.clone();
-                launch.capabilities.model_fallback.clear();
                 launch.request_id = Uuid::new_v4();
                 launch.initial_prompt = None;
                 launch.provider = snapshot.provider;
@@ -8602,7 +8600,6 @@ impl SubagentCoordinator {
             // journal from here until the old writer has relinquished it.
             self.stop_and_wait(session_id).await?;
             let mut launch = self.root_launch.clone();
-            launch.capabilities.model_fallback.clear();
             launch.cwd = current.cwd.clone();
             launch.provider = current.provider;
             launch.model = current.model.clone();
