@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.21.2)
+## Unreleased (since 0.21.3)
+
+## 0.21.3 (2026-11-16)
 
 - The footer shows "n shells" again for commands running in the background.
   A backgrounded command was being counted only as a watcher.
