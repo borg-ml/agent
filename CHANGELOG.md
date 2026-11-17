@@ -13,6 +13,11 @@ Git comparison.
   to the provider list rather than closing it, and Ctrl+C quits. `--print` and
   `--json` runs still stop with that error, since they have no screen to sign
   in from.
+- A bare `borg` starts on any connected subscription: Claude, then ChatGPT,
+  then GLM Coding Plan, Kimi Code, Qwen Coding Plan, OpenCode Go, Grok Build
+  and Muse Code. Before, only Claude and ChatGPT were picked, so a session
+  signed in to another plan started on ChatGPT and could not answer.
+  Pay-per-use keys are still never chosen automatically.
 
 ## 0.21.3 (2026-11-16)
 

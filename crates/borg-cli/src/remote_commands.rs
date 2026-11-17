@@ -2625,7 +2625,7 @@ async fn run_local_agent_session(
     {
         ensure!(
             crate::cli::default_subscription_ready(args.provider()),
-            "automatic provider selection requires a Claude or Codex subscription login; \
+            "automatic provider selection requires a subscription login; \
              sign in or pass --provider explicitly (no API-key billing was selected)"
         );
     }
@@ -3264,9 +3264,9 @@ async fn run_local_agent_session(
             && !provider_connection_ready(provider).await;
         let nothing_connected = args.provider.is_none()
             && args.model.is_none()
-            && !crate::cli::DEFAULT_PROVIDER_PREFERENCE
+            && !CodingProvider::ALL
                 .into_iter()
-                .any(crate::cli::default_subscription_ready);
+                .any(provider_credentials_present);
         if credential_preflight_shown {
             if nothing_connected {
                 terminal.welcome_sign_in();
@@ -3284,6 +3284,9 @@ async fn run_local_agent_session(
                     credential_guidance(provider)
                 ));
             }
+        } else if !conversation_started && !has_initial_prompt && model.is_none() {
+            // A connected provider without a default model, such as OpenCode.
+            terminal.open_model_picker();
         }
         // First boot: emit one notification so the host terminal asks the OS
         // for notification permission (the popup a bare CLI cannot raise
@@ -9594,6 +9597,11 @@ async fn switch_to_pending_model(
     }
     terminal.clear_pending_model();
     terminal.close_settings();
+    let model = if model.is_empty() {
+        default_model_for_provider(target).unwrap_or_default()
+    } else {
+        model
+    };
     if model.is_empty() || (target == CodingProvider::OpenCode && !model.starts_with("opencode-go/")) {
         terminal.open_model_picker();
         return;

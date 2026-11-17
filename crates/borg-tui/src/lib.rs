@@ -119,7 +119,7 @@ const INLINE_VIEWPORT_HEIGHT: u16 = 24;
 const HORIZONTAL_MARGIN: u16 = 0;
 const BORG_ORANGE: Color = Color::Rgb(255, 142, 36);
 const WELCOME_SIGN_IN: &str =
-    "Welcome to Borg. Sign in to start: Claude and ChatGPT use your subscription.";
+    "Welcome to Borg. Sign in to any provider to start.";
 const BORG_ORANGE_HOVER: Color = Color::Rgb(255, 184, 92);
 const RUNNING_STATUS_PEACH: Color = Color::Rgb(255, 132, 112);
 const SUBAGENT_PURPLE: Color = Color::Rgb(213, 126, 177);

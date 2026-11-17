@@ -651,10 +651,19 @@ pub(crate) struct LocalAgentCliArgs {
     pub(crate) session_host: Option<Uuid>,
 }
 
-/// Bare sessions prefer Claude subscription, then Codex subscription. Other
-/// providers remain available via `--provider`, never as a billing fallback.
-pub(crate) const DEFAULT_PROVIDER_PREFERENCE: [RemoteProviderArg; 2] =
-    [RemoteProviderArg::Claude, RemoteProviderArg::Codex];
+/// Bare sessions start on a connected subscription: Claude, then Codex, then
+/// the other subscription plans. Pay-per-use routes (the Anthropic API,
+/// OpenRouter, Vercel) stay available via `--provider`, never as a fallback.
+pub(crate) const DEFAULT_PROVIDER_PREFERENCE: [RemoteProviderArg; 8] = [
+    RemoteProviderArg::Claude,
+    RemoteProviderArg::Codex,
+    RemoteProviderArg::Glm,
+    RemoteProviderArg::Kimi,
+    RemoteProviderArg::Qwen,
+    RemoteProviderArg::OpenCode,
+    RemoteProviderArg::Grok,
+    RemoteProviderArg::Muse,
+];
 
 /// The provider a fresh session starts on when the user did not name one.
 /// Only a usable subscription can become the automatic provider. A stored
@@ -673,8 +682,27 @@ pub(crate) fn default_subscription_ready(candidate: RemoteProviderArg) -> bool {
             borg_remote::provider_subscription_credentials_present(candidate.into())
                 && !borg_provider::credentials::openai_uses_api_key()
         }
-        _ => false,
+        RemoteProviderArg::Glm => coding_plan_ready(borg_provider::Plan::GlmCoding),
+        RemoteProviderArg::Kimi => coding_plan_ready(borg_provider::Plan::KimiCode),
+        RemoteProviderArg::Qwen => coding_plan_ready(borg_provider::Plan::QwenCoding),
+        RemoteProviderArg::OpenCode => {
+            borg_remote::provider_subscription_credentials_present(candidate.into())
+                || borg_provider::credentials::opencode_go_api_key().is_some()
+        }
+        RemoteProviderArg::Grok | RemoteProviderArg::Muse => {
+            borg_remote::provider_subscription_credentials_present(candidate.into())
+        }
+        RemoteProviderArg::Anthropic
+        | RemoteProviderArg::OpenRouter
+        | RemoteProviderArg::OpenAiCompatible => false,
     }
+}
+
+/// A coding plan's own key, not a pay-per-use key from the environment.
+fn coding_plan_ready(plan: borg_provider::Plan) -> bool {
+    borg_provider::subscription::active_for(plan)
+        .and_then(|plan| plan.api_key())
+        .is_some()
 }
 
 fn default_provider_with(
@@ -683,8 +711,8 @@ fn default_provider_with(
     DEFAULT_PROVIDER_PREFERENCE
         .into_iter()
         .find(|candidate| credentials_present(*candidate))
-        // Neither subscription is connected: choose Codex for explicit
-        // sign-in guidance, but never proceed on API-key billing.
+        // No subscription is connected: choose Codex for explicit sign-in
+        // guidance, but never proceed on API-key billing.
         .unwrap_or(RemoteProviderArg::Codex)
 }
 
@@ -1136,6 +1164,10 @@ mod tests {
         assert!(matches!(
             default_provider_with(|candidate| matches!(candidate, RemoteProviderArg::Codex)),
             RemoteProviderArg::Codex
+        ));
+        assert!(matches!(
+            default_provider_with(|candidate| matches!(candidate, RemoteProviderArg::Glm)),
+            RemoteProviderArg::Glm
         ));
         assert!(matches!(
             default_provider_with(|candidate| matches!(candidate, RemoteProviderArg::OpenRouter)),
