@@ -479,44 +479,22 @@ fn keychain_user() -> String {
     "claude-code-user".into()
 }
 
-// Generic-password data is UTF-8 JSON, not a JSON-encoded hex string. Native
-// dRs at 209491759 parses read data as JSON; `security -X` writes decoded bytes.
-// Use OS APIs directly: no executable/runtime dependency and no secrets in argv.
+// Keychain access goes through Apple's `/usr/bin/security`, as native Claude
+// Code does. Item ACLs then trust that stable, Apple-signed tool instead of
+// whichever binary last wrote the item, so neither Borg rebuilds nor Claude
+// Code's own reads raise "wants to access key" prompts. Data is UTF-8 JSON;
+// `-w` prints it verbatim, or as hex when it is not plain ASCII. Writes go
+// over stdin (`security -i`), so the secret never appears in argv.
 #[cfg(target_os = "macos")]
 mod macos {
     use super::*;
-    use std::ffi::c_void;
-    type Item = *mut c_void;
-    #[link(name = "Security", kind = "framework")]
-    unsafe extern "C" {
-        fn SecKeychainFindGenericPassword(
-            keychain: Item,
-            service_len: u32,
-            service: *const u8,
-            account_len: u32,
-            account: *const u8,
-            length: *mut u32,
-            data: *mut *mut c_void,
-            item: *mut Item,
-        ) -> i32;
-        fn SecKeychainItemFreeContent(attributes: Item, data: Item) -> i32;
-        fn SecKeychainItemModifyAttributesAndData(
-            item: Item,
-            attributes: Item,
-            length: u32,
-            data: *const u8,
-        ) -> i32;
-        fn SecKeychainAddGenericPassword(
-            keychain: Item,
-            service_len: u32,
-            service: *const u8,
-            account_len: u32,
-            account: *const u8,
-            length: u32,
-            data: *const u8,
-            item: *mut Item,
-        ) -> i32;
-    }
+    use std::process::{Command, Stdio};
+    type Item = *mut std::ffi::c_void;
+    const SECURITY: &str = "/usr/bin/security";
+    // errSecItemNotFound, reported as the tool's exit status.
+    const NOT_FOUND: i32 = 44;
+    // `security -i` reads commands with a 4 KiB line buffer.
+    const MAX_LINE: usize = 4000;
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
         fn CFRelease(value: Item);
@@ -573,87 +551,57 @@ mod macos {
         }
     }
     pub(super) fn read(identity: &KeychainIdentity) -> Result<Vec<u8>> {
-        let mut length = 0;
-        let mut data = std::ptr::null_mut();
-        let status = unsafe {
-            SecKeychainFindGenericPassword(
-                std::ptr::null_mut(),
-                identity.service.len() as u32,
-                identity.service.as_ptr(),
-                identity.account.len() as u32,
-                identity.account.as_ptr(),
-                &mut length,
-                &mut data,
-                std::ptr::null_mut(),
-            )
-        };
-        ensure!(
-            status == 0,
-            "Claude Keychain read failed (OS status {status}); unlock/reconnect selected authority, no fallback"
-        );
-        let bytes = if length as usize <= MAX_BYTES && (!data.is_null() || length == 0) {
-            if length == 0 {
-                Vec::new()
-            } else {
-                unsafe { std::slice::from_raw_parts(data.cast::<u8>(), length as usize).to_vec() }
-            }
-        } else {
-            unsafe {
-                SecKeychainItemFreeContent(std::ptr::null_mut(), data);
-            }
-            anyhow::bail!("Claude Keychain credentials too large or malformed");
-        };
-        unsafe {
-            SecKeychainItemFreeContent(std::ptr::null_mut(), data);
+        let output = Command::new(SECURITY)
+            .args(["find-generic-password", "-a", &identity.account])
+            .args(["-s", &identity.service, "-w"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .context("run macOS security tool")?;
+        match output.status.code() {
+            Some(0) => {}
+            Some(NOT_FOUND) => return Err(anyhow::anyhow!(MissingAuthority)),
+            code => anyhow::bail!(
+                "Claude Keychain read failed (security exit {code:?}); unlock/reconnect selected authority, no fallback"
+            ),
         }
-        Ok(bytes)
+        let mut text = output.stdout;
+        ensure!(
+            text.len() <= 2 * MAX_BYTES + 1,
+            "Claude Keychain credentials too large"
+        );
+        if text.last() == Some(&b'\n') {
+            text.pop();
+        }
+        if text.first() == Some(&b'{') {
+            return Ok(text);
+        }
+        hex::decode(&text).map_err(|_| anyhow::anyhow!("Claude Keychain credentials malformed"))
     }
     pub(super) fn write(identity: &KeychainIdentity, bytes: &[u8]) -> Result<()> {
-        let mut item = std::ptr::null_mut();
-        let status = unsafe {
-            SecKeychainFindGenericPassword(
-                std::ptr::null_mut(),
-                identity.service.len() as u32,
-                identity.service.as_ptr(),
-                identity.account.len() as u32,
-                identity.account.as_ptr(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut item,
-            )
-        };
-        let status = if status == 0 {
-            let changed = unsafe {
-                SecKeychainItemModifyAttributesAndData(
-                    item,
-                    std::ptr::null_mut(),
-                    bytes.len() as u32,
-                    bytes.as_ptr(),
-                )
-            };
-            unsafe {
-                CFRelease(item);
-            }
-            changed
-        } else if status == -25300 {
-            unsafe {
-                SecKeychainAddGenericPassword(
-                    std::ptr::null_mut(),
-                    identity.service.len() as u32,
-                    identity.service.as_ptr(),
-                    identity.account.len() as u32,
-                    identity.account.as_ptr(),
-                    bytes.len() as u32,
-                    bytes.as_ptr(),
-                    std::ptr::null_mut(),
-                )
-            }
-        } else {
-            status
-        };
+        let line = format!(
+            "add-generic-password -U -a \"{}\" -s \"{}\" -X \"{}\"\n",
+            identity.account,
+            identity.service,
+            hex::encode(bytes)
+        );
         ensure!(
-            status == 0,
-            "Claude Keychain save failed (OS status {status}); no plaintext fallback"
+            line.len() <= MAX_LINE,
+            "Claude credentials too large for the Keychain tool; no plaintext fallback"
+        );
+        let mut child = Command::new(SECURITY)
+            .arg("-i")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("run macOS security tool")?;
+        let written = child.stdin.take().unwrap().write_all(line.as_bytes());
+        let status = child.wait().context("wait for macOS security tool")?;
+        ensure!(
+            written.is_ok() && status.success(),
+            "Claude Keychain save failed (security exit {:?}); no plaintext fallback",
+            status.code()
         );
         Ok(())
     }
