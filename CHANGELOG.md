@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.21.4)
+## Unreleased (since 0.21.5)
+
+## 0.21.5 (2026-11-17)
 
 - Markdown tables in the transcript wrap long cells onto extra lines instead
   of cutting them off with `…`. When a row wraps, rules between rows keep
