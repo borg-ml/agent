@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.21.5)
 
+- The resume picker is easier to read. Each session row shows its time and
+  title without the model name crowding the title out. The preview lists
+  started, last activity, directory, model and latest prompt one per line,
+  in plain text instead of a run-together italic quote. The header's column
+  divider now lines up with the rows, and "type to filter" is shown once.
+
 ## 0.21.5 (2026-11-17)
 
 - Markdown tables in the transcript wrap long cells onto extra lines instead

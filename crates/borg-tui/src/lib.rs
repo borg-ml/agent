@@ -2525,19 +2525,6 @@ impl Picker {
         }
     }
 
-    fn resume_header(&self) -> String {
-        let header = self.header();
-        if self
-            .query
-            .as_deref()
-            .is_none_or(|query| query.trim().is_empty())
-        {
-            format!("{header} · type to filter")
-        } else {
-            header
-        }
-    }
-
     fn styled_option_rows(&self) -> Vec<(String, Style)> {
         self.displayed_option_rows()
             .into_iter()
@@ -2560,7 +2547,7 @@ impl Picker {
                 )
             });
             let header = if matches!(self.kind, PickerKind::Resume) {
-                truncate_table_cell(&self.resume_header(), width)
+                truncate_table_cell(&self.header(), width)
             } else {
                 self.header()
             };
@@ -2623,20 +2610,12 @@ impl Picker {
             ));
         }
         let row_count = option_rows.len().max(preview_lines.len());
-        let preview_header = if self
-            .query
-            .as_deref()
-            .is_none_or(|query| query.trim().is_empty())
-        {
-            "Latest response · type to filter · PgUp/PgDn older"
-        } else {
-            "Latest response"
-        };
+        let preview_header = "Latest response · PgUp/PgDn older";
         let mut lines = vec![Line::from(vec![
             Span::styled(
                 pad_display(
-                    &truncate_table_cell(&self.resume_header(), left_width),
-                    left_width,
+                    &truncate_table_cell(&self.header(), left_content_width),
+                    left_content_width,
                 ),
                 Style::default()
                     .fg(Color::White)

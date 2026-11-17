@@ -3201,7 +3201,7 @@ async fn resume_picker_titles_and_previews_sessions_from_the_latest_response() {
 
     assert!(target.label.contains("Concise persisted title"));
     assert!(!target.label.contains("Latest formatted response"));
-    assert!(target.label.contains("gpt-resume-filter"));
+    assert!(!target.label.contains("gpt-resume-filter"));
     assert!(!target.label.contains("First setup request"));
     assert!(target.preview.starts_with("Latest **formatted** response"));
     assert!(target.preview.contains("**Model:** `gpt-resume-filter`"));

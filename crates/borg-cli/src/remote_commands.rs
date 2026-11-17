@@ -10122,7 +10122,6 @@ async fn recent_session_options(
             .unwrap_or_else(|| "Unknown time".to_string());
         let label = [
             Some(timestamp),
-            model.clone(),
             state
                 .imported_from
                 .as_ref()
@@ -10140,17 +10139,17 @@ async fn recent_session_options(
         .flatten()
         .collect::<Vec<_>>()
         .join(" · ");
-        let metadata = vec![
+        let mut metadata = vec![
             started_at.map(|time| {
                 format!(
                     "**Started:** {}",
-                    time.with_timezone(&Local).format("%A, %B %-d at %H:%M")
+                    time.with_timezone(&Local).format("%a %b %-d %H:%M")
                 )
             }),
             updated_at.map(|time| {
                 format!(
                     "**Last activity:** {}",
-                    time.with_timezone(&Local).format("%A, %B %-d at %H:%M")
+                    time.with_timezone(&Local).format("%a %b %-d %H:%M")
                 )
             }),
             state
@@ -10174,28 +10173,23 @@ async fn recent_session_options(
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
-        let started_differently = last_prompt != first_prompt;
-        let mut preview = primary_preview;
-        if !metadata.is_empty() {
-            preview.push_str("\n\n---\n");
-            preview.push_str(
-                &metadata
-                    .into_iter()
-                    .map(|line| format!("> {line}"))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            );
-        }
         if latest_response.is_some() {
-            preview.push_str(&format!(
-                "\n> **Latest prompt:** {}",
+            metadata.push(format!(
+                "**Latest prompt:** {}",
                 prompt_summary(&last_prompt, 120)
             ));
-        } else if started_differently {
-            preview.push_str(&format!(
-                "\n> **Started with:** {}",
+        } else if last_prompt != first_prompt {
+            metadata.push(format!(
+                "**Started with:** {}",
                 prompt_summary(&first_prompt, 120)
             ));
+        }
+        // One field per line: a hard break keeps markdown from reflowing the
+        // fields into a single paragraph.
+        let mut preview = primary_preview;
+        if !metadata.is_empty() {
+            preview.push_str("\n\n---\n\n");
+            preview.push_str(&metadata.join("\\\n"));
         }
         options.push(ResumeSessionOption {
             id,

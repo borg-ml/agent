@@ -10544,7 +10544,7 @@ fn resume_picker_uses_a_balanced_two_column_layout() {
                 },
             ],
             selected: 0,
-            query: None,
+            query: Some(String::new()),
             viewport_offset: Cell::new(0),
         };
 
@@ -10564,6 +10564,11 @@ fn resume_picker_uses_a_balanced_two_column_layout() {
     assert!(
         rows.iter().all(|row| UnicodeWidthStr::width(*row) <= 112),
         "picker rows must fit their actual render width: {rows:?}"
+    );
+    let divider = |row: &str| row.find('│').map(|end| UnicodeWidthStr::width(&row[..end]));
+    assert!(
+        rows.iter().all(|row| divider(row) == divider(rows[0])),
+        "the header divider must line up with the rows: {rows:?}"
     );
 
     let styled = picker.styled_lines(112, USER_LABEL_BLUE, USER_TEXT);
