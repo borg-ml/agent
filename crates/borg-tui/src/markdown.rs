@@ -872,7 +872,10 @@ impl MarkdownTable {
                     .iter()
                     .enumerate()
                     .map(|(column, width)| {
-                        wrap_table_cell(row.get(column).map(String::as_str).unwrap_or_default(), *width)
+                        wrap_table_cell(
+                            row.get(column).map(String::as_str).unwrap_or_default(),
+                            *width,
+                        )
                     })
                     .collect::<Vec<_>>()
             })
