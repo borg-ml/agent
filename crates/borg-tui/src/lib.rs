@@ -118,6 +118,8 @@ use borg_ui::KeybindingConfig;
 const INLINE_VIEWPORT_HEIGHT: u16 = 24;
 const HORIZONTAL_MARGIN: u16 = 0;
 const BORG_ORANGE: Color = Color::Rgb(255, 142, 36);
+const WELCOME_SIGN_IN: &str =
+    "Welcome to Borg. Sign in to start: Claude and ChatGPT use your subscription. Ctrl+C quits.";
 const BORG_ORANGE_HOVER: Color = Color::Rgb(255, 184, 92);
 const RUNNING_STATUS_PEACH: Color = Color::Rgb(255, 132, 112);
 const SUBAGENT_PURPLE: Color = Color::Rgb(213, 126, 177);
@@ -6827,9 +6829,7 @@ impl BorgTerminal {
             .as_mut()
             .expect("settings just opened")
             .show_providers();
-        self.set_notice(
-            "Welcome to Borg. Sign in to a provider to start: pick Claude or ChatGPT to use your subscription.",
-        );
+        self.set_notice(WELCOME_SIGN_IN);
     }
 
     /// The model waiting for a login on `lane`, with the provider it runs on.
@@ -7084,6 +7084,11 @@ impl BorgTerminal {
             return Ok(UiAction::None);
         };
         let rows = screen.rows(&values);
+        let ctrl_c = matches!(
+            &event,
+            Event::Key(key)
+                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
+        );
         let effect = match event {
             Event::Key(key) => screen.handle_key(key, &rows),
             Event::Mouse(mouse) => {
@@ -7099,6 +7104,17 @@ impl BorgTerminal {
         };
         Ok(match effect {
             SettingsEffect::None => UiAction::None,
+            // Nothing is connected yet, so a session without the sign-in
+            // screen could not do anything: stay on the provider list.
+            SettingsEffect::Close if self.awaiting_first_login => {
+                if ctrl_c {
+                    UiAction::Quit
+                } else {
+                    screen.show_providers();
+                    self.set_notice(WELCOME_SIGN_IN);
+                    UiAction::None
+                }
+            }
             SettingsEffect::Close => {
                 self.settings = None;
                 UiAction::None
