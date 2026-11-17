@@ -15433,7 +15433,8 @@ fn provider_error_usage_limit_reset_delay_at(
 
     // Claude's terminal error supplies a wall clock and IANA time zone.
     // Interpret it in that zone, including daylight saving and midnight.
-    use chrono::TimeZone;
+    use chrono::Timelike;
+    use jiff::tz::AmbiguousOffset;
     static RESET: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let captures = RESET
         .get_or_init(|| {
@@ -15445,19 +15446,27 @@ fn provider_error_usage_limit_reset_delay_at(
         clock.insert_str(clock.len() - 2, ":00");
     }
     let clock = chrono::NaiveTime::parse_from_str(&clock, "%I:%M%P").ok()?;
-    let zone: chrono_tz::Tz = captures[2].parse().ok()?;
-    let date = now.with_timezone(&zone).date_naive();
-    let reset = [Some(date), date.succ_opt()]
+    let clock = jiff::civil::time(clock.hour() as i8, clock.minute() as i8, 0, 0);
+    let zone = jiff::tz::TimeZone::get(&captures[2]).ok()?;
+    let now = jiff::Timestamp::new(now.timestamp(), now.timestamp_subsec_nanos() as i32).ok()?;
+    let date = now.to_zoned(zone.clone()).date();
+    let reset = [Some(date), date.tomorrow().ok()]
         .into_iter()
         .flatten()
         .flat_map(|date| {
-            let times = zone.from_local_datetime(&date.and_time(clock));
-            [times.earliest(), times.latest()].into_iter().flatten()
+            let local = date.to_datetime(clock);
+            let offsets = match zone.to_ambiguous_timestamp(local).offset() {
+                AmbiguousOffset::Unambiguous { offset } => vec![offset],
+                AmbiguousOffset::Gap { .. } => Vec::new(),
+                AmbiguousOffset::Fold { before, after } => vec![before, after],
+            };
+            offsets
+                .into_iter()
+                .filter_map(move |offset| offset.to_timestamp(local).ok())
         })
-        .map(|time| time.with_timezone(&Utc))
         .filter(|time| *time > now)
         .min()?;
-    (reset - now).to_std().ok()
+    Duration::try_from(reset.duration_since(now)).ok()
 }
 
 fn format_reset_delay(delay: Duration) -> String {

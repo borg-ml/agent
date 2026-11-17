@@ -26,7 +26,6 @@ borg-lanes = { path = "../borg-lanes" }
 borg-provider = { path = "../borg-provider", default-features = false }
 borg-search.workspace = true
 chrono.workspace = true
-chrono-tz = "0.10"
 dirs.workspace = true
 futures.workspace = true
 grep-matcher.workspace = true
@@ -35,6 +34,7 @@ grep-searcher.workspace = true
 hex.workspace = true
 image = { version = "0.25.10", default-features = false, features = ["png", "pnm", "jpeg", "gif", "webp"] }
 ignore.workspace = true
+jiff = "0.2.35"
 libc.workspace = true
 regex.workspace = true
 reqwest.workspace = true

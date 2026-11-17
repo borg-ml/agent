@@ -8,7 +8,10 @@
 # repository was archived with no safe replacement version.
 # zbus_names/zvariant/derive moved into zbus 6; AT-SPI and GPUI still
 # require zbus 5 and provide no compatible migration yet (0370–0372).
+# chrono (RUSTSEC-2026-0543) is unmaintained but still required by sqlx,
+# ts-rs and serde_with, and is the persisted timestamp type across Borg.
 ignore = [
+    "RUSTSEC-2026-0543",
     "RUSTSEC-2026-0370",
     "RUSTSEC-2026-0371",
     "RUSTSEC-2026-0372",
