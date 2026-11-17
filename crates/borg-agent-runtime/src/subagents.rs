@@ -4604,9 +4604,15 @@ struct SubagentTable {
 const PARKED_WITH_PARENT: &str = "Paused with the parent session; follow up to wake";
 /// A child parked in the middle of a task; restore wakes it to continue.
 const PARKED_MID_TASK: &str = "Paused mid-task with the parent session; resumes when it restarts";
-/// A child whose actor stopped because the session store pool timed out.
+/// Journals written before explicit lifecycle used this for a child parked
+/// by a store pool timeout.
 const PARKED_STORE_BUSY: &str =
     "Paused: the session store was busy (pool timed out); follow up to wake";
+/// A child whose actor stopped because it lost the session store connection.
+const PARKED_STORE_LOST: &str = "Paused: lost the session store connection; resumes automatically";
+const RESUME_AFTER_STORE_LOSS: &str = "Borg lost its session database connection while you were working on your assigned task, which cut off your last turn. Continue the task from where you left off; your conversation and workspace are intact.";
+/// Time for the store to come back before the parked child is resumed.
+const STORE_LOSS_RESUME_DELAY: Duration = Duration::from_secs(5);
 const RESUME_AFTER_RESTART: &str = "Borg restarted while you were working on your assigned task, which cut off your last turn. Continue the task from where you left off; your conversation and workspace are intact.";
 
 impl SubagentTable {
@@ -7121,8 +7127,9 @@ impl SubagentCoordinator {
                 .await
                 .context("subagent actor task failed")
                 .and_then(|x| x);
+            let store_lost = outcome.as_ref().err().is_some_and(is_store_connection_loss);
             if let Err(error) = &outcome
-                && !is_store_pool_timeout(error)
+                && !store_lost
             {
                 let recorded = async {
                     let path = child_lock_path(&coordinator.journal_root, actor_session_id);
@@ -7155,6 +7162,9 @@ impl SubagentCoordinator {
                     (activity, _) => activity,
                 };
                 let _ = activity_tx.send(activity);
+            }
+            if store_lost {
+                resume_after_store_loss(coordinator, actor_session_id).await;
             }
         });
         for message in queued_inbox {
@@ -13875,16 +13885,42 @@ fn project_child_state(snapshot: &mut SubagentSnapshot, state: &crate::SessionSt
     };
 }
 
-fn is_store_pool_timeout(error: &anyhow::Error) -> bool {
-    // Matched by text too: the error can cross a task boundary as a message.
-    error.chain().any(|cause| {
-        matches!(
-            cause.downcast_ref::<sqlx::Error>(),
-            Some(sqlx::Error::PoolTimedOut)
-        ) || cause
-            .to_string()
-            .starts_with("pool timed out while waiting for an open connection")
+/// Resume a child parked by a lost store connection once the store has had
+/// time to come back. Its journal still ends mid-turn, so the work is intact.
+///
+/// The explicit boxed type matters: waking starts the child's actor again,
+/// whose start path awaits this, so an inferred future type would contain
+/// itself.
+fn resume_after_store_loss(
+    coordinator: SubagentCoordinator,
+    session_id: Uuid,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        tokio::time::sleep(STORE_LOSS_RESUME_DELAY).await;
+        let parked = coordinator
+            .get(session_id)
+            .await
+            .is_some_and(|agent| agent.lifecycle() == SubagentLifecycle::DormantInterrupted);
+        if parked
+            && let Err(error) = coordinator
+                .followup_task(&session_id.to_string(), RESUME_AFTER_STORE_LOSS)
+                .await
+        {
+            tracing::warn!(%session_id, %error, "could not resume a child parked by a lost store connection");
+        }
     })
+}
+
+/// The actor stopped because the journal connection was lost or saturated,
+/// not because its work is wrong.
+fn is_store_connection_loss(error: &anyhow::Error) -> bool {
+    // Matched by text too: the error can cross a task boundary as a message.
+    crate::session_store::postgres::transient_connection_error(error)
+        || error.chain().any(|cause| {
+            let text = cause.to_string();
+            text.starts_with("pool timed out while waiting for an open connection")
+                || text.starts_with("error communicating with database")
+        })
 }
 
 async fn finish_agent(
@@ -13898,10 +13934,10 @@ async fn finish_agent(
         .as_ref()
         .map(|busy| busy.contains(&session_id));
     let entry = table.entries.get_mut(&session_id)?;
-    // A store pool timeout says the journal was momentarily saturated, not
-    // that this child's work is wrong. Park it wakeable instead of failing it
-    // for good; its journal still ends in flight, so a restore resumes it too.
-    let store_busy = error.as_ref().is_some_and(is_store_pool_timeout);
+    // A lost or saturated journal connection says nothing about this child's
+    // work. Park it wakeable instead of failing it for good; its journal still
+    // ends in flight, so a restore resumes it too.
+    let store_busy = error.as_ref().is_some_and(is_store_connection_loss);
     let lifecycle = match (&error, parked_mid_task) {
         (Some(_), _) if !store_busy => SubagentLifecycle::Failed,
         (Some(_), _) | (None, Some(true)) => SubagentLifecycle::DormantInterrupted,
@@ -13910,7 +13946,7 @@ async fn finish_agent(
     };
     let detail = match (error, parked_mid_task) {
         (Some(error), _) if !store_busy => Some(format!("{error:#}")),
-        (Some(_), _) => Some(PARKED_STORE_BUSY.to_string()),
+        (Some(_), _) => Some(PARKED_STORE_LOST.to_string()),
         (None, Some(true)) => Some(PARKED_MID_TASK.to_string()),
         (None, Some(false)) => Some(PARKED_WITH_PARENT.to_string()),
         (None, None) => None,

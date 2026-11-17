@@ -5,6 +5,14 @@ Git comparison.
 
 ## Unreleased (since 0.21.4)
 
+- A lost session-database connection no longer fails running agents. When
+  Postgres drops or restarts a connection mid-write (closed socket, reset,
+  terminated backend, recovery after a crash), the journal operation is
+  retried on a fresh connection, and a durable append whose commit already
+  landed is not written twice. A subagent whose turn is still cut off is
+  paused rather than marked `failed`, and resumes by itself a few seconds
+  later instead of waiting for a manual follow-up.
+
 ## 0.21.4 (2026-11-17)
 
 - The first `borg` with no provider connected opens Settings › Providers so

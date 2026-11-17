@@ -554,7 +554,14 @@ impl PostgresSessionStore {
     /// Store one coalesced live snapshot, replacing any previous value for its
     /// live key. Live state is a rebuildable view of an in-flight turn, so it
     /// is written outside the durable event sequence and carries no sequence.
-    async fn append_live(&self, mut event: SessionEvent) -> Result<SessionEvent> {
+    /// Live frames are replayed on a fresh connection after a transport
+    /// failure. If the lost reply was the COMMIT's, one streamed fragment can
+    /// repeat in the live preview until the durable message replaces it.
+    async fn append_live(&self, event: SessionEvent) -> Result<SessionEvent> {
+        super::retry_transient(|| self.append_live_once(event.clone())).await
+    }
+
+    async fn append_live_once(&self, mut event: SessionEvent) -> Result<SessionEvent> {
         let original_event = event.clone();
         let message_fragment = matches!(&event.kind, SessionEventKind::MessageDelta { .. });
         if let SessionEventKind::MessageDelta { message_id, delta } = &event.kind {
@@ -793,6 +800,85 @@ impl PostgresSessionStore {
             events.push(self.event_from_row(row).await?);
         }
         Ok(events)
+    }
+
+    async fn read_once(&self, session_id: Uuid) -> Result<Vec<SessionEvent>> {
+        // A session that owns its whole history reads straight from its own
+        // rows; only a fork pays for composing an inherited prefix.
+        if self
+            .session_row(session_id)
+            .await?
+            .parent_session_id
+            .is_none()
+        {
+            return self.events_query(session_id, 0, None).await;
+        }
+        self.composed_events(session_id, None).await
+    }
+
+    async fn events_after_once(
+        &self,
+        session_id: Uuid,
+        sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<SessionEvent>> {
+        // A fork's own rows keep their composed sequence numbers, so a cursor
+        // past the inherited prefix is a bounded query, not a full composition.
+        let session = self.session_row(session_id).await?;
+        if session.parent_session_id.is_none() || sequence >= session.inherited_event_count {
+            return self
+                .events_query(
+                    session_id,
+                    i64::try_from(sequence).unwrap_or(i64::MAX),
+                    Some(i64::try_from(limit).unwrap_or(i64::MAX)),
+                )
+                .await;
+        }
+        let until = sequence
+            .saturating_add(u64::try_from(limit).unwrap_or(u64::MAX))
+            .min(session.next_sequence.saturating_sub(1));
+        self.composed_events_range(session_id, sequence, until, false)
+            .await
+    }
+
+    /// The batch as committed, when a transaction whose connection died did
+    /// in fact commit. A batch commits whole, so its first event decides.
+    async fn committed_batch(&self, events: &[SessionEvent]) -> Result<Option<Vec<SessionEvent>>> {
+        let mut committed = Vec::with_capacity(events.len());
+        for event in events {
+            // Mirrors the id rewrite in `append_durable_in_transaction`.
+            let event_id = match &event.kind {
+                SessionEventKind::ReasoningBlockStarted { reasoning_id } => *reasoning_id,
+                _ => event.id,
+            };
+            let row = sqlx::query(
+                "select event_json, event_body, dict_id from session_events \
+                 where session_id = $1 and event_id = $2",
+            )
+            .bind(event.session_id)
+            .bind(event_id)
+            .fetch_optional(self.pool())
+            .await?;
+            match row {
+                Some(row) => committed.push(self.event_from_row(&row).await?),
+                None if committed.is_empty() => return Ok(None),
+                None => anyhow::bail!("journal batch committed partially"),
+            }
+        }
+        Ok(Some(committed))
+    }
+
+    async fn append_batch_once(&self, events: &[SessionEvent]) -> Result<Vec<SessionEvent>> {
+        let mut transaction = self.pool().begin().await?;
+        let mut appended = Vec::with_capacity(events.len());
+        for event in events {
+            appended.push(
+                self.append_durable_in_transaction(&mut transaction, event.clone())
+                    .await?,
+            );
+        }
+        transaction.commit().await?;
+        Ok(appended)
     }
 }
 
@@ -1050,17 +1136,32 @@ impl SessionStore for PostgresSessionStore {
     }
 
     async fn read(&self, session_id: Uuid) -> Result<Vec<SessionEvent>> {
-        // A session that owns its whole history reads straight from its own
-        // rows; only a fork pays for composing an inherited prefix.
-        if self
-            .session_row(session_id)
-            .await?
-            .parent_session_id
-            .is_none()
-        {
-            return self.events_query(session_id, 0, None).await;
-        }
-        self.composed_events(session_id, None).await
+        super::retry_transient(|| self.read_once(session_id)).await
+    }
+
+    async fn events_after(
+        &self,
+        session_id: Uuid,
+        sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<SessionEvent>> {
+        super::retry_transient(|| self.events_after_once(session_id, sequence, limit)).await
+    }
+
+    async fn state(&self, session_id: Uuid) -> Result<SessionState> {
+        let state_json: Option<String> = super::retry_transient(|| async {
+            Ok(
+                sqlx::query_scalar("select state_json from sessions where id = $1")
+                    .bind(session_id)
+                    .fetch_optional(self.pool())
+                    .await?,
+            )
+        })
+        .await?;
+        let Some(state_json) = state_json else {
+            return Ok(SessionState::default());
+        };
+        Ok(serde_json::from_str(&state_json)?)
     }
 
     async fn prompt_event(
@@ -1082,49 +1183,12 @@ impl SessionStore for PostgresSessionStore {
         Ok(Some(serde_json::from_value(value)?))
     }
 
-    async fn events_after(
-        &self,
-        session_id: Uuid,
-        sequence: u64,
-        limit: usize,
-    ) -> Result<Vec<SessionEvent>> {
-        // A fork's own rows keep their composed sequence numbers, so a cursor
-        // past the inherited prefix is a bounded query, not a full composition.
-        let session = self.session_row(session_id).await?;
-        if session.parent_session_id.is_none() || sequence >= session.inherited_event_count {
-            return self
-                .events_query(
-                    session_id,
-                    i64::try_from(sequence).unwrap_or(i64::MAX),
-                    Some(i64::try_from(limit).unwrap_or(i64::MAX)),
-                )
-                .await;
-        }
-        let until = sequence
-            .saturating_add(u64::try_from(limit).unwrap_or(u64::MAX))
-            .min(session.next_sequence.saturating_sub(1));
-        self.composed_events_range(session_id, sequence, until, false)
-            .await
-    }
-
     async fn latest_completed_context_compaction(
         &self,
         session_id: Uuid,
     ) -> Result<Option<SessionEvent>> {
         self.latest_completed_context_compaction_before(session_id, None)
             .await
-    }
-
-    async fn state(&self, session_id: Uuid) -> Result<SessionState> {
-        let state_json: Option<String> =
-            sqlx::query_scalar("select state_json from sessions where id = $1")
-                .bind(session_id)
-                .fetch_optional(self.pool())
-                .await?;
-        let Some(state_json) = state_json else {
-            return Ok(SessionState::default());
-        };
-        Ok(serde_json::from_str(&state_json)?)
     }
 
     async fn inherited_event_count(&self, session_id: Uuid) -> Result<u64> {
@@ -1629,35 +1693,41 @@ impl SessionStore for PostgresSessionStore {
         if events.is_empty() {
             return Ok(Vec::new());
         }
-        for attempt in 0..6 {
-            let result: Result<Vec<SessionEvent>> = async {
-                let mut transaction = self.pool().begin().await?;
-                let mut appended = Vec::with_capacity(events.len());
-                for event in &events {
-                    appended.push(
-                        self.append_durable_in_transaction(&mut transaction, event.clone())
-                            .await?,
-                    );
+        let mut contended = 0;
+        let mut connection_lost = false;
+        let mut transient_delays = super::TRANSIENT_RETRY_DELAYS.iter();
+        loop {
+            let result = async {
+                // A lost connection can hide a COMMIT that landed; replaying
+                // it would append every event a second time.
+                if connection_lost && let Some(committed) = self.committed_batch(&events).await? {
+                    return Ok(committed);
                 }
-                transaction.commit().await?;
-                Ok(appended)
+                self.append_batch_once(&events).await
             }
             .await;
-            match result {
+            let delay = match result {
                 Ok(appended) => return Ok(appended),
-                Err(error) => {
-                    if !super::retryable_transaction_error(&error) || attempt == 5 {
-                        return Err(error);
-                    }
+                Err(error) if super::retryable_transaction_error(&error) && contended < 5 => {
+                    contended += 1;
                     tracing::warn!(
-                        attempt = attempt + 1,
+                        attempt = contended,
                         "retrying contended Postgres journal append"
                     );
-                    tokio::time::sleep(Duration::from_millis(100 << attempt)).await;
+                    Duration::from_millis(100 << (contended - 1))
                 }
-            }
+                Err(error) if super::transient_connection_error(&error) => {
+                    let Some(delay) = transient_delays.next() else {
+                        return Err(error);
+                    };
+                    connection_lost = true;
+                    tracing::warn!(%error, "session store connection lost; retrying journal append");
+                    *delay
+                }
+                Err(error) => return Err(error),
+            };
+            tokio::time::sleep(delay).await;
         }
-        unreachable!()
     }
 
     async fn raw_event_page(
