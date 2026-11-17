@@ -862,23 +862,35 @@ impl MarkdownTable {
         }
 
         let available = width.saturating_sub(columns.saturating_mul(3).saturating_add(1));
-        let mut column_widths = (0..columns)
-            .map(|column| {
-                self.rows
+        let column_widths = self.column_widths(columns, available);
+
+        let rows = self
+            .rows
+            .iter()
+            .map(|row| {
+                column_widths
                     .iter()
-                    .filter_map(|row| row.get(column))
-                    .map(|cell| UnicodeWidthStr::width(cell.as_str()))
-                    .max()
-                    .unwrap_or(1)
-                    .max(1)
+                    .enumerate()
+                    .map(|(column, width)| {
+                        wrap_table_cell(row.get(column).map(String::as_str).unwrap_or_default(), *width)
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        fit_table_columns(&mut column_widths, available);
+        // Once any body row spans several lines, rules between rows keep
+        // the row boundaries readable.
+        let separate_rows = rows
+            .iter()
+            .skip(1)
+            .any(|cells| cells.iter().any(|lines| lines.len() > 1));
 
         let mut output = Vec::new();
-        for (row_index, row) in self.rows.iter().enumerate() {
-            output.push(table_row_line(
-                row,
+        for (row_index, cells) in rows.iter().enumerate() {
+            if row_index > 1 && separate_rows {
+                output.push(table_rule_line(&column_widths));
+            }
+            output.extend(table_row_lines(
+                cells,
                 &column_widths,
                 &self.alignments,
                 if row_index == 0 {
@@ -893,6 +905,33 @@ impl MarkdownTable {
         }
         output
     }
+
+    fn column_widths(&self, columns: usize, available: usize) -> Vec<usize> {
+        let mut column_widths = (0..columns)
+            .map(|column| {
+                self.rows
+                    .iter()
+                    .filter_map(|row| row.get(column))
+                    .map(|cell| UnicodeWidthStr::width(cell.as_str()))
+                    .max()
+                    .unwrap_or(1)
+                    .max(1)
+            })
+            .collect::<Vec<_>>();
+        fit_table_columns(&mut column_widths, available);
+        column_widths
+    }
+}
+
+fn wrap_table_cell(value: &str, width: usize) -> Vec<String> {
+    let mut lines = display_ranges(value, width, false)
+        .into_iter()
+        .map(|(start, end)| value[start..end].trim().to_string())
+        .collect::<Vec<_>>();
+    while lines.len() > 1 && lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    lines
 }
 
 fn fit_table_columns(widths: &mut [usize], available: usize) {
@@ -929,34 +968,41 @@ fn fit_table_columns(widths: &mut [usize], available: usize) {
     }
 }
 
-fn table_row_line(
-    row: &[String],
+fn table_row_lines(
+    cells: &[Vec<String>],
     widths: &[usize],
     alignments: &[MarkdownAlignment],
     style: Style,
-) -> Line<'static> {
-    let mut spans = vec![Span::styled("│", Style::default().fg(Color::DarkGray))];
-    for (column, width) in widths.iter().copied().enumerate() {
-        let cell = row.get(column).map(String::as_str).unwrap_or_default();
-        let cell = truncate_table_cell(cell, width);
-        let cell_width = UnicodeWidthStr::width(cell.as_str());
-        let padding = width.saturating_sub(cell_width);
-        let (left, right) = match alignments
-            .get(column)
-            .copied()
-            .unwrap_or(MarkdownAlignment::None)
-        {
-            MarkdownAlignment::Right => (padding, 0),
-            MarkdownAlignment::Center => (padding / 2, padding - padding / 2),
-            MarkdownAlignment::None | MarkdownAlignment::Left => (0, padding),
-        };
-        spans.push(Span::styled(
-            format!(" {}{}{} ", " ".repeat(left), cell, " ".repeat(right)),
-            style,
-        ));
-        spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
-    }
-    Line::from(spans)
+) -> Vec<Line<'static>> {
+    let height = cells.iter().map(Vec::len).max().unwrap_or(1).max(1);
+    (0..height)
+        .map(|line| {
+            let mut spans = vec![Span::styled("│", Style::default().fg(Color::DarkGray))];
+            for (column, width) in widths.iter().copied().enumerate() {
+                let cell = cells
+                    .get(column)
+                    .and_then(|lines| lines.get(line))
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                let padding = width.saturating_sub(UnicodeWidthStr::width(cell));
+                let (left, right) = match alignments
+                    .get(column)
+                    .copied()
+                    .unwrap_or(MarkdownAlignment::None)
+                {
+                    MarkdownAlignment::Right => (padding, 0),
+                    MarkdownAlignment::Center => (padding / 2, padding - padding / 2),
+                    MarkdownAlignment::None | MarkdownAlignment::Left => (0, padding),
+                };
+                spans.push(Span::styled(
+                    format!(" {}{}{} ", " ".repeat(left), cell, " ".repeat(right)),
+                    style,
+                ));
+                spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
+            }
+            Line::from(spans)
+        })
+        .collect()
 }
 
 fn table_rule_line(widths: &[usize]) -> Line<'static> {
@@ -991,18 +1037,22 @@ fn render_stacked_table(rows: &[Vec<String>], width: usize, style: Style) -> Vec
             let prefix_width = UnicodeWidthStr::width(prefix.as_str());
             let value_width = UnicodeWidthStr::width(value.as_str());
             if prefix_width.saturating_add(value_width) > width {
-                output.push(Line::from(Span::styled(
-                    truncate_table_cell(prefix.trim_end(), width),
-                    style.add_modifier(Modifier::BOLD),
-                )));
-                output.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(truncate_table_cell(value, width.saturating_sub(2)), style),
-                ]));
+                for header_line in wrap_table_cell(prefix.trim_end(), width) {
+                    output.push(Line::from(Span::styled(
+                        header_line,
+                        style.add_modifier(Modifier::BOLD),
+                    )));
+                }
+                for value_line in wrap_table_cell(value, width.saturating_sub(2)) {
+                    output.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(value_line, style),
+                    ]));
+                }
             } else {
                 output.push(Line::from(vec![
                     Span::styled(prefix, style.add_modifier(Modifier::BOLD)),
-                    Span::styled(truncate_table_cell(value, width - prefix_width), style),
+                    Span::styled(value.clone(), style),
                 ]));
             }
         }
@@ -1165,11 +1215,11 @@ mod tests {
         ];
 
         let started = Instant::now();
-        let lines = table.render(COLUMNS * 4 + 1, Style::default());
+        let widths = table.column_widths(COLUMNS, COLUMNS);
         let elapsed = started.elapsed();
         eprintln!("64-column 2 MiB markdown table balancing: {elapsed:?}");
 
-        assert_eq!(lines.len(), 3);
+        assert_eq!(widths, vec![1; COLUMNS]);
         assert!(
             elapsed < std::time::Duration::from_millis(25),
             "oversized markdown table balancing exceeded 25 ms: {elapsed:?}"

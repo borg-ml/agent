@@ -5,6 +5,9 @@ Git comparison.
 
 ## Unreleased (since 0.21.4)
 
+- Markdown tables in the transcript wrap long cells onto extra lines instead
+  of cutting them off with `…`. When a row wraps, rules between rows keep
+  the rows apart. The narrow-terminal stacked layout wraps the same way.
 - A lost session-database connection no longer fails running agents. When
   Postgres drops or restarts a connection mid-write (closed socket, reset,
   terminated backend, recovery after a crash), the journal operation is
