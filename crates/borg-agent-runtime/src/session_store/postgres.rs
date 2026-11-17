@@ -121,6 +121,57 @@ fn retryable_transaction_error(error: &anyhow::Error) -> bool {
     })
 }
 
+/// Waits between attempts after a transport failure. Each retry acquires a
+/// fresh connection, and the pool's own connect loop already waits out a
+/// server that is restarting or in recovery, so these only space attempts.
+const TRANSIENT_RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_millis(100),
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+];
+
+/// The connection under the operation was lost, not the data: the socket
+/// closed or reset, the backend was terminated (admin or crash shutdown, which
+/// a server crash-restart does to every backend), the server is still
+/// recovering, or no connection could be acquired in time. A fresh connection
+/// can succeed where this one failed. Data errors such as constraint
+/// violations or serialization failures are not included.
+pub(crate) fn transient_connection_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| match cause.downcast_ref::<sqlx::Error>() {
+            Some(sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut) => true,
+            Some(sqlx::Error::Database(error)) => error.code().is_some_and(|code| {
+                code.starts_with("08") || matches!(code.as_ref(), "57P01" | "57P02" | "57P03")
+            }),
+            _ => false,
+        })
+}
+
+/// Run an idempotent store operation, repeating it on a fresh connection after
+/// a transport failure. Only operations that are safe to replay may use this.
+pub(crate) async fn retry_transient<T, F, Fut>(mut operation: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut delays = TRANSIENT_RETRY_DELAYS.iter();
+    loop {
+        match operation().await {
+            Err(error) if transient_connection_error(&error) => {
+                let Some(delay) = delays.next() else {
+                    return Err(error);
+                };
+                tracing::warn!(%error, "session store connection lost; retrying");
+                tokio::time::sleep(*delay).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 impl PostgresSessionStore {
     /// Connect with a caller-chosen pool size.
     ///
@@ -598,6 +649,74 @@ mod tests {
     /// mock would get wrong. Without one they skip rather than fail, so the
     /// suite still runs on a machine with no database.
     use super::testing::{ScratchDatabase, test_url};
+
+    /// A crash-restart of the server terminates every backend, including one
+    /// in the middle of a journal append. That append must land, exactly
+    /// once, on a fresh connection instead of failing the session's actor.
+    #[tokio::test]
+    async fn journal_append_survives_its_connection_being_terminated() {
+        use crate::{SessionEvent, SessionEventKind, SessionStatus, SessionStore};
+
+        let (scratch, store) = testing::session_store().await;
+        let session_id = uuid::Uuid::new_v4();
+        store.create_session(session_id).await.unwrap();
+        // Hold the session row so the append waits mid-transaction, where its
+        // backend can be found and terminated.
+        let mut blocker = store.pool().begin().await.unwrap();
+        sqlx::query("select 1 from sessions where id = $1 for update")
+            .bind(session_id)
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let event = SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Running,
+                lifecycle: None,
+                detail: Some("working".into()),
+            },
+        );
+        let appending = tokio::spawn({
+            let store = store.clone();
+            let event = event.clone();
+            async move { store.append(event).await }
+        });
+        let victim: i32 = loop {
+            let waiting = sqlx::query_scalar(
+                "select pid from pg_stat_activity \
+                 where datname = current_database() and wait_event_type = 'Lock'",
+            )
+            .fetch_optional(store.pool())
+            .await
+            .unwrap();
+            if let Some(pid) = waiting {
+                break pid;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let terminated: bool = sqlx::query_scalar("select pg_terminate_backend($1)")
+            .bind(victim)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert!(terminated);
+        blocker.rollback().await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(30), appending)
+            .await
+            .expect("retry is bounded")
+            .unwrap()
+            .expect("a terminated connection must not fail the append");
+        let journal = store.read(session_id).await.unwrap();
+        assert_eq!(journal.iter().filter(|e| e.id == event.id).count(), 1);
+        assert_eq!(
+            store.state(session_id).await.unwrap().status,
+            Some(SessionStatus::Running)
+        );
+        drop(store);
+        scratch.discard().await;
+    }
 
     #[tokio::test]
     async fn journal_connections_bound_stranded_transactions() {
