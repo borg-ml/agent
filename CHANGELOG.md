@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.21.3)
+## Unreleased (since 0.21.4)
+
+## 0.21.4 (2026-11-17)
 
 - The first `borg` with no provider connected opens Settings › Providers so
   you can sign in from the TUI, instead of exiting with "automatic provider
