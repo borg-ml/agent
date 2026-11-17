@@ -1993,6 +1993,9 @@ pub struct BorgTerminal {
     /// Model the user picked from a provider that still needs credentials;
     /// applied once the auth picker resolves.
     pending_model: Option<(CodingProvider, String)>,
+    /// Nothing was connected at startup: the first provider signed in becomes
+    /// the session's provider, on its default model.
+    awaiting_first_login: bool,
     /// The subscription sign-in the host is running, shown on its lane.
     subscription_sign_in: Option<(borg_provider::subscriptions::Lane, crate::settings::SignIn)>,
     /// True once the enable-dictation flow has completed (mirrors the durable
@@ -3522,6 +3525,7 @@ impl BorgTerminal {
             history_page_loading: false,
             picker: None,
             pending_model: None,
+            awaiting_first_login: false,
             subscription_sign_in: None,
             dictation_enabled: false,
             dictation_enable_flow: false,
@@ -6813,19 +6817,42 @@ impl BorgTerminal {
         }
     }
 
+    /// First run with no provider connected: list every provider so the user
+    /// can sign in to whichever they have.
+    pub fn welcome_sign_in(&mut self) {
+        self.pending_model = None;
+        self.awaiting_first_login = true;
+        self.open_settings();
+        self.settings
+            .as_mut()
+            .expect("settings just opened")
+            .show_providers();
+        self.set_notice(
+            "Welcome to Borg. Sign in to a provider to start: pick Claude or ChatGPT to use your subscription.",
+        );
+    }
+
     /// The model waiting for a login on `lane`, with the provider it runs on.
     pub fn pending_model(
         &self,
         lane: borg_provider::subscriptions::Lane,
     ) -> Option<(CodingProvider, String)> {
-        self.pending_model.clone().filter(|(provider, _)| {
+        let waiting = self.pending_model.clone().filter(|(provider, _)| {
             borg_remote::provider_usage::provider_lane(*provider) == Some(lane)
+        });
+        waiting.or_else(|| {
+            let provider = borg_remote::provider_usage::lane_provider(lane);
+            self.awaiting_first_login
+                .then(|| provider.model_catalog())
+                .flatten()
+                .map(|catalog| (provider, catalog.default_model.to_string()))
         })
     }
 
     /// The waiting model was switched to, or no longer applies.
     pub fn clear_pending_model(&mut self) {
         self.pending_model = None;
+        self.awaiting_first_login = false;
     }
 
     /// Open the fullscreen settings screen at one provider's page.

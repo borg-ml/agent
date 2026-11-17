@@ -2612,7 +2612,10 @@ async fn run_local_agent_session(
     } else {
         args.provider().into()
     };
-    if !resuming
+    // An interactive session opens sign-in itself (the credential pre-flight
+    // below), so only a run with no terminal to sign in from stops here.
+    if (args.print || args.json)
+        && !resuming
         && chain_start.is_none()
         && args.provider.is_none()
         && matches!(
@@ -3248,12 +3251,26 @@ async fn run_local_agent_session(
         let configured_route = model
             .as_deref()
             .is_some_and(|model| agent_config.has_configured_model(model));
-        let credential_preflight_shown = !resuming
+        // A terminal attached to a fresh detached host sees the host's
+        // configuration events, so "fresh" means no conversation yet.
+        let conversation_started = resuming
+            && (!history_start_reached
+                || history
+                    .iter()
+                    .any(|event| matches!(event.kind, SessionEventKind::Message { .. })));
+        let credential_preflight_shown = !conversation_started
             && !has_initial_prompt
             && !configured_route
             && !provider_connection_ready(provider).await;
+        let nothing_connected = args.provider.is_none()
+            && args.model.is_none()
+            && !crate::cli::DEFAULT_PROVIDER_PREFERENCE
+                .into_iter()
+                .any(crate::cli::default_subscription_ready);
         if credential_preflight_shown {
-            if provider_lane(provider).is_some() {
+            if nothing_connected {
+                terminal.welcome_sign_in();
+            } else if provider_lane(provider).is_some() {
                 let model = model.clone().or_else(|| {
                     provider
                         .model_catalog()

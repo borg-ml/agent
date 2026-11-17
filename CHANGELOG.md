@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.21.3)
 
+- The first `borg` with no provider connected opens Settings › Providers so
+  you can sign in from the TUI, instead of exiting with "automatic provider
+  selection requires a Claude or Codex subscription login". The session then
+  switches to the first provider you sign in to. `--print` and `--json` runs
+  still stop with that error, since they have no screen to sign in from.
+
 ## 0.21.3 (2026-11-16)
 
 - The footer shows "n shells" again for commands running in the background.
