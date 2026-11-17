@@ -8,8 +8,9 @@ Git comparison.
 - The first `borg` with no provider connected opens Settings › Providers so
   you can sign in from the TUI, instead of exiting with "automatic provider
   selection requires a Claude or Codex subscription login". The session then
-  switches to the first provider you sign in to. Until then Esc returns to
-  the provider list rather than closing it, and Ctrl+C quits. `--print` and
+  switches to the first provider you sign in to, or opens the model picker
+  for a provider without a default model. Until a login exists, Esc returns
+  to the provider list rather than closing it, and Ctrl+C quits. `--print` and
   `--json` runs still stop with that error, since they have no screen to sign
   in from.
 

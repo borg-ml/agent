@@ -9594,7 +9594,7 @@ async fn switch_to_pending_model(
     }
     terminal.clear_pending_model();
     terminal.close_settings();
-    if target == CodingProvider::OpenCode && !model.starts_with("opencode-go/") {
+    if model.is_empty() || (target == CodingProvider::OpenCode && !model.starts_with("opencode-go/")) {
         terminal.open_model_picker();
         return;
     }

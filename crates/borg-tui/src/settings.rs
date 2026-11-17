@@ -947,9 +947,20 @@ pub(crate) struct SettingsScreen {
     pending: Vec<(SettingId, usize, Instant)>,
     hits: Vec<(Rect, Target)>,
     hovered: Option<Target>,
+    /// First run: the screen stays until some login exists.
+    sign_in_required: bool,
 }
 
 impl SettingsScreen {
+    pub(crate) fn require_sign_in(&mut self) {
+        self.sign_in_required = true;
+    }
+
+    /// No login exists yet on the first run, so closing would leave a session
+    /// that cannot answer.
+    pub(crate) fn blocks_close(&self) -> bool {
+        self.sign_in_required && self.lanes.iter().all(|lane| lane.accounts.is_empty())
+    }
     /// Open the Providers overview.
     pub(crate) fn show_providers(&mut self) {
         self.set_section(
@@ -1955,6 +1966,13 @@ impl SettingsScreen {
             &["↑↓ choose", "Enter select", "Esc close list"]
         } else if !self.query.is_empty() {
             &["↑↓ move", "←→ change", "Enter select", "Esc clear search"]
+        } else if self.blocks_close() {
+            &[
+                "↑↓ move",
+                "Enter select",
+                "Tab next section",
+                "Esc back · Ctrl+C quit",
+            ]
         } else {
             &[
                 "↑↓ move",

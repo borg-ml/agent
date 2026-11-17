@@ -119,7 +119,7 @@ const INLINE_VIEWPORT_HEIGHT: u16 = 24;
 const HORIZONTAL_MARGIN: u16 = 0;
 const BORG_ORANGE: Color = Color::Rgb(255, 142, 36);
 const WELCOME_SIGN_IN: &str =
-    "Welcome to Borg. Sign in to start: Claude and ChatGPT use your subscription. Ctrl+C quits.";
+    "Welcome to Borg. Sign in to start: Claude and ChatGPT use your subscription.";
 const BORG_ORANGE_HOVER: Color = Color::Rgb(255, 184, 92);
 const RUNNING_STATUS_PEACH: Color = Color::Rgb(255, 132, 112);
 const SUBAGENT_PURPLE: Color = Color::Rgb(213, 126, 177);
@@ -6825,10 +6825,9 @@ impl BorgTerminal {
         self.pending_model = None;
         self.awaiting_first_login = true;
         self.open_settings();
-        self.settings
-            .as_mut()
-            .expect("settings just opened")
-            .show_providers();
+        let settings = self.settings.as_mut().expect("settings just opened");
+        settings.show_providers();
+        settings.require_sign_in();
         self.set_notice(WELCOME_SIGN_IN);
     }
 
@@ -6841,11 +6840,16 @@ impl BorgTerminal {
             borg_remote::provider_usage::provider_lane(*provider) == Some(lane)
         });
         waiting.or_else(|| {
+            // A provider without a default model leaves the model to the
+            // picker, signalled by an empty name.
             let provider = borg_remote::provider_usage::lane_provider(lane);
-            self.awaiting_first_login
-                .then(|| provider.model_catalog())
-                .flatten()
-                .map(|catalog| (provider, catalog.default_model.to_string()))
+            self.awaiting_first_login.then(|| {
+                let model = provider
+                    .model_catalog()
+                    .map(|catalog| catalog.default_model.to_string())
+                    .unwrap_or_default();
+                (provider, model)
+            })
         })
     }
 
@@ -7106,7 +7110,7 @@ impl BorgTerminal {
             SettingsEffect::None => UiAction::None,
             // Nothing is connected yet, so a session without the sign-in
             // screen could not do anything: stay on the provider list.
-            SettingsEffect::Close if self.awaiting_first_login => {
+            SettingsEffect::Close if screen.blocks_close() => {
                 if ctrl_c {
                     UiAction::Quit
                 } else {
