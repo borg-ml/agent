@@ -5,6 +5,14 @@ Git comparison.
 
 ## Unreleased (since 0.21.5)
 
+- Pasting an image into a session on a text-only model no longer kills the
+  turn with an upstream HTTP 400. The OpenCode Go catalog states each
+  model's input modalities, and Borg now reads them: when the selected
+  model accepts text only, image attachments are withheld with a note the
+  model can read, so the turn still answers and says what was lost, and
+  the /model picker marks text-only Go models. The gateway reports such
+  refusals as HTTP 400 with a server-error label; Borg no longer retries
+  them as if they were lost connections.
 - The resume picker is easier to read. Each session row shows its time and
   title without the model name crowding the title out. The preview lists
   started, last activity, directory, model and latest prompt one per line,

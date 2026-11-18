@@ -352,6 +352,29 @@ impl OpenAiCompatibleProvider {
             });
         }
         let request_id = request.request_id.clone();
+        // A text-only Go model refuses an image by blaming the model, so the
+        // route's own catalog is consulted before the request is built: the
+        // images are withheld with a note the model can read instead of the
+        // turn dying on a refusal no resend can clear. Support the catalog
+        // did not declare is respected as unknown — the request is sent as
+        // built.
+        if gateway
+            .is_some_and(|gateway| gateway.label.as_deref() == Some(super::opencode_model::LABEL))
+            && request.messages.iter().any(message_has_image_attachments)
+            && matches!(
+                super::opencode_model::model_accepts_images(request_model).await,
+                Some(false)
+            )
+            && withhold_image_attachments(&mut request, request_model)
+            && let Some(progress) = progress.as_ref()
+        {
+            let _ = progress.send(ProviderProgress::Narration {
+                text: format!(
+                    "Image attachments withheld: {request_model} accepts text-only input \
+                     and cannot view images."
+                ),
+            });
+        }
         let deepseek_model = request_model.to_ascii_lowercase().contains("deepseek");
         let wire_messages = compatible_wire_messages(&request.messages, deepseek_model);
         let mut body = json!({
@@ -1260,6 +1283,55 @@ fn model_message_wire_values(message: &ModelMessage, deepseek_model: bool) -> Ve
     }
 }
 
+/// Whether a message carries image attachments.
+fn message_has_image_attachments(message: &ModelMessage) -> bool {
+    matches!(
+        message,
+        ModelMessage::User { attachments, .. } | ModelMessage::Tool { attachments, .. }
+            if !attachments.is_empty()
+    )
+}
+
+/// Replace every image attachment with a note naming why it is absent.
+///
+/// A text-only model can still answer the surrounding text, and the note lets
+/// it tell the human what was lost instead of the gateway refusing the whole
+/// request. Returns whether anything was withheld.
+fn withhold_image_attachments(request: &mut ModelTurnRequest, model: &str) -> bool {
+    let mut withheld = false;
+    for message in &mut request.messages {
+        match message {
+            ModelMessage::User {
+                content,
+                attachments,
+            } if !attachments.is_empty() => {
+                let count = attachments.len();
+                withheld = true;
+                attachments.clear();
+                let plural = if count == 1 { "image" } else { "images" };
+                content.push_str(&format!(
+                    "\n\n[{count} attached {plural} not delivered: {model} accepts text-only \
+                     input and cannot view images.]"
+                ));
+            }
+            ModelMessage::Tool {
+                tool_call_id,
+                content,
+                attachments,
+            } if !attachments.is_empty() => {
+                withheld = true;
+                attachments.clear();
+                content.push_str(&format!(
+                    "\n\n[Image output of tool call {tool_call_id} not delivered: {model} \
+                     accepts text-only input and cannot view images.]"
+                ));
+            }
+            _ => {}
+        }
+    }
+    withheld
+}
+
 /// Serialize model messages for chat completions without splitting a tool-call
 /// group.
 ///
@@ -1913,7 +1985,16 @@ fn compatible_provider_error_kind(body: &str, status: u16) -> ProviderErrorKind 
     let declares_server_error = [r#""type":"server_error""#, r#""code":"server_error""#]
         .iter()
         .any(|marker| compact.contains(marker));
-    if declares_server_error {
+    // The same gateway also labels a deterministic request refusal as a
+    // server error: an image sent to a text-only model answers 400 with
+    // `"type":"server_error"` and the refusal named in the message. A resend
+    // of that request is byte-identical, so unlike an upstream blip it can
+    // never clear, and the declared type must not make it retryable.
+    let lower = compact.to_ascii_lowercase();
+    let names_request_refusal = ["notavlm", "text-onlyprompts", "invalidimageorvideoinput"]
+        .iter()
+        .any(|marker| lower.contains(marker));
+    if declares_server_error && !names_request_refusal {
         ProviderErrorKind::ConnectionLost
     } else {
         ProviderErrorKind::Unknown
@@ -2391,6 +2472,49 @@ mod tests {
             wire["content"][1]["image_url"]["url"],
             "data:image/png;base64,aW1hZ2U="
         );
+    }
+
+    #[test]
+    fn withheld_images_leave_readable_notes_and_no_image_blocks() {
+        let attachment = || super::super::ModelInputAttachment {
+            media_type: "image/png".to_string(),
+            data_base64: "aW1hZ2U=".to_string(),
+            filename: Some("screen.png".to_string()),
+        };
+        let mut request = ModelTurnRequest {
+            fast: false,
+            ultrafast: false,
+            request_id: None,
+            session_id: None,
+            prompt_cache_key: None,
+            turn_routing: Default::default(),
+            messages: vec![
+                ModelMessage::user_with_attachments("look at this", vec![attachment()]),
+                ModelMessage::Tool {
+                    tool_call_id: "call-1".into(),
+                    content: "screenshot taken".into(),
+                    attachments: vec![attachment()],
+                },
+            ],
+            tools: vec![],
+            output_schema: None,
+        };
+        assert!(withhold_image_attachments(&mut request, "glm-5.3"));
+        assert!(!withhold_image_attachments(&mut request, "glm-5.3"));
+        let wire = compatible_wire_messages(&request.messages, false);
+        let serialized = serde_json::to_string(&wire).expect("wire is serializable");
+        assert!(!serialized.contains("image_url"), "{serialized}");
+        assert!(!serialized.contains("aW1hZ2U="), "{serialized}");
+        assert!(
+            serialized.contains("attached image not delivered: glm-5.3"),
+            "{serialized}"
+        );
+        assert!(
+            serialized.contains("Image output of tool call call-1 not delivered: glm-5.3"),
+            "{serialized}"
+        );
+        assert!(serialized.contains("look at this"), "{serialized}");
+        assert!(serialized.contains("screenshot taken"), "{serialized}");
     }
 
     #[test]
@@ -3365,6 +3489,24 @@ mod tests {
         assert_eq!(
             compatible_provider_error_kind(
                 r#"{"error":{"type":"invalid_request_error","message":"unknown model"}}"#,
+                400
+            ),
+            ProviderErrorKind::Unknown
+        );
+        // The gateway labels this deterministic refusal — an image for a
+        // text-only model — as a server error. The resend is byte-identical,
+        // so it must not be retried as a lost connection. Verbatim from a
+        // live turn on opencode-go/glm-5.3.
+        assert_eq!(
+            compatible_provider_error_kind(
+                r#"{"error":{"type":"server_error","message":"Upstream request failed: [20041] The model is not a VLM (Vision Language Model). Please use text-only prompts."}}"#,
+                400
+            ),
+            ProviderErrorKind::Unknown
+        );
+        assert_eq!(
+            compatible_provider_error_kind(
+                r#"{"error":{"type":"server_error","message":"Upstream request failed: [400] Invalid image or video input"}}"#,
                 400
             ),
             ProviderErrorKind::Unknown

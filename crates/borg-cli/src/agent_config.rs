@@ -707,6 +707,7 @@ impl AgentConfig {
                             .then(|| model.variants.keys().cloned().collect()),
                         reasoning_mandatory: false,
                         default_effort: None,
+                        supports_images: None,
                     }
                 })
             })

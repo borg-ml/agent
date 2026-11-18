@@ -175,6 +175,37 @@ pub async fn context_window_tokens(model: &str) -> Option<u64> {
 
 const MODELS_DEV_PROVIDER: &str = "opencode-go";
 
+/// Whether the Go route's model accepts image input, as the route's own model
+/// catalog declares it.
+///
+/// The gateway answers an image sent to a text-only model with a 400 that
+/// blames the model, so the catalog is read before the request is built: the
+/// turn keeps its text, the images are withheld with a note the model can
+/// read, and the failure becomes a message instead of a dead turn. `None`
+/// means the catalog has not described the model — unknown stays unknown and
+/// the request is sent as built. The cached catalog answers first; when it
+/// does not describe the model at all it is refreshed once, because a client
+/// that started offline keeps an empty cache until something asks.
+pub async fn model_accepts_images(model: &str) -> Option<bool> {
+    let wire = wire_model(model).unwrap_or_else(|| model.trim());
+    if wire.is_empty() {
+        return None;
+    }
+    let described = |entries: &[crate::runtime::DynamicModelEntry]| {
+        entries
+            .iter()
+            .find(|entry| wire_model(&entry.id) == Some(wire))
+            .and_then(|entry| entry.supports_images)
+    };
+    if let Some(accepts) = described(&crate::runtime::opencode_go_model_entries()) {
+        return Some(accepts);
+    }
+    crate::runtime::refresh_opencode_go_model_catalog()
+        .await
+        .ok()?;
+    described(&crate::runtime::opencode_go_model_entries())
+}
+
 /// The catalog quotes dollars per million tokens; Borg accounts in micro-USD.
 /// One allowance window the Go plan reports.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -266,6 +297,28 @@ mod tests {
     use super::*;
 
     const TEST_KEY: &str = "test-opencode-go-key";
+
+    #[tokio::test]
+    async fn go_catalog_answers_image_support_for_wire_and_prefixed_ids() {
+        let entry = crate::runtime::DynamicModelEntry {
+            id: "opencode-go/glm-5.3".to_string(),
+            label: "GLM-5.3".to_string(),
+            detail: None,
+            supported_efforts: None,
+            reasoning_mandatory: false,
+            default_effort: None,
+            supports_images: Some(false),
+        };
+        crate::runtime::set_opencode_go_model_entries(vec![entry]);
+        // The request path knows the wire id; the picker knows the prefixed
+        // alias. Both must resolve to the same catalog answer.
+        assert_eq!(model_accepts_images("glm-5.3").await, Some(false));
+        assert_eq!(
+            model_accepts_images("opencode-go/glm-5.3").await,
+            Some(false)
+        );
+        assert_eq!(model_accepts_images("  ").await, None);
+    }
 
     /// The catalog publishes `opencode-go/<id>` but the service expects the
     /// bare id. Sending the alias through unchanged is a silent 4xx, so the

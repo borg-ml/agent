@@ -2904,6 +2904,7 @@ fn model_picker_options_with_configured(
                     supported_efforts: None,
                     reasoning_mandatory: false,
                     default_effort: None,
+                    supports_images: None,
                 });
             }
             for (index, model) in models.into_iter().enumerate() {
@@ -3046,6 +3047,7 @@ fn model_picker_options_with_configured(
                 supported_efforts: None,
                 reasoning_mandatory: false,
                 default_effort: None,
+                supports_images: None,
             });
         }
         for (index, model) in models.into_iter().enumerate() {

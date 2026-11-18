@@ -2229,6 +2229,7 @@ fn model_picker_openai_compatible_merges_discovered_models_after_current() {
             supported_efforts: None,
             reasoning_mandatory: false,
             default_effort: None,
+            supports_images: None,
         },
         borg_provider::DynamicModelEntry {
             id: "gguf:bonsai-27b-q2_g64".to_string(),
@@ -2237,6 +2238,7 @@ fn model_picker_openai_compatible_merges_discovered_models_after_current() {
             supported_efforts: None,
             reasoning_mandatory: false,
             default_effort: None,
+            supports_images: None,
         },
     ];
     let options = model_picker_options_with_discovered(
@@ -2264,6 +2266,7 @@ fn model_picker_openrouter_uses_runtime_entries_and_existing_fuzzy_filter() {
         supported_efforts: None,
         reasoning_mandatory: false,
         default_effort: None,
+        supports_images: None,
     }];
     let options = model_picker_options_with_discovered(
         Some(CodingProvider::OpenRouter),
@@ -2320,6 +2323,7 @@ fn model_picker_lists_vercel_models_from_any_provider() {
         supported_efforts: None,
         reasoning_mandatory: false,
         default_effort: None,
+        supports_images: None,
     }]);
 
     // A Codex session lists the gateway's models alongside the fixed catalogs.

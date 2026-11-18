@@ -78,6 +78,7 @@ impl LocalModel {
             supported_efforts: None,
             reasoning_mandatory: false,
             default_effort: None,
+            supports_images: None,
         }
     }
 }

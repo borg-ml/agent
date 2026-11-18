@@ -241,6 +241,7 @@ pub fn model_options(provider: CodingProvider, current: Option<&str>) -> Vec<Mod
             // The catalog is empty here, so this fallback model has no
             // published default effort.
             default_effort: None,
+            supports_images: None,
         });
     }
     options.extend(openrouter_models.into_iter().map(|model| ModelOption {

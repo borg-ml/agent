@@ -237,6 +237,11 @@ pub struct DynamicModelEntry {
     pub reasoning_mandatory: bool,
     /// The level the model applies when reasoning is requested without one.
     pub default_effort: Option<String>,
+    /// The catalog states this model accepts image input. `None` means the
+    /// catalog said nothing, which is not evidence of either answer; `Some`
+    /// is only read from a catalog entry that declared the model's input
+    /// modalities.
+    pub supports_images: Option<bool>,
 }
 
 impl DynamicModelEntry {
@@ -250,6 +255,7 @@ impl DynamicModelEntry {
             supported_efforts: None,
             reasoning_mandatory: false,
             default_effort: None,
+            supports_images: None,
         }
     }
 }
@@ -263,6 +269,16 @@ pub fn opencode_go_model_entries() -> Vec<DynamicModelEntry> {
         .read()
         .map(|entries| entries.clone())
         .unwrap_or_default()
+}
+
+/// Seed the cached Go catalog, mirroring [`set_openrouter_model_entries`].
+pub fn set_opencode_go_model_entries(entries: Vec<DynamicModelEntry>) {
+    if let Ok(mut current) = OPENCODE_GO_MODEL_ENTRIES
+        .get_or_init(|| RwLock::new(Vec::new()))
+        .write()
+    {
+        *current = entries;
+    }
 }
 
 pub async fn refresh_opencode_go_model_catalog() -> anyhow::Result<Vec<DynamicModelEntry>> {
@@ -279,7 +295,11 @@ pub async fn refresh_opencode_go_model_catalog() -> anyhow::Result<Vec<DynamicMo
     let mut entries = openrouter_model_entries_from_response(&payload);
     for entry in &mut entries {
         entry.id = format!("opencode-go/{}", entry.id);
-        entry.detail = Some("OpenCode Go subscription · uses your Go allowance".to_string());
+        let mut detail = "OpenCode Go subscription · uses your Go allowance".to_string();
+        if entry.supports_images == Some(false) {
+            detail.push_str(" · text-only");
+        }
+        entry.detail = Some(detail);
     }
     anyhow::ensure!(
         !entries.is_empty(),
@@ -380,6 +400,20 @@ pub(crate) fn openrouter_model_entries_from_response(
                 details.push(description.to_string());
             }
             let reasoning = model.get("reasoning");
+            // The Go route states input modalities directly; OpenRouter nests
+            // them under `architecture`. Either way the fact is whether
+            // "image" is an accepted input, and a payload that says nothing
+            // leaves it unknown rather than defaulting to either answer.
+            let input_modalities = model
+                .get("modalities")
+                .and_then(|modalities| modalities.get("input"))
+                .and_then(serde_json::Value::as_array)
+                .or_else(|| {
+                    model
+                        .get("architecture")
+                        .and_then(|architecture| architecture.get("input_modalities"))
+                        .and_then(serde_json::Value::as_array)
+                });
             Some(DynamicModelEntry {
                 id: id.to_string(),
                 label,
@@ -402,6 +436,11 @@ pub(crate) fn openrouter_model_entries_from_response(
                     .and_then(|reasoning| reasoning.get("default_effort"))
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string),
+                supports_images: input_modalities.map(|modalities| {
+                    modalities
+                        .iter()
+                        .any(|modality| modality.as_str() == Some("image"))
+                }),
             })
         })
         .collect::<Vec<_>>();
@@ -591,6 +630,9 @@ fn vercel_model_entries_from_response(payload: &serde_json::Value) -> Vec<Dynami
                     .and_then(|reasoning| reasoning.get("default_effort"))
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string),
+                // Vercel's model list types models rather than stating input
+                // modalities, so image support stays unknown here.
+                supports_images: None,
             })
         })
         .collect::<Vec<_>>();
@@ -654,6 +696,7 @@ pub fn dynamic_models_for_backend(
                 supported_efforts: None,
                 reasoning_mandatory: false,
                 default_effort: None,
+                supports_images: None,
             });
         }
         seen_ids.insert(cur.to_string());
@@ -755,6 +798,43 @@ mod tests {
                 |detail| detail.contains("128000 context") && detail.contains("coding")
             )
         );
+    }
+
+    /// The Go route's model list states input modalities directly, and a
+    /// text-only entry is what the image-withholding decision reads. The
+    /// verbatim shapes come from the live `/zen/go/v1/models` payload; the
+    /// OpenRouter spelling is checked too because the same parser reads it.
+    #[test]
+    fn catalog_input_modalities_answer_image_support() {
+        let entries = openrouter_model_entries_from_response(&serde_json::json!({
+            "data": [
+                {
+                    "id": "glm-5.3",
+                    "name": "GLM-5.3",
+                    "modalities": { "input": ["text"], "output": ["text"] }
+                },
+                {
+                    "id": "qwen3.7-vl",
+                    "name": "Qwen3.7 VL",
+                    "modalities": { "input": ["text", "image"], "output": ["text"] }
+                },
+                {
+                    "id": "openrouter/vision",
+                    "name": "Vision",
+                    "architecture": { "input_modalities": ["text", "image"] }
+                },
+                {
+                    "id": "silent",
+                    "name": "Says Nothing"
+                }
+            ]
+        }));
+        let find = |id: &str| entries.iter().find(|entry| entry.id == id).unwrap();
+        assert_eq!(find("glm-5.3").supports_images, Some(false));
+        assert_eq!(find("qwen3.7-vl").supports_images, Some(true));
+        assert_eq!(find("openrouter/vision").supports_images, Some(true));
+        // A catalog entry that declares no modalities is unknown, not "no".
+        assert_eq!(find("silent").supports_images, None);
     }
 
     #[test]
