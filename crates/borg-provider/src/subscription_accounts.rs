@@ -25,10 +25,18 @@ pub struct SubscriptionAccount {
     pub active: bool,
 }
 
+/// Characters a login name cannot contain, because the name is used as a
+/// directory under `~/.borg/accounts/<provider>/`: the path separators, and
+/// the set Windows reserves in file names.
+const NAME_PATH_UNSAFE: &[char] = &['/', '\\', ':', '*', '?', '"', '<', '>', '|'];
+
 pub fn validate_name(name: &str) -> Result<&str> {
     // A space is allowed inside a name so a login can be called "Profile 2";
     // it never appears at either end, where it would be invisible and would
-    // make two names that read the same differ.
+    // make two names that read the same differ. Everything else printable is
+    // allowed as long as the filesystem can carry it, because a login people
+    // actually want to type is often an email such as "sasha@borg.ml". A name
+    // still begins with a letter or digit, so "." and ".." stay impossible.
     let valid = !name.is_empty()
         && name.len() <= 40
         && name
@@ -36,16 +44,16 @@ pub fn validate_name(name: &str) -> Result<&str> {
             .next()
             .is_some_and(|first| first.is_ascii_alphanumeric())
         && name.chars().all(|character| {
-            character.is_ascii_alphanumeric()
-                || character == '-'
-                || character == '_'
-                || character == ' '
+            character == ' '
+                || (character.is_ascii_graphic() && !NAME_PATH_UNSAFE.contains(&character))
         })
         && !name.ends_with(' ')
+        && !name.ends_with('.')
         && !name.contains("  ");
     ensure!(
         valid,
-        "login name must be 1-40 ASCII letters, digits, spaces, '-' or '_'"
+        "login name must be 1-40 printable ASCII characters starting with a letter or digit; \
+         path separators and the reserved \":*?<>|\" set are not allowed"
     );
     Ok(name)
 }
@@ -440,6 +448,10 @@ mod tests {
             "../escape",
             ".hidden",
             "a/b",
+            "a\\b",
+            "a:b",
+            "a*b",
+            "trailing.",
             " leading",
             "trailing ",
             "double  space",
@@ -460,6 +472,12 @@ mod tests {
             new_account_path(ProviderAuthProvider::Claude, "Profile 2")
                 .unwrap()
                 .ends_with("accounts/claude/Profile 2")
+        );
+        // An email is a login name people actually want to type.
+        assert!(
+            new_account_path(ProviderAuthProvider::Openai, "sasha@borg.ml")
+                .unwrap()
+                .ends_with("accounts/openai/sasha@borg.ml/auth.json")
         );
     }
 

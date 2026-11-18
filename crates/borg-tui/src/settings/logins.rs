@@ -296,7 +296,7 @@ pub(crate) fn detail_rows(
             Id::LaneName(position),
             "New login name",
             format!(
-                "Optional name for the login below, up to 40 letters, digits, spaces, '-' or '_'. Leave it blank to call it {}.",
+                "Optional name for the login below, up to 40 printable characters — letters, digits, spaces, and punctuation such as '.' or '@'. Leave it blank to call it {}.",
                 default_name(view.accounts.iter().map(|account| account.name.as_str()))
             ),
             SettingControl::Text(editor.name(lane).to_string()),

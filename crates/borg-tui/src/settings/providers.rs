@@ -144,7 +144,7 @@ fn login_rows(
         Id::ProviderLoginName,
         "New login name",
         &format!(
-            "Optional name for the key below, up to 40 letters, digits, spaces, '-' or '_'. Leave it blank to call it {}.",
+            "Optional name for the key below, up to 40 printable characters — letters, digits, spaces, and punctuation such as '.' or '@'. Leave it blank to call it {}.",
             super::logins::default_name(accounts.iter().map(|account| account.name.as_str()))
         ),
         &editor.login_name,

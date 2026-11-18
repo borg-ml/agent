@@ -13,6 +13,10 @@ Git comparison.
   the /model picker marks text-only Go models. The gateway reports such
   refusals as HTTP 400 with a server-error label; Borg no longer retries
   them as if they were lost connections.
+- Login names accept printable ASCII, so an email such as
+  "sasha@borg.ml" can name a subscription account. Names still start with
+  a letter or digit, stay at most 40 characters, and avoid the characters a
+  directory name cannot carry.
 - The resume picker is easier to read. Each session row shows its time and
   title without the model name crowding the title out. The preview lists
   started, last activity, directory, model and latest prompt one per line,
