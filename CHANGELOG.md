@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.21.5)
+## Unreleased (since 0.21.6)
+
+## 0.21.6 (2026-11-18)
 
 - Pasting an image into a session on a text-only model no longer kills the
   turn with an upstream HTTP 400. The OpenCode Go catalog states each
