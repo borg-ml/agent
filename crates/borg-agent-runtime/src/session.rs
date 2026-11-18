@@ -2574,7 +2574,8 @@ async fn run_agent_session_store_kernel(
 ) -> Result<()> {
     // Every session entry point funnels here, so this is the one place the
     // live-delivery budget needs installing for the actor task.
-    let kernel: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> =
+    let owned_team = std::sync::OnceLock::new();
+    let kernel: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> =
         Box::pin(run_agent_session_store_kernel_inner(
             session_root,
             session_id,
@@ -2587,8 +2588,17 @@ async fn run_agent_session_store_kernel(
             shared_team,
             initial_peers,
             priority_commands,
+            &owned_team,
         ));
-    with_live_delivery_budget(kernel).await
+    let result = with_live_delivery_budget(kernel).await;
+    // A failed root leaves its running children working; a retry of this root
+    // in the same process adopts them instead of colliding with their leases.
+    if result.is_err()
+        && let Some(team) = owned_team.get()
+    {
+        team.retain_live_children().await;
+    }
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2604,6 +2614,7 @@ async fn run_agent_session_store_kernel_inner(
     shared_team: Option<SubagentCoordinator>,
     initial_peers: Vec<crate::SpawnSubagent>,
     priority_commands: Option<(mpsc::Receiver<HostCommand>, SessionInterrupt)>,
+    owned_team: &std::sync::OnceLock<SubagentCoordinator>,
 ) -> Result<()> {
     let mut commands = HostCommandInbox::new(commands, priority_commands, session_id);
     let interrupt = commands.interrupt.clone();
@@ -3142,14 +3153,21 @@ async fn run_agent_session_store_kernel_inner(
     let subagents = if subagents_enabled {
         Some(match shared_team {
             Some(team) => team,
-            None => crate::SubagentCoordinator::new_with_store_and_executor(
-                session_root,
-                session_id,
-                launch.clone(),
-                subagent_concurrency_limit(&launch),
-                Arc::clone(&executor),
-                subagent_store,
-            )?,
+            None => {
+                let team = match SubagentCoordinator::take_retained(session_id) {
+                    Some(team) => team,
+                    None => crate::SubagentCoordinator::new_with_store_and_executor(
+                        session_root,
+                        session_id,
+                        launch.clone(),
+                        subagent_concurrency_limit(&launch),
+                        Arc::clone(&executor),
+                        subagent_store,
+                    )?,
+                };
+                let _ = owned_team.set(team.clone());
+                team
+            }
         })
     } else {
         None
@@ -3249,6 +3267,26 @@ async fn run_agent_session_store_kernel_inner(
     let watches =
         crate::watch::Watches::new(workflow_processes.clone(), watch_events_tx, session_id);
     let _watch_shutdown = SessionAutonomyShutdown(watches.cancel.clone());
+    // Watchers do not outlive their actor: one the journal still shows running
+    // died with the previous actor. Record that, so it is reported only once.
+    if initial_state.watches.iter().any(|watch| watch.running) {
+        let watches = initial_state
+            .watches
+            .iter()
+            .cloned()
+            .map(|mut watch| {
+                watch.running = false;
+                watch
+            })
+            .collect();
+        record(
+            &mut journal,
+            &events,
+            session_id,
+            SessionEventKind::WatchesChanged { watches },
+        )
+        .await?;
+    }
     if owns_team {
         let team = subagents.as_ref().expect("enabled team");
         let (control_tx, control_rx) = mpsc::channel(32);

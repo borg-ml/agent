@@ -4596,8 +4596,9 @@ struct SubagentTable {
     /// Set while the root shuts down: the children that were mid-task. A
     /// child that exits then is parked with its parent, not stopped.
     parking: Option<HashSet<Uuid>>,
-    /// Children restored as parked mid-task, woken once restore is recorded.
-    resume_after_restore: Vec<Uuid>,
+    /// Children restored as parked mid-task or with watchers that died with
+    /// their previous actor, woken with the message once restore is recorded.
+    resume_after_restore: Vec<(Uuid, String)>,
 }
 
 /// A child parked idle when its parent shut down.
@@ -4813,6 +4814,13 @@ pub struct SubagentCoordinator {
     wait_cursors: Arc<Mutex<HashMap<Uuid, wait::WaitCursor>>>,
 }
 
+/// Teams whose root actor failed while child actors were still running, by
+/// root session. A session host retries a failed root inside the same process;
+/// the retry must adopt these children rather than restore them, because their
+/// actors still hold the writer leases and keep working.
+static RETAINED_TEAMS: std::sync::LazyLock<std::sync::Mutex<HashMap<Uuid, SubagentCoordinator>>> =
+    std::sync::LazyLock::new(Default::default);
+
 /// How far a team broadcast reaches.
 ///
 /// `ActiveTeam` is the root plus the workers currently running; it is what
@@ -4873,6 +4881,32 @@ impl SubagentCoordinator {
             configuration_tx: broadcast::channel(16).0,
             wait_cursors: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Keep a team whose root actor failed reachable for the root's next actor
+    /// in this process, when any child actor is still running.
+    pub(crate) async fn retain_live_children(&self) {
+        let live = self
+            .table
+            .lock()
+            .await
+            .entries
+            .values()
+            .any(|entry| entry.commands.is_some());
+        if live {
+            RETAINED_TEAMS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(self.root_session_id, self.clone());
+        }
+    }
+
+    /// The team a failed previous actor of this root left running, if any.
+    pub(crate) fn take_retained(root_session_id: Uuid) -> Option<Self> {
+        RETAINED_TEAMS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&root_session_id)
     }
 
     pub(crate) fn is_root_session(&self, session_id: Uuid) -> bool {
@@ -5701,11 +5735,24 @@ impl SubagentCoordinator {
             if !descendants.contains(&snapshot.session_id) {
                 continue;
             }
+            // An adopted team's running child is its own authority: its actor
+            // holds the writer lease and still reports through this team.
+            if self
+                .table
+                .lock()
+                .await
+                .entries
+                .get(&snapshot.session_id)
+                .is_some_and(|entry| entry.commands.is_some())
+            {
+                continue;
+            }
             let mirrored = snapshot.clone();
             let mirrored_status = snapshot.status;
             let mut parked_mid_task = snapshot.lifecycle() == SubagentLifecycle::DormantInterrupted;
             let actor_path = child_lock_path(&self.journal_root, snapshot.session_id);
             let mut recovery_failed = false;
+            let mut dead_watchers = Vec::new();
             {
                 // Configuration is recoverable even when lifecycle is stopped.
                 let recovered = async {
@@ -5734,6 +5781,14 @@ impl SubagentCoordinator {
                         recovery_failed = true;
                     }
                     Ok(state) if state.latest_sequence > 0 => {
+                        // No actor runs this child now, so a watcher its journal
+                        // still shows running died with the previous one.
+                        dead_watchers = state
+                            .watches
+                            .iter()
+                            .filter(|watch| watch.running)
+                            .map(|watch| watch.label.clone())
+                            .collect();
                         let newer_launch = state
                             .subagent_registration
                             .as_ref()
@@ -5838,8 +5893,27 @@ impl SubagentCoordinator {
                         admitted: true,
                     },
                 );
-                if parked_mid_task && !recovery_failed && !snapshot.status.is_terminal() {
-                    table.resume_after_restore.push(snapshot.session_id);
+                if (parked_mid_task || !dead_watchers.is_empty())
+                    && !recovery_failed
+                    && !snapshot.status.is_terminal()
+                {
+                    let mut message = if parked_mid_task {
+                        RESUME_AFTER_RESTART.to_string()
+                    } else {
+                        String::new()
+                    };
+                    if !dead_watchers.is_empty() {
+                        if !message.is_empty() {
+                            message.push(' ');
+                        }
+                        message.push_str(&format!(
+                            "Borg restarted while you had running watchers ({}); they died with the restart and will never report. Check directly what they were watching (rerun or inspect the command), re-arm a watcher only if still needed, and continue your assigned task.",
+                            dead_watchers.join(", ")
+                        ));
+                    }
+                    table
+                        .resume_after_restore
+                        .push((snapshot.session_id, message));
                 }
             }
             if changed {
@@ -5881,7 +5955,7 @@ impl SubagentCoordinator {
             .await
             .entries
             .values()
-            .filter(|entry| !entry.snapshot.status.is_terminal())
+            .filter(|entry| !entry.snapshot.status.is_terminal() && entry.commands.is_none())
             .map(|entry| entry.snapshot.session_id)
             .collect::<Vec<_>>();
         for child_id in child_ids {
@@ -8885,11 +8959,8 @@ impl SubagentCoordinator {
     /// task. A child that cannot be woken stays parked for a follow-up.
     pub(crate) async fn resume_interrupted_children(&self) {
         let resume = std::mem::take(&mut self.table.lock().await.resume_after_restore);
-        for session_id in resume {
-            if let Err(error) = self
-                .followup_task(&session_id.to_string(), RESUME_AFTER_RESTART)
-                .await
-            {
+        for (session_id, message) in resume {
+            if let Err(error) = self.followup_task(&session_id.to_string(), &message).await {
                 tracing::warn!(%error, %session_id, "could not resume a child parked mid-task");
             }
         }

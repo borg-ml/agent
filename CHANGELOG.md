@@ -5,6 +5,17 @@ Git comparison.
 
 ## Unreleased (since 0.21.6)
 
+- A director whose session host retries after a database connection failure
+  no longer loses its subagents. The retry used to restore every child while
+  their still-running actors held the child locks, so `list_agents` showed
+  each one failed with "subagent session … is already active" and every
+  wake, steer, interrupt and final report was lost while the children kept
+  working unseen. The retried director now adopts its running children and
+  keeps controlling them.
+- A subagent restored after a restart while it had running watchers is woken
+  with a note that those watchers died with the restart, instead of waiting
+  forever for an event that can no longer arrive.
+
 ## 0.21.6 (2026-11-18)
 
 - Pasting an image into a session on a text-only model no longer kills the

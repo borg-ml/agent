@@ -7072,7 +7072,14 @@ async fn restored_live_child_stays_dormant_and_parks_with_its_root() {
             .unwrap();
         assert_eq!(restored.status, SubagentStatus::Ready);
         assert_eq!(
-            restarted.table.lock().await.resume_after_restore,
+            restarted
+                .table
+                .lock()
+                .await
+                .resume_after_restore
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
             if resumes { vec![child_id] } else { Vec::new() }
         );
     }
@@ -7122,9 +7129,24 @@ async fn restore_wakes_a_child_cut_off_mid_turn_but_never_a_stopped_one() {
     store.create_session(root).await.unwrap();
     let mut parent_events = Vec::new();
     let mut children = Vec::new();
-    for (name, journaled_status) in [
-        ("/root/cut_off", SessionStatus::Running),
-        ("/root/stopped", SessionStatus::Stopped),
+    let dead_watch = crate::WatchSummary {
+        watch_id: Uuid::new_v4(),
+        label: "tests done".into(),
+        command: "exec".into(),
+        running: true,
+        started_at: Utc::now(),
+        last_event_at: None,
+        event_count: 0,
+    };
+    for (name, journaled_status, watches) in [
+        ("/root/cut_off", SessionStatus::Running, vec![]),
+        (
+            "/root/stopped",
+            SessionStatus::Stopped,
+            vec![dead_watch.clone()],
+        ),
+        // Parked idle on a watcher whose command died with the old actor.
+        ("/root/watching", SessionStatus::Ready, vec![dead_watch]),
     ] {
         let child_id = Uuid::new_v4();
         let now = Utc::now();
@@ -7173,6 +7195,7 @@ async fn restore_wakes_a_child_cut_off_mid_turn_but_never_a_stopped_one() {
                 permission_mode: PermissionMode::Manual,
                 speed_support: Default::default(),
             },
+            SessionEventKind::WatchesChanged { watches },
             SessionEventKind::StatusChanged {
                 status: journaled_status,
                 lifecycle: None,
@@ -7200,7 +7223,7 @@ async fn restore_wakes_a_child_cut_off_mid_turn_but_never_a_stopped_one() {
         .restore_from_events(&parent_events)
         .await
         .unwrap();
-    let [cut_off, stopped] = [children[0], children[1]];
+    let [cut_off, stopped, watching] = [children[0], children[1], children[2]];
     let restored = coordinator
         .resolve_snapshot(&cut_off.to_string())
         .await
@@ -7215,9 +7238,144 @@ async fn restore_wakes_a_child_cut_off_mid_turn_but_never_a_stopped_one() {
             .status,
         SubagentStatus::Stopped
     );
-    assert_eq!(
-        coordinator.table.lock().await.resume_after_restore,
-        vec![cut_off]
+    let mut resume = coordinator.table.lock().await.resume_after_restore.clone();
+    resume.sort_by_key(|(id, _)| *id != cut_off);
+    assert!(
+        matches!(resume.as_slice(), [(first, wake), (second, note)]
+            if *first == cut_off && wake == RESUME_AFTER_RESTART
+                && *second == watching && note.contains("tests done") && note.contains("died")),
+        "{resume:?}"
+    );
+    scratch.discard().await;
+}
+
+/// A session host retries a failed root actor inside the same process while
+/// its child actors keep running and hold their writer leases. Restoring those
+/// children collides with the leases and fails every one of them; the retry
+/// must adopt the running team instead and keep controlling it.
+#[tokio::test]
+async fn a_root_retried_in_process_adopts_its_running_children() {
+    let directory = tempdir().unwrap();
+    let workspace = directory.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let root = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    let now = Utc::now();
+    let parent_event = SessionEvent::new(
+        root,
+        1,
+        SessionEventKind::SubagentActivity {
+            activity: SubagentActivityKind::Completed,
+            agent: SubagentSnapshot {
+                desktop: false,
+                session_id: child_id,
+                parent_session_id: root,
+                task_name: "/root/worker".into(),
+                status: SubagentStatus::Ready,
+                lifecycle: None,
+                source: None,
+                provider: CodingProvider::Codex,
+                model: Some("gpt-test".into()),
+                effort: Some("high".into()),
+                fast: false,
+                ultrafast: false,
+                cwd: workspace.clone(),
+                created_at: now,
+                updated_at: now,
+                detail: None,
+                final_text: Some("ready".into()),
+                usage: SubagentUsage::default(),
+                interrupted_by: None,
+            },
+            event: None,
+        },
+    );
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
+    store.create_session(root).await.unwrap();
+    store.append(parent_event.clone()).await.unwrap();
+    store.create_session(child_id).await.unwrap();
+    for kind in [
+        SessionEventKind::SessionStarted,
+        SessionEventKind::SessionConfigured {
+            cwd: workspace,
+            provider: CodingProvider::Codex,
+            model: Some("gpt-test".into()),
+            effort: Some("high".into()),
+            fast: false,
+            ultrafast: false,
+            response_language: crate::ResponseLanguage::Auto,
+            permission_mode: PermissionMode::Manual,
+            speed_support: Default::default(),
+        },
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Ready,
+            lifecycle: None,
+            detail: None,
+        },
+    ] {
+        store
+            .append(SessionEvent::new(child_id, 0, kind))
+            .await
+            .unwrap();
+    }
+    let team = || {
+        let session_store: Arc<dyn SessionStore> = store.clone();
+        SubagentCoordinator::new_with_store_and_executor(
+            directory.path(),
+            root,
+            launch(),
+            3,
+            Arc::new(crate::LocalAgentTurnExecutor::default()),
+            session_store,
+        )
+        .unwrap()
+    };
+    let first = team();
+    first
+        .restore_from_events(std::slice::from_ref(&parent_event))
+        .await
+        .unwrap();
+    first.ensure_child_actor(child_id).await.unwrap();
+    let child_path = child_lock_path(directory.path(), child_id);
+    assert!(
+        crate::SessionWriterLease::try_acquire(&child_path)
+            .unwrap()
+            .is_none()
+    );
+    // The root actor fails; its running child is retained, not abandoned.
+    first.retain_live_children().await;
+
+    // What a retry without adoption sees: every running child "already active".
+    let fresh = team();
+    fresh
+        .restore_from_events(std::slice::from_ref(&parent_event))
+        .await
+        .unwrap();
+    let collided = fresh.resolve_snapshot(&child_id.to_string()).await.unwrap();
+    assert_eq!(collided.status, SubagentStatus::Failed);
+    assert!(collided.detail.unwrap().contains("already active"));
+
+    let adopted = SubagentCoordinator::take_retained(root).expect("the retry adopts the team");
+    assert!(SubagentCoordinator::take_retained(root).is_none());
+    adopted.restore_from_events(&[parent_event]).await.unwrap();
+    let agent = adopted
+        .resolve_snapshot(&child_id.to_string())
+        .await
+        .unwrap();
+    assert_ne!(agent.status, SubagentStatus::Failed, "{agent:?}");
+    assert!(
+        adopted.table.lock().await.entries[&child_id]
+            .commands
+            .is_some(),
+        "the running child stays reachable"
+    );
+    // The adopted team still owns the child: parking it releases the writer.
+    adopted.stop_all().await;
+    assert!(
+        crate::SessionWriterLease::try_acquire(&child_path)
+            .unwrap()
+            .is_some()
     );
     scratch.discard().await;
 }
