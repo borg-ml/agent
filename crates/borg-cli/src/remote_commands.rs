@@ -11524,10 +11524,11 @@ async fn usage_summary(
             .await
             .map(|limits| Some(AccountRateLimits::Claude(limits))),
         // A key-billed plan reports its allowance against the subscription key,
-        // so the selected login is what the next turn spends and what this
-        // command shows. A plan that publishes no quota says so instead of
-        // claiming the provider exposes nothing.
-        provider if key_billed_lane(provider) => {
+        // and Gemini against the selected Google login, so the selected login
+        // is what the next turn spends and what this command shows. A plan
+        // that publishes no quota says so instead of claiming the provider
+        // exposes nothing.
+        provider if key_billed_lane(provider) || provider == CodingProvider::Gemini => {
             let accounts = borg_remote::provider_usage::subscription_accounts(provider).await;
             let account = accounts
                 .iter()
@@ -11618,9 +11619,15 @@ fn format_usage_summary(
             } else if limits.windows.is_empty() {
                 lines.push("  No active account limit reported.".to_string());
             } else {
+                let width = limits
+                    .windows
+                    .iter()
+                    .map(|window| window.label.chars().count())
+                    .fold(16, usize::max);
                 for window in &limits.windows {
                     append_usage_window(
                         &mut lines,
+                        width,
                         &window.label,
                         window.used_percent,
                         window.resets_at,
@@ -11639,12 +11646,18 @@ fn format_usage_summary(
             }
         }
         (_, Some(AccountRateLimits::Host(usage))) => {
+            let width = usage
+                .windows
+                .iter()
+                .map(|window| window.label.chars().count())
+                .fold(16, usize::max);
             if let Some(plan) = usage.plan.as_deref() {
-                lines.push(format!("  {:<16} {}", "Plan", title_case(plan)));
+                lines.push(format!("  {:<width$} {}", "Plan", title_case(plan)));
             }
             for window in &usage.windows {
                 append_usage_window(
                     &mut lines,
+                    width,
                     &window.label,
                     window.used_percent,
                     window.resets_at,
@@ -11711,7 +11724,10 @@ fn format_usage_summary(
             format_count(session.total_tokens)
         ),
     ]);
-    if matches!(provider, CodingProvider::Codex | CodingProvider::Claude) {
+    if matches!(
+        provider,
+        CodingProvider::Codex | CodingProvider::Claude | CodingProvider::Gemini
+    ) {
         lines.push("  Processed tokens include cache reads and writes; output includes reasoning. Account allowance is reported separately above.".to_string());
     }
     if let Some(cost) = session.cost_usd {
@@ -11745,16 +11761,22 @@ fn append_rate_limit_window(lines: &mut Vec<String>, label: &str, window: &Codex
     }
 }
 
+/// `width` is the label column, widened to the longest label of the block so
+/// a long model name does not push its bar out of line.
 fn append_usage_window(
     lines: &mut Vec<String>,
+    width: usize,
     label: &str,
     used_percent: u8,
     resets_at: Option<DateTime<Utc>>,
 ) {
-    lines.push(format!("  {:<16} {}", label, rate_limit_bar(used_percent)));
+    lines.push(format!(
+        "  {label:<width$} {}",
+        rate_limit_bar(used_percent)
+    ));
     if let Some(reset) = resets_at {
         lines.push(format!(
-            "  {:<16} resets {}",
+            "  {:<width$} resets {}",
             "",
             reset.with_timezone(&Local).format("%H:%M on %d %b")
         ));
