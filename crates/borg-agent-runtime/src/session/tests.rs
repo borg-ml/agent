@@ -9416,6 +9416,7 @@ fn usage_limit_reset_honors_provider_time_zone_and_long_waits() {
 fn usage_limit_auto_resume_is_restricted_to_subscription_cli_providers() {
     assert!(provider_supports_usage_limit_resume(CodingProvider::Claude));
     assert!(provider_supports_usage_limit_resume(CodingProvider::Codex));
+    assert!(provider_supports_usage_limit_resume(CodingProvider::Gemini));
     assert!(provider_supports_usage_limit_resume(
         CodingProvider::OpenCode
     ));

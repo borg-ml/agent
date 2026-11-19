@@ -15537,7 +15537,10 @@ fn provider_error_is_temporary_usage_limited(error: &str) -> bool {
 fn provider_supports_usage_limit_resume(provider: CodingProvider) -> bool {
     matches!(
         provider,
-        CodingProvider::Claude | CodingProvider::Codex | CodingProvider::OpenCode
+        CodingProvider::Claude
+            | CodingProvider::Codex
+            | CodingProvider::Gemini
+            | CodingProvider::OpenCode
     )
 }
 

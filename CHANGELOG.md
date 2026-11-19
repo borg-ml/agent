@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.22.0)
 
+- When a Gemini subscription's quota is spent (for example "Individual quota
+  reached"), Borg reports it once as a usage limit and waits for Google's
+  reset instead of resending the request in a loop of identical HTTP 429
+  errors. Like Claude, Codex and OpenCode, the turn resumes on its own after
+  the reset.
+
 ## 0.22.0 (2026-11-19)
 
 - Hover tooltips, such as the keybindings tooltip on the palette hint and the

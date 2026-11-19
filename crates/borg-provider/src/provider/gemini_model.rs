@@ -142,15 +142,8 @@ impl GeminiModelProvider {
                 .unwrap_or_else(|error| error.to_string());
             trace.exit_status = Some(1);
             trace.stderr = raw.clone();
-            return Err(fail(
-                &trace,
-                format!(
-                    "{GEMINI_LABEL} request failed with HTTP {}: {}",
-                    status.as_u16(),
-                    error_message(&raw)
-                ),
-                error_kind(status.as_u16(), &raw),
-            ));
+            let (message, kind) = describe_failure(status.as_u16(), &raw);
+            return Err(fail(&trace, message, kind));
         };
         let mut state = StreamState::default();
         let mut buffer: Vec<u8> = Vec::new();
@@ -724,39 +717,94 @@ fn error_message(raw: &str) -> String {
     super::truncate_provider_text(message, 500)
 }
 
-/// A 429 is a short rate limit unless Google says the subscription's
-/// allowance is spent; retrying a spent allowance only hides the cause.
-fn error_kind(status: u16, raw: &str) -> ProviderErrorKind {
+/// Render a failed request and classify it. A 429 is a short rate limit
+/// unless Google says the subscription's allowance is spent; that is reported
+/// as a usage limit, with Google's reset delay when it gives one, so the turn
+/// waits for the reset instead of resending into the same refusal.
+fn describe_failure(status: u16, raw: &str) -> (String, ProviderErrorKind) {
+    let message = error_message(raw);
     let lowered = raw.to_ascii_lowercase();
     if lowered.contains("exceeds the maximum number of tokens")
         || lowered.contains("context window")
         || lowered.contains("input token count")
     {
-        return ProviderErrorKind::ContextLength;
+        return (
+            format!("{GEMINI_LABEL} request failed with HTTP {status}: {message}"),
+            ProviderErrorKind::ContextLength,
+        );
     }
-    if status == 429 {
-        let spent = lowered.contains("quota_exhausted")
-            || lowered.contains("per day")
-            || lowered.contains("daily")
-            || lowered.contains("exhausted your capacity");
-        return if spent {
-            ProviderErrorKind::Fatal
-        } else {
+    let kind = match status {
+        429 => {
+            let delay = retry_delay_seconds(raw);
+            let spent = lowered.contains("quota_exhausted")
+                || lowered.contains("quota reached")
+                || lowered.contains("upgrade your")
+                || lowered.contains("per day")
+                || lowered.contains("daily")
+                || lowered.contains("exhausted your capacity")
+                || delay.is_some_and(|seconds| seconds > 120);
+            if spent {
+                let mut text = format!("{GEMINI_LABEL} usage limit reached (HTTP 429): {message}");
+                if let Some(seconds) = delay {
+                    text.push_str(&format!(
+                        " Provider-reported retry delay: {seconds} seconds."
+                    ));
+                }
+                return (text, ProviderErrorKind::Fatal);
+            }
             ProviderErrorKind::ConnectionLost
-        };
-    }
-    if status >= 500 {
-        return ProviderErrorKind::ConnectionLost;
-    }
-    if matches!(status, 400 | 401 | 403 | 404) {
-        return ProviderErrorKind::Fatal;
-    }
-    ProviderErrorKind::Unknown
+        }
+        500.. => ProviderErrorKind::ConnectionLost,
+        400 | 401 | 403 | 404 => ProviderErrorKind::Fatal,
+        _ => ProviderErrorKind::Unknown,
+    };
+    (
+        format!("{GEMINI_LABEL} request failed with HTTP {status}: {message}"),
+        kind,
+    )
+}
+
+/// Google's suggested wait, from a `RetryInfo` detail (`"3600s"`) or the
+/// `quotaResetDelay` an `ErrorInfo` detail carries.
+fn retry_delay_seconds(raw: &str) -> Option<u64> {
+    let parsed: Value = serde_json::from_str(raw).ok()?;
+    let error = if parsed["error"].is_object() {
+        &parsed["error"]
+    } else {
+        &parsed[0]["error"]
+    };
+    error["details"].as_array()?.iter().find_map(|detail| {
+        let delay = detail["retryDelay"]
+            .as_str()
+            .or_else(|| detail["metadata"]["quotaResetDelay"].as_str())?;
+        let seconds: f64 = delay.strip_suffix('s')?.parse().ok()?;
+        Some(seconds.ceil() as u64)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A spent subscription quota was read as a dropped connection and resent
+    // dozens of times; it must surface once as a usage limit with its reset.
+    #[test]
+    fn spent_quota_is_a_usage_limit_and_a_short_rate_limit_is_retried() {
+        let spent = r#"{"error":{"code":429,"message":"Individual quota reached. Please upgrade your subscription to continue.","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"3599.5s"}]}}"#;
+        let (message, kind) = describe_failure(429, spent);
+        assert_eq!(kind, ProviderErrorKind::Fatal);
+        assert!(message.contains("usage limit reached"), "{message}");
+        assert!(
+            message.ends_with("Provider-reported retry delay: 3600 seconds."),
+            "{message}"
+        );
+
+        let brief = r#"{"error":{"code":429,"message":"Resource has been exhausted (e.g. check quota).","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"2s"}]}}"#;
+        assert_eq!(
+            describe_failure(429, brief).1,
+            ProviderErrorKind::ConnectionLost
+        );
+    }
 
     // Gemini rejects a replayed call turn without its thought signature, and
     // a replayed functionResponse must name the call it answers.
