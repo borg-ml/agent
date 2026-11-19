@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.22.0)
+## Unreleased (since 0.22.1)
+
+## 0.22.1 (2026-11-19)
 
 - An agent blocked waiting for its subagents (`wait_agent`) shows as
   "waiting" in the status bar and the agent list, instead of "running".
