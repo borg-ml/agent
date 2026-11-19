@@ -5,6 +5,10 @@ Git comparison.
 
 ## Unreleased (since 0.21.6)
 
+- Hover tooltips, such as the keybindings tooltip on the palette hint and the
+  status-line details, close as soon as you type or press Esc instead of
+  staying up while the pointer rests on them. Typed keys still reach the
+  composer; Esc only closes the tooltip.
 - Esc closes the slash-command suggestions above the composer while keeping
   what you typed, and they stay closed as you keep typing that line. Clearing
   the line or starting a new command shows them again.

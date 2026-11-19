@@ -6143,6 +6143,24 @@ impl BorgTerminal {
         self.invalidate_transcript_render_cache();
     }
 
+    fn hover_tooltip_open(&self) -> bool {
+        self.keybindings_open
+            || self.keybindings_hovered
+            || self.status_hovered
+            || self.goal_status_hovered
+            || self.todo_status_hovered
+            || self.billing_status_hovered
+            || self.shell_status_hovered
+            || self.watch_status_hovered
+            || self.agents_status_hovered
+            || self.model_status_hovered
+            || self.effort_status_hovered
+            || self.context_status_hovered
+            || self.fast_status_hovered
+            || self.permission_status_hovered
+            || self.git_status_hovered
+    }
+
     fn clear_background_hover(&mut self) {
         self.hovered_tool = None;
         self.hovered_tool_run = None;
@@ -12581,6 +12599,16 @@ impl BorgTerminal {
     }
 
     fn handle_key(&mut self, mut key: KeyEvent) -> Result<UiAction> {
+        // A hover tooltip (the keybindings palette tooltip, a status-line
+        // detail) stays up while the pointer rests on its target. Typing or
+        // Esc dismisses it; Esc does nothing else.
+        if self.hover_tooltip_open() {
+            self.keybindings_open = false;
+            self.clear_background_hover();
+            if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
+                return Ok(UiAction::None);
+            }
+        }
         if self
             .slash_dismissed
             .as_ref()
