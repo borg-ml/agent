@@ -2012,6 +2012,10 @@ pub struct BorgTerminal {
     pending_dictation_accelerator: Option<String>,
     keybindings_open: bool,
     slash_selection: usize,
+    /// The composer text when Esc hid the slash suggestions. They stay hidden
+    /// while the text still extends it, so Esc and continued typing both
+    /// dismiss the menu instead of it reappearing on the next keystroke.
+    slash_dismissed: Option<String>,
     rewind_targets: Vec<RewindTarget>,
     rewind_primed: bool,
     borging_this_run: bool,
@@ -3516,6 +3520,7 @@ impl BorgTerminal {
             pending_dictation_accelerator: None,
             keybindings_open: false,
             slash_selection: 0,
+            slash_dismissed: None,
             rewind_targets: Vec::new(),
             rewind_primed: false,
             borging_this_run: false,
@@ -10162,7 +10167,7 @@ impl BorgTerminal {
         }
         let todo_status = self.transcript.todo_status();
         let slash_suggestions = (self.picker.is_none())
-            .then(|| slash_suggestion_lines(&self.composer.text, self.slash_selection))
+            .then(|| slash_suggestion_lines(self.slash_query(), self.slash_selection))
             .filter(|lines| !lines.is_empty());
         let showing_slash_suggestions = slash_suggestions.is_some();
         let notice = self.notice.clone();
@@ -12576,6 +12581,13 @@ impl BorgTerminal {
     }
 
     fn handle_key(&mut self, mut key: KeyEvent) -> Result<UiAction> {
+        if self
+            .slash_dismissed
+            .as_ref()
+            .is_some_and(|dismissed| !self.composer.text.starts_with(dismissed.as_str()))
+        {
+            self.slash_dismissed = None;
+        }
         if self.picker.is_none()
             && !self.keybindings_open
             && let Some(index) = status_focus_shortcut(&key)
@@ -12870,6 +12882,14 @@ impl BorgTerminal {
             self.close_tool_inspector();
             return Ok(UiAction::None);
         }
+        if key.code == KeyCode::Esc
+            && key.modifiers == KeyModifiers::NONE
+            && !slash_matches(self.slash_query()).is_empty()
+        {
+            self.slash_dismissed = Some(self.composer.text.clone());
+            self.notice = None;
+            return Ok(UiAction::None);
+        }
         if self.keymap.matches(KeyAction::Keybindings, &key) && self.composer.text.is_empty() {
             self.open_command_palette();
             return Ok(UiAction::None);
@@ -13104,7 +13124,7 @@ impl BorgTerminal {
             });
         }
         if self.keymap.matches(KeyAction::Queue, &key)
-            && slash_matches(&self.composer.text).is_empty()
+            && slash_matches(self.slash_query()).is_empty()
         {
             if let Some(notice) = prompt_image_limit_notice(self.composer.attachments.len()) {
                 self.notice = Some(notice);
@@ -13153,7 +13173,7 @@ impl BorgTerminal {
         if self.keymap.matches(KeyAction::Send, &key) {
             if self.composer.attachments.is_empty()
                 && let Some(command) =
-                    slash_selected_command(&self.composer.text, self.slash_selection)
+                    slash_selected_command(self.slash_query(), self.slash_selection)
             {
                 self.composer.replace_text(command);
             }
@@ -13282,7 +13302,7 @@ impl BorgTerminal {
                 Ok(UiAction::None)
             }
             KeyCode::Up => {
-                let slash_matches = slash_matches(&self.composer.text).len();
+                let slash_matches = slash_matches(self.slash_query()).len();
                 if self.composer.history_index.is_none() && slash_matches > 0 {
                     self.slash_selection = self
                         .slash_selection
@@ -13316,7 +13336,7 @@ impl BorgTerminal {
                 Ok(UiAction::None)
             }
             KeyCode::Down => {
-                let slash_matches = slash_matches(&self.composer.text).len();
+                let slash_matches = slash_matches(self.slash_query()).len();
                 if self.composer.history_index.is_none() && slash_matches > 0 {
                     self.slash_selection = (self.slash_selection + 1) % slash_matches;
                     return Ok(UiAction::None);
@@ -13336,7 +13356,7 @@ impl BorgTerminal {
                 Ok(UiAction::None)
             }
             KeyCode::Tab => {
-                let matches = slash_matches(&self.composer.text);
+                let matches = slash_matches(self.slash_query());
                 if matches.is_empty() && self.composer.text.is_empty() {
                     self.open_command_palette();
                     return Ok(UiAction::None);
@@ -13353,8 +13373,17 @@ impl BorgTerminal {
         }
     }
 
+    /// The composer text the slash suggestions match against, or nothing while
+    /// the user has dismissed them for this text.
+    fn slash_query(&self) -> &str {
+        match &self.slash_dismissed {
+            Some(dismissed) if self.composer.text.starts_with(dismissed.as_str()) => "",
+            _ => &self.composer.text,
+        }
+    }
+
     fn update_slash_notice(&mut self) {
-        let matches = slash_matches(&self.composer.text);
+        let matches = slash_matches(self.slash_query());
         self.slash_selection = self.slash_selection.min(matches.len().saturating_sub(1));
         self.notice = if matches.is_empty() {
             None

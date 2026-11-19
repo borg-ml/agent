@@ -5,6 +5,9 @@ Git comparison.
 
 ## Unreleased (since 0.21.6)
 
+- Esc closes the slash-command suggestions above the composer while keeping
+  what you typed, and they stay closed as you keep typing that line. Clearing
+  the line or starting a new command shows them again.
 - Gemini is a subscription provider. `borg login gemini` signs in with the
   Google account that holds Google AI Pro, Ultra or the free tier, and Borg's
   own loop drives Gemini 4 Neon (the new default), Gemini 4 Argon, Gemini 3.8
