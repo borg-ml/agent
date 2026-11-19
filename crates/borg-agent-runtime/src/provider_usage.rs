@@ -215,6 +215,13 @@ pub async fn refresh_provider_capability_usage(
             None
         }
     };
+    let gemini = async {
+        if has_subscription(CodingProvider::Gemini) {
+            probe_provider_usage(CodingProvider::Gemini).await
+        } else {
+            None
+        }
+    };
     let opencode = async {
         if has_subscription(CodingProvider::OpenCode) {
             probe_provider_usage(CodingProvider::OpenCode).await
@@ -222,12 +229,13 @@ pub async fn refresh_provider_capability_usage(
             None
         }
     };
-    let (codex, claude, opencode) = tokio::join!(codex, claude, opencode);
+    let (codex, claude, gemini, opencode) = tokio::join!(codex, claude, gemini, opencode);
     // Account rows are read after the provider probes above so Claude's usage
     // endpoint is asked once per interval rather than once per row, and so a
     // connected login is still described when the selected one is unusable.
     let codex_accounts = subscription_accounts(CodingProvider::Codex).await;
     let claude_accounts = subscription_accounts(CodingProvider::Claude).await;
+    let gemini_accounts = subscription_accounts(CodingProvider::Gemini).await;
     let mut capabilities: Vec<ProviderCapability> = capabilities
         .iter()
         .cloned()
@@ -235,6 +243,7 @@ pub async fn refresh_provider_capability_usage(
             let usage = match capability.provider {
                 CodingProvider::Codex => codex.clone(),
                 CodingProvider::Claude => claude.clone(),
+                CodingProvider::Gemini => gemini.clone(),
                 CodingProvider::OpenCode => opencode.clone(),
                 _ => return capability,
             };
@@ -246,6 +255,7 @@ pub async fn refresh_provider_capability_usage(
             let accounts: &[ProviderAccount] = match capability.provider {
                 CodingProvider::Codex => &codex_accounts,
                 CodingProvider::Claude => &claude_accounts,
+                CodingProvider::Gemini => &gemini_accounts,
                 _ => &[],
             };
             attach_account_usage(&mut capability, accounts);
@@ -324,6 +334,10 @@ async fn probe_provider_usage(provider: CodingProvider) -> Option<ProviderUsage>
                 .ok()
                 .map(claude_provider_usage)
         }
+        CodingProvider::Gemini => borg_provider::gemini_subscription::quota(None)
+            .await
+            .ok()
+            .map(gemini_provider_usage),
         CodingProvider::OpenCode => match selected_key_account(KeyLane::OpenCodeGo) {
             Some(key) => borg_provider::provider::opencode_model::usage(&key)
                 .await
@@ -364,6 +378,7 @@ pub fn subscription_lane(provider: CodingProvider) -> Option<borg_provider::subs
             Lane::Claude
         }
         CodingProvider::Codex if !borg_provider::credentials::openai_uses_api_key() => Lane::Codex,
+        CodingProvider::Gemini => Lane::Gemini,
         CodingProvider::OpenCode => Lane::OpenCode,
         CodingProvider::Glm => Lane::Glm,
         CodingProvider::Kimi => Lane::Kimi,
@@ -378,6 +393,7 @@ pub fn lane_provider(lane: borg_provider::subscriptions::Lane) -> CodingProvider
     match lane {
         Lane::Claude => CodingProvider::Claude,
         Lane::Codex => CodingProvider::Codex,
+        Lane::Gemini => CodingProvider::Gemini,
         Lane::OpenCode => CodingProvider::OpenCode,
         Lane::Glm => CodingProvider::Glm,
         Lane::Kimi => CodingProvider::Kimi,
@@ -487,6 +503,11 @@ async fn account_probe(
             borg_provider::provider::read_codex_account_rate_limits(Some(path.clone()))
                 .await
                 .map(codex_provider_usage)
+        }
+        (CodingProvider::Gemini, Some(path)) => {
+            borg_provider::gemini_subscription::quota(Some(path.clone()))
+                .await
+                .map(gemini_provider_usage)
         }
         // The Go plan reports an allowance against the key itself, so every
         // named login answers for its own windows.
@@ -607,6 +628,48 @@ fn claude_provider_usage(
             None
         },
         plan,
+    }
+}
+
+/// Gemini meters each model separately. The provider is exhausted only when
+/// every model is, since a session can still switch to one with capacity.
+fn gemini_provider_usage(quota: borg_provider::gemini_subscription::Quota) -> ProviderUsage {
+    // Every thinking tier of a model shares one allowance, so one row per
+    // model ("Gemini 4 Neon (High)" and "(Low)" become "Gemini 4 Neon").
+    let mut windows: Vec<ProviderUsageWindow> = Vec::new();
+    for window in quota.windows {
+        let Some(remaining) = window.remaining_fraction else {
+            continue;
+        };
+        let label = window
+            .label
+            .split(" (")
+            .next()
+            .unwrap_or(&window.label)
+            .to_string();
+        let used_percent = (100.0 - remaining * 100.0).round().clamp(0.0, 100.0) as u8;
+        match windows.iter_mut().find(|known| known.label == label) {
+            Some(known) => known.used_percent = known.used_percent.max(used_percent),
+            None => windows.push(ProviderUsageWindow {
+                label,
+                used_percent,
+                resets_at: window.resets_at,
+                global: false,
+            }),
+        }
+    }
+    let exhausted = !windows.is_empty() && windows.iter().all(|window| window.used_percent >= 100);
+    ProviderUsage {
+        availability: if windows.is_empty() {
+            ProviderUsageAvailability::Unknown
+        } else if exhausted {
+            ProviderUsageAvailability::Exhausted
+        } else {
+            ProviderUsageAvailability::Available
+        },
+        windows,
+        detail: exhausted.then(|| "Gemini subscription usage is exhausted".to_string()),
+        plan: quota.tier,
     }
 }
 

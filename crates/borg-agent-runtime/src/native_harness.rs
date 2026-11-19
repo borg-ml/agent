@@ -688,6 +688,25 @@ impl NativeHarness {
                 ..self.clone()
             });
         }
+        #[cfg(feature = "subscription-adapters")]
+        if provider == crate::CodingProvider::Gemini {
+            let store = access
+                .store
+                .as_ref()
+                .context("subscription model access requires durable Borg session storage")?;
+            let identity = borg_provider::provider::GeminiModelProvider::account_identity(None)?;
+            store
+                .record_model_access(access.session_id, provider, &identity)
+                .await?;
+            return Ok(Self {
+                model_client: Arc::new(ProviderModelClient {
+                    gemini_account: Some(identity),
+                    access: Some(access.clone()),
+                    ..ProviderModelClient::default()
+                }),
+                ..self.clone()
+            });
+        }
         #[cfg(not(feature = "subscription-adapters"))]
         let _ = (provider, access);
         #[cfg(feature = "subscription-adapters")]
@@ -3012,6 +3031,8 @@ struct ProviderModelClient {
     /// Claude turns were bound to the stored Anthropic API key, chosen as the
     /// Claude billing lane, instead of the subscription login.
     claude_api_key: bool,
+    /// The Google account Gemini turns were bound to.
+    gemini_account: Option<String>,
     access: Option<crate::ModelAccessContext>,
 }
 
@@ -3029,6 +3050,7 @@ enum NativeRoute<'a> {
     /// The Anthropic Messages API, reached with the API key the user stored for
     /// the Anthropic lane.
     AnthropicMessages,
+    GeminiSubscription(&'a str),
     ChatCompletions {
         profile: OpenAiCompatibleProfile,
         gateway: Option<&'a ModelGateway>,
@@ -3074,6 +3096,13 @@ impl ProviderModelClient {
         {
             return Ok(NativeRoute::CodexAccount(account));
         }
+        if provider == crate::CodingProvider::Gemini {
+            return self
+                .gemini_account
+                .as_deref()
+                .map(NativeRoute::GeminiSubscription)
+                .ok_or(NotNative);
+        }
         // The Anthropic lane is a Messages route Borg drives itself, so it
         // never shares the compatibility path or its credentials.
         if provider == crate::CodingProvider::Anthropic {
@@ -3103,6 +3132,7 @@ impl ProviderModelClient {
             crate::CodingProvider::Codex
             | crate::CodingProvider::Anthropic
             | crate::CodingProvider::Claude
+            | crate::CodingProvider::Gemini
             | crate::CodingProvider::OpenCode
             | crate::CodingProvider::Grok
             | crate::CodingProvider::Muse => return Err(NotNative),
@@ -3241,6 +3271,14 @@ impl ProviderModelClient {
                     account,
                     self.codex_auth_file.clone(),
                 )
+                .await;
+            }
+            NativeRoute::GeminiSubscription(account) => {
+                return borg_provider::provider::GeminiModelProvider {
+                    model: model.to_string(),
+                    effort: effort.map(str::to_owned),
+                }
+                .model_turn_for_account(request, progress, account, None)
                 .await;
             }
             NativeRoute::AnthropicMessages => {
@@ -3570,6 +3608,8 @@ impl NativeModelClient for ProviderModelClient {
             // The Messages API collects `System` into one top-level field, so a
             // change there rewrites the head wherever it was placed.
             Ok(NativeRoute::AnthropicMessages) => DeclarationTransport::Collapsed,
+            // Gemini gathers `System` into one `systemInstruction`.
+            Ok(NativeRoute::GeminiSubscription(_)) => DeclarationTransport::Collapsed,
             Err(NotNative) => DeclarationTransport::Collapsed,
         }
     }
@@ -3577,6 +3617,8 @@ impl NativeModelClient for ProviderModelClient {
     async fn context_window(&self, provider: crate::CodingProvider, model: &str) -> Option<u64> {
         let gateway = match self.route(provider, model) {
             Ok(NativeRoute::ChatCompletions { gateway, .. }) => gateway,
+            // Every Gemini model the subscription serves has a 1M window.
+            Ok(NativeRoute::GeminiSubscription(_)) => return Some(1_048_576),
             #[cfg(feature = "subscription-adapters")]
             Ok(NativeRoute::ClaudeSubscription(_)) => {
                 return borg_provider::provider::ClaudeModelProvider {
@@ -3657,6 +3699,8 @@ impl PromptCacheRefreshClient for ProviderModelClient {
             .route(provider, model)
             .map_err(|NotNative| Ineligible::RouteNotNative)?
         {
+            // Gemini caches implicitly with no published lifetime to refresh at.
+            NativeRoute::GeminiSubscription(_) => return Err(Ineligible::CacheLifetimeUnknown),
             #[cfg(feature = "subscription-adapters")]
             NativeRoute::ClaudeSubscription(_) => {
                 // This connector writes 1h markers. Capabilities are checked again
@@ -3802,6 +3846,13 @@ impl PromptCacheRefreshClient for ProviderModelClient {
                 )
                 .await
             }
+            NativeRoute::GeminiSubscription(_) => Err(ProviderCallError {
+                message: "the Gemini subscription does not support prompt-cache refresh"
+                    .to_string(),
+                trace: Box::default(),
+                session_id: None,
+                kind: borg_provider::provider::ProviderErrorKind::Fatal,
+            }),
             NativeRoute::AnthropicMessages => Err(ProviderCallError {
                 message: "the anthropic-api lane does not support prompt-cache refresh".to_string(),
                 trace: Box::default(),

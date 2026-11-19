@@ -1063,6 +1063,7 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
             }
             CodingProvider::Codex
             | CodingProvider::Claude
+            | CodingProvider::Gemini
             | CodingProvider::Anthropic
             | CodingProvider::Kimi
             | CodingProvider::Glm

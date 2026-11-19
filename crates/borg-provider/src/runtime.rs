@@ -53,6 +53,22 @@ pub const CLAUDE_MODEL_CATALOG: ProviderModelCatalog = ProviderModelCatalog {
     effort_levels: &CLAUDE_EFFORT_LEVELS,
 };
 
+/// Models the Gemini subscription serves through Antigravity. A model the
+/// account advertises only with a thinking tier is resolved per request.
+pub const GEMINI_SELECTABLE_MODELS: [(&str, &str); 4] = [
+    ("gemini-4-neon", "Gemini 4 Neon"),
+    ("gemini-4-argon", "Gemini 4 Argon"),
+    ("gemini-4-hydrogen", "Gemini 4 Hydrogen"),
+    ("gemini-3.8-flash", "Gemini 3.8 Flash"),
+];
+pub const GEMINI_EFFORT_LEVELS: [&str; 4] = ["low", "medium", "high", "xhigh"];
+pub const GEMINI_MODEL_CATALOG: ProviderModelCatalog = ProviderModelCatalog {
+    backend: "gemini",
+    default_model: "gemini-4-neon",
+    selectable_models: &GEMINI_SELECTABLE_MODELS,
+    effort_levels: &GEMINI_EFFORT_LEVELS,
+};
+
 pub const MUSE_EFFORT_LEVELS: [&str; 8] = [
     "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
 ];
@@ -62,9 +78,10 @@ pub const MUSE_MODEL_CATALOG: ProviderModelCatalog = ProviderModelCatalog {
     selectable_models: MUSE_MODELS,
     effort_levels: &MUSE_EFFORT_LEVELS,
 };
-pub const MODEL_CATALOGS: [ProviderModelCatalog; 3] = [
+pub const MODEL_CATALOGS: [ProviderModelCatalog; 4] = [
     CODEX_MODEL_CATALOG,
     CLAUDE_MODEL_CATALOG,
+    GEMINI_MODEL_CATALOG,
     MUSE_MODEL_CATALOG,
 ];
 
@@ -205,6 +222,15 @@ pub fn qwen_default_effort() -> &'static str {
 /// what it is actually talking to; the CLI's own default can change under it.
 pub fn grok_product_model() -> &'static str {
     "grok-4.6"
+}
+
+pub fn gemini_product_model() -> &'static str {
+    GEMINI_MODEL_CATALOG.default_model
+}
+
+/// Gemini 4's own default thinking level.
+pub fn gemini_default_effort() -> &'static str {
+    "high"
 }
 
 /// Muse Code's default model.

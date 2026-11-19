@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub enum ProviderAuthProvider {
     Claude,
     Openai,
+    Google,
 }
 
 impl ProviderAuthProvider {
@@ -12,6 +13,7 @@ impl ProviderAuthProvider {
         match self {
             Self::Claude => "claude",
             Self::Openai => "openai",
+            Self::Google => "google",
         }
     }
 }

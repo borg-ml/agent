@@ -654,9 +654,10 @@ pub(crate) struct LocalAgentCliArgs {
 /// Bare sessions start on a connected subscription: Claude, then Codex, then
 /// the other subscription plans. Pay-per-use routes (the Anthropic API,
 /// OpenRouter, Vercel) stay available via `--provider`, never as a fallback.
-pub(crate) const DEFAULT_PROVIDER_PREFERENCE: [RemoteProviderArg; 8] = [
+pub(crate) const DEFAULT_PROVIDER_PREFERENCE: [RemoteProviderArg; 9] = [
     RemoteProviderArg::Claude,
     RemoteProviderArg::Codex,
+    RemoteProviderArg::Gemini,
     RemoteProviderArg::Glm,
     RemoteProviderArg::Kimi,
     RemoteProviderArg::Qwen,
@@ -689,7 +690,7 @@ pub(crate) fn default_subscription_ready(candidate: RemoteProviderArg) -> bool {
             borg_remote::provider_subscription_credentials_present(candidate.into())
                 || borg_provider::credentials::opencode_go_api_key().is_some()
         }
-        RemoteProviderArg::Grok | RemoteProviderArg::Muse => {
+        RemoteProviderArg::Gemini | RemoteProviderArg::Grok | RemoteProviderArg::Muse => {
             borg_remote::provider_subscription_credentials_present(candidate.into())
         }
         RemoteProviderArg::Anthropic
@@ -1405,6 +1406,9 @@ pub(crate) enum RemoteProviderArg {
     #[value(alias = "openai")]
     Codex,
     Claude,
+    /// Gemini through a Google account subscription.
+    #[value(alias = "google")]
+    Gemini,
     /// The Anthropic API lane, billed to a configured API key.
     Anthropic,
     #[value(name = "opencode", alias = "open-code")]
@@ -1424,6 +1428,7 @@ impl From<RemoteProviderArg> for borg_remote::CodingProvider {
         match value {
             RemoteProviderArg::Codex => Self::Codex,
             RemoteProviderArg::Claude => Self::Claude,
+            RemoteProviderArg::Gemini => Self::Gemini,
             RemoteProviderArg::Anthropic => Self::Anthropic,
             RemoteProviderArg::OpenCode => Self::OpenCode,
             RemoteProviderArg::Grok => Self::Grok,
@@ -1442,6 +1447,8 @@ pub(crate) enum SubscriptionProviderArg {
     Claude,
     #[value(alias = "chatgpt", alias = "openai")]
     Codex,
+    #[value(alias = "google")]
+    Gemini,
     #[value(alias = "go")]
     Opencode,
     Glm,
@@ -1455,6 +1462,7 @@ impl From<SubscriptionProviderArg> for borg_provider::subscriptions::Lane {
         match value {
             SubscriptionProviderArg::Claude => Lane::Claude,
             SubscriptionProviderArg::Codex => Lane::Codex,
+            SubscriptionProviderArg::Gemini => Lane::Gemini,
             SubscriptionProviderArg::Opencode => Lane::OpenCode,
             SubscriptionProviderArg::Glm => Lane::Glm,
             SubscriptionProviderArg::Kimi => Lane::Kimi,
@@ -1468,6 +1476,7 @@ impl From<SubscriptionProviderArg> for borg_remote::CodingProvider {
         match value {
             SubscriptionProviderArg::Claude => Self::Claude,
             SubscriptionProviderArg::Codex => Self::Codex,
+            SubscriptionProviderArg::Gemini => Self::Gemini,
             SubscriptionProviderArg::Opencode => Self::OpenCode,
             SubscriptionProviderArg::Glm => Self::Glm,
             SubscriptionProviderArg::Kimi => Self::Kimi,

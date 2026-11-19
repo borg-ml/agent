@@ -2377,6 +2377,10 @@ mod tests {
                 sign_in: None,
             })
             .collect();
+        let opencode = Lane::ALL
+            .iter()
+            .position(|lane| *lane == Lane::OpenCode)
+            .unwrap();
         let mut screen = SettingsScreen::default();
         screen.show_lane(Lane::OpenCode);
         let rows = screen.rows(&values);
@@ -2386,11 +2390,14 @@ mod tests {
             .map(|index| rows[*index].id)
             .collect();
         assert_eq!(page[0], SettingId::LaneBack);
-        assert!(page.contains(&SettingId::LaneName(2)));
+        assert!(page.contains(&SettingId::LaneName(opencode)));
         assert!(!page.iter().any(|id| matches!(id, SettingId::Lane(_))));
         screen.handle_key(KeyEvent::from(KeyCode::Esc), &rows);
         let rows = screen.rows(&values);
-        assert_eq!(screen.selected_row(&rows).unwrap().id, SettingId::Lane(2));
+        assert_eq!(
+            screen.selected_row(&rows).unwrap().id,
+            SettingId::Lane(opencode)
+        );
     }
 
     /// The panel is sized to the section it shows, so the description follows

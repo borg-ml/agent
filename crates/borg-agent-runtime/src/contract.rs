@@ -15,6 +15,9 @@ pub const REMOTE_PROTOCOL_VERSION: u16 = 6;
 pub enum CodingProvider {
     Codex,
     Claude,
+    /// Google Gemini through a Google account subscription (Google AI Pro or
+    /// Ultra, Gemini Code Assist), driven by Borg's harness over Code Assist.
+    Gemini,
     /// Anthropic API, driven by Borg with a user-supplied API key on a
     /// pay-as-you-go lane.
     ///
@@ -201,6 +204,7 @@ impl CodingProvider {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Gemini => "gemini",
             Self::Anthropic => "anthropic",
             Self::OpenCode => "open-code",
             Self::Grok => "grok",
@@ -222,6 +226,7 @@ impl CodingProvider {
         match self {
             Self::Codex => "Codex",
             Self::Claude => "Claude",
+            Self::Gemini => "Gemini",
             Self::Anthropic => "Anthropic API",
             Self::OpenCode => "OpenCode",
             Self::Grok => "Grok",
@@ -241,9 +246,10 @@ impl CodingProvider {
     /// One place, so a tool schema or an admission list cannot quietly disagree
     /// with the enum by listing fewer routes than exist. `config_alias` is the
     /// serialized spelling, which is what those surfaces take.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Codex,
         Self::Claude,
+        Self::Gemini,
         Self::Anthropic,
         Self::OpenCode,
         Self::Grok,
@@ -257,7 +263,7 @@ impl CodingProvider {
     ];
 
     /// Every provider that publishes a fixed model catalog, in picker order.
-    pub const CATALOG_PROVIDERS: [Self; 3] = [Self::Codex, Self::Claude, Self::Muse];
+    pub const CATALOG_PROVIDERS: [Self; 4] = [Self::Codex, Self::Claude, Self::Gemini, Self::Muse];
 
     /// The provider whose catalog lists `model`, if any. Model ids are unique
     /// across catalogs, so this is what lets the model picker offer models
@@ -306,6 +312,7 @@ impl CodingProvider {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Gemini => "gemini",
             Self::Anthropic => "anthropic",
             Self::OpenCode => "open_code",
             Self::Grok => "grok",
@@ -326,7 +333,8 @@ impl CodingProvider {
             Self::OpenCode => "opencode",
             Self::Grok => "grok",
             Self::Muse => "muse",
-            Self::Anthropic
+            Self::Gemini
+            | Self::Anthropic
             | Self::Kimi
             | Self::Glm
             | Self::Qwen
@@ -343,7 +351,8 @@ impl CodingProvider {
     pub fn uses_native_harness(self) -> bool {
         matches!(
             self,
-            Self::Anthropic
+            Self::Gemini
+                | Self::Anthropic
                 | Self::Kimi
                 | Self::Glm
                 | Self::Qwen

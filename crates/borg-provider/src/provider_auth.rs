@@ -33,12 +33,15 @@ fn required_files_for_provider(provider: ProviderAuthProvider) -> &'static [&'st
     match provider {
         ProviderAuthProvider::Claude => &[CLAUDE_CREDENTIALS_REL_PATH],
         ProviderAuthProvider::Openai => &[CODEX_AUTH_REL_PATH],
+        // Controller bundles never carry Google logins; see `validate_home`.
+        ProviderAuthProvider::Google => &[],
     }
 }
 
 fn auth_kind_for_provider(provider: ProviderAuthProvider, auth_json: Option<&Value>) -> String {
     match provider {
         ProviderAuthProvider::Claude => "claude_code_session".to_string(),
+        ProviderAuthProvider::Google => "gemini_google_session".to_string(),
         ProviderAuthProvider::Openai => {
             let has_tokens = auth_json
                 .map(auth_json_holds_chatgpt_session)
@@ -303,6 +306,9 @@ pub async fn validate_home(
     match provider {
         ProviderAuthProvider::Claude => validate_claude_home(home_dir).await,
         ProviderAuthProvider::Openai => validate_openai_home(home_dir).await,
+        ProviderAuthProvider::Google => Err(anyhow!(
+            "Gemini logins stay on the host that signed in; controller auth bundles are not supported"
+        )),
     }
 }
 

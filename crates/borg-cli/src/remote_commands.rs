@@ -1934,6 +1934,7 @@ fn provider_argument(provider: crate::cli::RemoteProviderArg) -> &'static str {
     match provider {
         RemoteProviderArg::Codex => "codex",
         RemoteProviderArg::Claude => "claude",
+        RemoteProviderArg::Gemini => "gemini",
         RemoteProviderArg::Anthropic => "anthropic",
         RemoteProviderArg::OpenCode => "open-code",
         RemoteProviderArg::Kimi => "kimi",
@@ -2656,6 +2657,9 @@ async fn run_local_agent_session(
                     CodingProvider::OpenAiCompatible => None,
                     CodingProvider::Claude => {
                         Some(borg_provider::claude_default_effort().to_string())
+                    }
+                    CodingProvider::Gemini => {
+                        Some(borg_provider::gemini_default_effort().to_string())
                     }
                     CodingProvider::OpenCode => None,
                     CodingProvider::Kimi | CodingProvider::Glm => {
@@ -9208,6 +9212,7 @@ pub(crate) async fn login_command(
         for provider in [
             CodingProvider::Codex,
             CodingProvider::Claude,
+            CodingProvider::Gemini,
             CodingProvider::OpenCode,
             CodingProvider::Grok,
             CodingProvider::Muse,
@@ -9241,8 +9246,14 @@ pub(crate) async fn login_command(
             let path = prompt_and_store_api_key(provider)?;
             println!("{} API key saved to {}.", provider.label(), path.display());
         }
+        CodingProvider::Gemini if api_key => {
+            anyhow::bail!(
+                "Gemini bills only the Google account subscription; run `borg login gemini`"
+            );
+        }
         CodingProvider::Codex
         | CodingProvider::Claude
+        | CodingProvider::Gemini
         | CodingProvider::OpenCode
         | CodingProvider::Grok
         | CodingProvider::Muse => {
@@ -9444,6 +9455,9 @@ fn credential_guidance(provider: CodingProvider) -> &'static str {
         }
         CodingProvider::Claude => {
             "`borg login claude` (Claude subscription) or `borg login claude --api-key` (API billing); /login switches saved credentials"
+        }
+        CodingProvider::Gemini => {
+            "`borg login gemini` signs in with your Google account (Google AI Pro/Ultra or Gemini Code Assist)"
         }
         CodingProvider::OpenCode => {
             "`borg login opencode --api-key` (Go subscription key), then /model → OpenCode Go"
@@ -9965,6 +9979,7 @@ fn default_model_for_provider(provider: CodingProvider) -> Option<String> {
     match provider {
         CodingProvider::Codex => Some(borg_provider::codex_product_model().to_string()),
         CodingProvider::Claude => Some(borg_provider::claude_product_model().to_string()),
+        CodingProvider::Gemini => Some(borg_provider::gemini_product_model().to_string()),
         CodingProvider::Kimi => Some(borg_provider::kimi_product_model().to_string()),
         CodingProvider::Glm => Some(borg_provider::glm_product_model().to_string()),
         CodingProvider::Qwen => Some(borg_provider::qwen_product_model().to_string()),
@@ -11886,6 +11901,7 @@ fn provider_name(provider: CodingProvider) -> &'static str {
     match provider {
         CodingProvider::Codex => "codex",
         CodingProvider::Claude => "claude",
+        CodingProvider::Gemini => "gemini",
         CodingProvider::Anthropic => "anthropic",
         CodingProvider::OpenCode => "open-code",
         CodingProvider::Grok => "grok",

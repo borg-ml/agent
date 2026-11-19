@@ -8433,6 +8433,7 @@ fn default_consultation_effort(provider: CodingProvider) -> Option<String> {
             Some("medium".to_string())
         }
         CodingProvider::Claude => Some(borg_provider::claude_default_effort().to_string()),
+        CodingProvider::Gemini => Some(borg_provider::gemini_default_effort().to_string()),
         // Nothing is enabled by default on these routes: effort is what asks
         // for extended thinking, so a session that did not ask for it should
         // not pay for it.

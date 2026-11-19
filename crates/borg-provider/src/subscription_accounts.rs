@@ -71,6 +71,7 @@ pub fn new_account_path(provider: ProviderAuthProvider, name: &str) -> Result<Pa
     Ok(match provider {
         ProviderAuthProvider::Claude => directory,
         ProviderAuthProvider::Openai => directory.join("auth.json"),
+        ProviderAuthProvider::Google => directory.join("gemini-subscription.json"),
     })
 }
 
@@ -86,6 +87,7 @@ fn selection_key(provider: ProviderAuthProvider) -> &'static str {
     match provider {
         ProviderAuthProvider::Claude => credentials::CLAUDE_CONFIG_DIR_KEY,
         ProviderAuthProvider::Openai => credentials::OPENAI_AUTH_FILE_KEY,
+        ProviderAuthProvider::Google => credentials::GEMINI_AUTH_FILE_KEY,
     }
 }
 
@@ -93,6 +95,7 @@ fn env_override(provider: ProviderAuthProvider) -> Option<PathBuf> {
     match provider {
         ProviderAuthProvider::Claude => credentials::claude_config_dir_env_override(),
         ProviderAuthProvider::Openai => credentials::openai_auth_file_env_override(),
+        ProviderAuthProvider::Google => credentials::gemini_auth_file_env_override(),
     }
 }
 
@@ -101,6 +104,7 @@ fn selection(provider: ProviderAuthProvider) -> Result<Option<PathBuf>> {
     match provider {
         ProviderAuthProvider::Claude => credentials::claude_subscription_config_dir(),
         ProviderAuthProvider::Openai => credentials::openai_subscription_auth_file(),
+        ProviderAuthProvider::Google => credentials::gemini_subscription_auth_file(),
     }
 }
 
@@ -214,6 +218,10 @@ async fn resolved_default(provider: ProviderAuthProvider) -> Option<PathBuf> {
             let path = crate::openai_subscription::auth_path().ok()?;
             path.is_file().then_some(path)
         }
+        ProviderAuthProvider::Google => {
+            let path = crate::gemini_subscription::auth_path().ok()?;
+            path.is_file().then_some(path)
+        }
     }
 }
 
@@ -256,6 +264,7 @@ fn write_selection(provider: ProviderAuthProvider, name: &str, path: &Path) -> R
         let variable = match provider {
             ProviderAuthProvider::Claude => "BORG_CLAUDE_CONFIG_DIR",
             ProviderAuthProvider::Openai => "BORG_OPENAI_AUTH_FILE",
+            ProviderAuthProvider::Google => "BORG_GEMINI_AUTH_FILE",
         };
         ensure!(
             same_path(&overridden, path),
@@ -307,6 +316,7 @@ pub async fn activate(provider: ProviderAuthProvider, name: &str) -> Result<Subs
                 match provider {
                     ProviderAuthProvider::Claude => "claude",
                     ProviderAuthProvider::Openai => "codex",
+                    ProviderAuthProvider::Google => "gemini",
                 }
             )
         })?;
@@ -369,7 +379,9 @@ fn owned_directory(provider: ProviderAuthProvider, name: &str, path: &Path) -> O
     }
     match provider {
         ProviderAuthProvider::Claude => Some(owned),
-        ProviderAuthProvider::Openai => owned.parent().map(Path::to_path_buf),
+        ProviderAuthProvider::Openai | ProviderAuthProvider::Google => {
+            owned.parent().map(Path::to_path_buf)
+        }
     }
 }
 

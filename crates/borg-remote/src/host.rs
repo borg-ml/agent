@@ -560,16 +560,19 @@ async fn probe_provider_capabilities_uncached(
     managed_kimi: bool,
     mode: ProviderProbeMode,
 ) -> Vec<ProviderCapability> {
-    let (codex, claude, opencode, kimi, openrouter, compatible, muse) = tokio::join!(
+    let (codex, claude, gemini, opencode, kimi, openrouter, compatible, muse) = tokio::join!(
         probe_provider(CodingProvider::Codex, managed_kimi, mode),
         probe_provider(CodingProvider::Claude, managed_kimi, mode),
+        probe_provider(CodingProvider::Gemini, managed_kimi, mode),
         probe_provider(CodingProvider::OpenCode, managed_kimi, mode),
         probe_provider(CodingProvider::Kimi, managed_kimi, mode),
         probe_provider(CodingProvider::OpenRouter, managed_kimi, mode),
         probe_provider(CodingProvider::OpenAiCompatible, managed_kimi, mode),
         probe_provider(CodingProvider::Muse, managed_kimi, mode),
     );
-    let capabilities = vec![codex, claude, opencode, kimi, openrouter, compatible, muse];
+    let capabilities = vec![
+        codex, claude, gemini, opencode, kimi, openrouter, compatible, muse,
+    ];
     match mode {
         // Launch only needs locally available authentication routes. Starting
         // provider subprocesses to refresh subscription usage blocks first
@@ -619,6 +622,8 @@ async fn probe_provider(
                 .flatten()
                 .is_some(),
         )
+    } else if provider == CodingProvider::Gemini {
+        (None, provider_subscription_credentials_present(provider))
     } else {
         match mode {
             ProviderProbeMode::Detailed => {
@@ -636,7 +641,8 @@ async fn probe_provider(
                             | CodingProvider::OpenCode
                             | CodingProvider::Grok
                             | CodingProvider::Muse => provider_auth_status(provider).await.ok(),
-                            CodingProvider::Anthropic
+                            CodingProvider::Gemini
+                            | CodingProvider::Anthropic
                             | CodingProvider::Kimi
                             | CodingProvider::Glm
                             | CodingProvider::Qwen
@@ -661,7 +667,8 @@ async fn probe_provider(
                     // an API key is the signal.
                     CodingProvider::Grok => grok_credentials_present(),
                     CodingProvider::Muse => muse_credentials_present(),
-                    CodingProvider::Anthropic
+                    CodingProvider::Gemini
+                    | CodingProvider::Anthropic
                     | CodingProvider::Kimi
                     | CodingProvider::Glm
                     | CodingProvider::Qwen
@@ -737,6 +744,13 @@ async fn probe_provider(
                 subscription_authenticated.then_some(BillingLane::Subscription)
             }
         }
+        // Gemini bills only the Google account subscription; there is no
+        // API-key lane to fall back to.
+        CodingProvider::Gemini => subscription_authenticated.then(|| {
+            auth_methods.push(ProviderAuthMethod::Subscription);
+            detail.push("Gemini subscription authenticated");
+            BillingLane::Subscription
+        }),
         CodingProvider::OpenCode => {
             if subscription_authenticated
                 || borg_provider::credentials::opencode_go_api_key().is_some()
@@ -914,6 +928,7 @@ async fn probe_provider(
         // service user's PATH.
         CodingProvider::Codex
         | CodingProvider::Claude
+        | CodingProvider::Gemini
         | CodingProvider::Anthropic
         | CodingProvider::Kimi
         | CodingProvider::Glm
@@ -964,6 +979,10 @@ pub fn provider_subscription_credentials_present(provider: CodingProvider) -> bo
             .is_some_and(opencode_auth_json_authenticated),
         CodingProvider::Grok => grok_credentials_present(),
         CodingProvider::Muse => muse_stored_credentials_present(),
+        CodingProvider::Gemini => borg_provider::gemini_subscription::account()
+            .ok()
+            .flatten()
+            .is_some(),
         CodingProvider::Anthropic
         | CodingProvider::Kimi
         | CodingProvider::Glm
@@ -1302,6 +1321,7 @@ pub fn provider_credentials_present(provider: CodingProvider) -> bool {
             borg_provider::credentials::ApiKeyCredential::Anthropic,
         )
         .is_some(),
+        CodingProvider::Gemini => provider_subscription_credentials_present(provider),
         CodingProvider::Grok => grok_credentials_present(),
         CodingProvider::Muse => muse_credentials_present(),
         CodingProvider::Kimi => {
@@ -1340,6 +1360,9 @@ pub fn provider_credentials_present(provider: CodingProvider) -> bool {
 }
 
 fn provider_login_command(provider: CodingProvider, mut command: Command) -> Result<Command> {
+    if provider == CodingProvider::Gemini {
+        bail!("Gemini subscription login is handled natively");
+    }
     if provider.uses_native_harness() {
         bail!(
             "{provider:?} uses API credentials from the environment; configure the provider key and endpoint variables"
@@ -1357,7 +1380,8 @@ fn provider_login_command(provider: CodingProvider, mut command: Command) -> Res
         CodingProvider::Muse => {
             command.args(["login"]);
         }
-        CodingProvider::Anthropic
+        CodingProvider::Gemini
+        | CodingProvider::Anthropic
         | CodingProvider::Kimi
         | CodingProvider::Glm
         | CodingProvider::Qwen
@@ -1371,7 +1395,10 @@ fn provider_login_command(provider: CodingProvider, mut command: Command) -> Res
 }
 
 pub async fn login_provider(provider: CodingProvider) -> Result<()> {
-    if matches!(provider, CodingProvider::Codex | CodingProvider::Claude) {
+    if matches!(
+        provider,
+        CodingProvider::Codex | CodingProvider::Claude | CodingProvider::Gemini
+    ) {
         return login_provider_with_output(provider, |line| println!("{line}")).await;
     }
     let command = if provider == CodingProvider::Muse {
@@ -1429,16 +1456,20 @@ pub async fn login_provider_with_output(
     login_subscription(provider, None, on_output).await
 }
 
-/// Connect an additional named subscription login and select it. Only Claude
-/// and ChatGPT keep several logins; every other provider has a single authority.
+/// Connect an additional named subscription login and select it. Only Claude,
+/// ChatGPT and Gemini keep several logins; every other provider has a single
+/// authority.
 pub async fn login_provider_account_with_output(
     provider: CodingProvider,
     account: &str,
     on_output: impl FnMut(&str) + Send,
 ) -> Result<()> {
     anyhow::ensure!(
-        matches!(provider, CodingProvider::Claude | CodingProvider::Codex),
-        "named subscription accounts exist for Claude and ChatGPT only"
+        matches!(
+            provider,
+            CodingProvider::Claude | CodingProvider::Codex | CodingProvider::Gemini
+        ),
+        "named subscription accounts exist for Claude, ChatGPT and Gemini only"
     );
     login_subscription(provider, Some(account), on_output).await
 }
@@ -1531,6 +1562,55 @@ async fn login_subscription(
         }
         crate::provider_usage::clear_login_dependent_usage_caches().await;
         on_output(&format!("{connected} Saved API credentials were kept."));
+        return Ok(());
+    }
+    if provider == CodingProvider::Gemini {
+        // Borg owns this login; Gemini CLI's ~/.gemini session is never shared,
+        // so neither program invalidates the other's tokens.
+        let path = match account {
+            Some(name) => borg_provider::subscription_accounts::new_account_path(
+                borg_provider::ProviderAuthProvider::Google,
+                name,
+            )?,
+            None => borg_provider::gemini_subscription::auth_path()?,
+        };
+        let login = borg_provider::gemini_subscription::begin_browser_login(path.clone()).await?;
+        on_output(&format!(
+            "Warning: {} Signing in accepts that risk for this Google account.",
+            borg_provider::gemini_subscription::TERMS_WARNING
+        ));
+        on_output(&format!(
+            "Open {} to connect your Gemini subscription with your Google account (expires in 10 minutes).",
+            login.authorize_url()
+        ));
+        let signed_in = login.complete().await?;
+        let tier = signed_in
+            .tier
+            .map(|tier| format!(" ({tier})"))
+            .unwrap_or_default();
+        let connected = match account {
+            Some(name) => {
+                borg_provider::subscription_accounts::register(
+                    borg_provider::ProviderAuthProvider::Google,
+                    name,
+                    &path,
+                )
+                .await?;
+                format!(
+                    "Connected Gemini account {name}: {}{tier}.",
+                    signed_in.email
+                )
+            }
+            None => {
+                borg_provider::credentials::set_gemini_subscription_auth_file(&path)?;
+                format!("Connected Gemini subscription: {}{tier}.", signed_in.email)
+            }
+        };
+        if let Some(cache) = PROVIDER_CAPABILITIES_CACHE.get() {
+            cache.lock().await.clear();
+        }
+        crate::provider_usage::clear_login_dependent_usage_caches().await;
+        on_output(&connected);
         return Ok(());
     }
     let command = if provider == CodingProvider::Muse {
@@ -4263,6 +4343,7 @@ fn provider_arg(provider: CodingProvider) -> &'static str {
     match provider {
         CodingProvider::Codex => "codex",
         CodingProvider::Claude => "claude",
+        CodingProvider::Gemini => "gemini",
         CodingProvider::Anthropic => "anthropic",
         CodingProvider::OpenCode => "open-code",
         CodingProvider::Grok => "grok",

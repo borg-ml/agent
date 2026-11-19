@@ -83,6 +83,13 @@ pub enum ModelProviderState {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         account_identity: Option<String>,
     },
+    /// Gemini model parts as received, including the thought signatures the
+    /// API requires back on later rounds.
+    Gemini {
+        parts: Vec<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_identity: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

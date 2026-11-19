@@ -229,6 +229,7 @@ pub fn set_claude_uses_api_key(api_key: bool) -> Result<PathBuf> {
 
 pub(crate) const CLAUDE_CONFIG_DIR_KEY: &str = "claude_subscription_config_dir";
 pub(crate) const OPENAI_AUTH_FILE_KEY: &str = "openai_subscription_auth_file";
+pub(crate) const GEMINI_AUTH_FILE_KEY: &str = "gemini_subscription_auth_file";
 
 fn env_override(env_var: &str) -> Option<PathBuf> {
     crate::env::nonempty_var(env_var).map(PathBuf::from)
@@ -244,6 +245,12 @@ pub fn claude_config_dir_env_override() -> Option<PathBuf> {
 /// [`claude_config_dir_env_override`].
 pub fn openai_auth_file_env_override() -> Option<PathBuf> {
     env_override("BORG_OPENAI_AUTH_FILE")
+}
+
+/// An operator-set `BORG_GEMINI_AUTH_FILE`; see
+/// [`claude_config_dir_env_override`].
+pub fn gemini_auth_file_env_override() -> Option<PathBuf> {
+    env_override("BORG_GEMINI_AUTH_FILE")
 }
 
 /// A path setting: the environment variable wins, the store is the fallback.
@@ -277,6 +284,14 @@ pub fn set_claude_subscription_config_dir(path: &Path) -> Result<PathBuf> {
 /// Where `borg login claude` keeps a Borg-owned Claude login.
 pub fn default_claude_subscription_config_dir() -> Option<PathBuf> {
     borg_dir().map(|dir| dir.join("claude"))
+}
+
+pub fn gemini_subscription_auth_file() -> Result<Option<PathBuf>> {
+    stored_path("BORG_GEMINI_AUTH_FILE", GEMINI_AUTH_FILE_KEY)
+}
+
+pub fn set_gemini_subscription_auth_file(path: &Path) -> Result<PathBuf> {
+    store_values(&[(GEMINI_AUTH_FILE_KEY, path_string(path, "Gemini auth")?)])
 }
 
 pub fn set_openai_subscription_auth_file(path: &Path) -> Result<PathBuf> {

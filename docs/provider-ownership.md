@@ -10,8 +10,8 @@ conversation must not become authoritative over Borg's journal.
 
 ## Current routes
 
-Claude and Codex use Borg's native harness over direct HTTP/SSE model transports.
-Neither route runs a Claude Code CLI, Codex CLI, app server, shared JavaScript
+Claude, Codex and Gemini use Borg's native harness over direct HTTP/SSE model
+transports. None of these routes runs a Claude Code CLI, Codex CLI, Gemini CLI, app server, shared JavaScript
 helper or upstream agent loop. Native model access also serves Anthropic, Kimi,
 GLM, Qwen, OpenRouter, Vercel and configured OpenAI-compatible endpoints.
 OpenCode Go models use the native route; other OpenCode routes, Grok Build and
@@ -39,9 +39,35 @@ Borg Remote. Refresh and replay remain bound to the selected account; opaque
 continuations cannot be reused under a different account. Missing entitlement
 or authentication must surface explicitly, never silently switch billing.
 
+## Gemini login
+
+Since 2026-06-18 Google serves personal Gemini subscriptions (free, Google AI
+Pro, Ultra) only to Antigravity; the Gemini CLI client is refused with
+`UNSUPPORTED_CLIENT`. `borg login gemini` therefore performs Antigravity's
+installed-app OAuth sign-in (PKCE, fixed redirect `localhost:51121`) and calls
+Cloud Code on `daily-cloudcode-pa.googleapis.com` with the Antigravity Hub
+`User-Agent`, whose version is read from the Hub update manifest. Google's
+Antigravity terms forbid third-party clients and Google suspends accounts it
+detects, so the login prints that warning before the browser opens; the risk
+is the account owner's. For the same reason the Gemini lane switches between
+named logins only by hand unless a strategy is chosen.
+
+The login is saved to `~/.borg/gemini-subscription.json`, refreshed under a
+file lock that refuses a token for a different Google account, and bound to
+the Cloud Code project `loadCodeAssist`/`onboardUser` assign.
+`BORG_GEMINI_AUTH_FILE` overrides the selected login.
+
+Turns use `v1internal:streamGenerateContent` in the Antigravity request
+envelope, in `crates/borg-provider/src/provider/gemini_model.rs`. A model the
+account advertises only with a thinking tier is resolved per request from
+`fetchAvailableModels`, which also reports each model's remaining quota. Model
+parts are stored as `ModelProviderState::Gemini` and replayed with their thought
+signatures only under the same Google account; other history gets the
+synthetic signature Gemini accepts.
+
 ## Several subscription accounts
 
-Claude and ChatGPT keep more than one login at a time. `borg login claude
+Claude, ChatGPT and Gemini keep more than one login at a time. `borg login claude
 --account work` (or `borg login codex --account work`) signs in to a new
 persistent authority under `~/.borg/accounts/`, and the credential store maps
 the name to that path in

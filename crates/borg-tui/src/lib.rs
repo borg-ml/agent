@@ -2994,7 +2994,7 @@ fn model_picker_options_with_configured(
                 options.push(option);
             }
         }
-        Some(CodingProvider::Codex | CodingProvider::Claude) => {
+        Some(CodingProvider::Codex | CodingProvider::Claude | CodingProvider::Gemini) => {
             unreachable!("catalog-backed providers are handled above")
         }
     }

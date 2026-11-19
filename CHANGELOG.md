@@ -5,6 +5,20 @@ Git comparison.
 
 ## Unreleased (since 0.21.6)
 
+- Gemini is a subscription provider. `borg login gemini` signs in with the
+  Google account that holds Google AI Pro, Ultra or the free tier, and Borg's
+  own loop drives Gemini 4 Neon (the new default), Gemini 4 Argon, Gemini 3.8
+  Flash and Gemini 3.1 Pro directly over Google's Cloud Code API. No Gemini
+  CLI or Antigravity process runs. Google serves personal subscriptions only
+  to Antigravity since June 18, 2026, so Borg signs in as Antigravity. Google's
+  Antigravity terms forbid third-party clients and Google has suspended
+  accounts for it; the login says so before you sign in. Turns stream text,
+  thinking and tool calls live and replay thought signatures exactly, and
+  `/effort` maps to Gemini's thinking levels. Each model's remaining quota
+  and reset time show on the provider page, in `borg accounts` and in
+  `get_provider_capabilities`. Several Google accounts can be connected with
+  `--account NAME`; Gemini switches between them only by hand unless you
+  choose an automatic strategy. Gemini never falls back to API-key billing.
 - A director whose session host retries after a database connection failure
   no longer loses its subagents. The retry used to restore every child while
   their still-running actors held the child locks, so `list_agents` showed

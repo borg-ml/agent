@@ -112,6 +112,7 @@ fn provider_slug(provider: CodingProvider) -> &'static str {
     match provider {
         CodingProvider::Codex => "codex",
         CodingProvider::Claude => "claude",
+        CodingProvider::Gemini => "gemini",
         CodingProvider::Anthropic => "anthropic",
         CodingProvider::OpenCode => "opencode",
         CodingProvider::OpenRouter => "openrouter",
@@ -129,6 +130,7 @@ fn provider_named(name: &str) -> Option<CodingProvider> {
     Some(match name.to_ascii_lowercase().as_str() {
         "codex" | "gpt" | "openai" => CodingProvider::Codex,
         "claude" => CodingProvider::Claude,
+        "gemini" | "google" => CodingProvider::Gemini,
         "anthropic" | "anthropic-api" | "anthropic_api" => CodingProvider::Anthropic,
         "opencode" | "open-code" | "open_code" => CodingProvider::OpenCode,
         "openrouter" | "open-router" => CodingProvider::OpenRouter,

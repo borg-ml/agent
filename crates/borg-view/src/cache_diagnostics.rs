@@ -474,6 +474,7 @@ fn cache_window(provider: CodingProvider) -> Option<Duration> {
         // The API lane sends no cache breakpoints yet, so there is no window to
         // explain a miss against, and guessing one would misreport the cause.
         CodingProvider::Anthropic
+        | CodingProvider::Gemini
         | CodingProvider::OpenCode
         | CodingProvider::Grok
         | CodingProvider::Muse

@@ -76,6 +76,7 @@ impl Strategy {
 pub enum Lane {
     Claude,
     Codex,
+    Gemini,
     OpenCode,
     Glm,
     Kimi,
@@ -95,9 +96,10 @@ pub enum AccountKind {
 }
 
 impl Lane {
-    pub const ALL: [Lane; 10] = [
+    pub const ALL: [Lane; 11] = [
         Lane::Claude,
         Lane::Codex,
+        Lane::Gemini,
         Lane::OpenCode,
         Lane::Glm,
         Lane::Kimi,
@@ -113,6 +115,7 @@ impl Lane {
         match self {
             Lane::Claude => "claude",
             Lane::Codex => "openai",
+            Lane::Gemini => "google",
             Lane::OpenCode => "opencode",
             Lane::Glm => "glm",
             Lane::Kimi => "kimi",
@@ -128,6 +131,7 @@ impl Lane {
         match self {
             Lane::Claude => "Claude",
             Lane::Codex => "ChatGPT",
+            Lane::Gemini => "Gemini",
             Lane::OpenCode => "OpenCode Go",
             Lane::Glm => "GLM Coding Plan",
             Lane::Kimi => "Kimi Code",
@@ -144,6 +148,7 @@ impl Lane {
         match value.trim().to_ascii_lowercase().as_str() {
             "claude" | "anthropic" => Some(Lane::Claude),
             "codex" | "openai" | "chatgpt" => Some(Lane::Codex),
+            "gemini" | "google" => Some(Lane::Gemini),
             "opencode" | "opencode-go" | "go" => Some(Lane::OpenCode),
             "glm" | "zai" => Some(Lane::Glm),
             "kimi" | "moonshot" => Some(Lane::Kimi),
@@ -170,7 +175,10 @@ impl Lane {
 
     /// Whether a subscription is connected by signing in with a browser.
     pub fn signs_in(self) -> bool {
-        matches!(self, Lane::Claude | Lane::Codex | Lane::Grok | Lane::Muse)
+        matches!(
+            self,
+            Lane::Claude | Lane::Codex | Lane::Gemini | Lane::Grok | Lane::Muse
+        )
     }
 
     /// The OAuth login registry behind this lane, if it keeps authorities as
@@ -179,6 +187,7 @@ impl Lane {
         match self {
             Lane::Claude => Some(ProviderAuthProvider::Claude),
             Lane::Codex => Some(ProviderAuthProvider::Openai),
+            Lane::Gemini => Some(ProviderAuthProvider::Google),
             _ => None,
         }
     }
@@ -223,6 +232,7 @@ impl Lane {
         match self {
             Lane::Claude => "claude",
             Lane::Codex => "codex",
+            Lane::Gemini => "gemini",
             Lane::OpenCode => "opencode",
             Lane::Glm => "glm",
             Lane::Kimi => "kimi",
@@ -312,7 +322,13 @@ pub fn strategy(lane: Lane) -> Strategy {
         .ok()
         .and_then(|values| values.get(&strategy_key(lane)).cloned())
         .and_then(|value| Strategy::parse(&value))
-        .unwrap_or_default()
+        // Google suspends Antigravity accounts it sees rotating automatically,
+        // so Gemini moves between logins only when the user asks.
+        .unwrap_or(if lane == Lane::Gemini {
+            Strategy::Manual
+        } else {
+            Strategy::default()
+        })
 }
 
 pub fn set_strategy(lane: Lane, strategy: Strategy) -> Result<()> {

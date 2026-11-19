@@ -15,6 +15,7 @@ mod claude_subscription_transport;
 mod claude_subscription_wire;
 #[cfg(feature = "codex")]
 mod codex_model;
+mod gemini_model;
 mod model_turn;
 mod openai_compatible;
 /// Access-only adapter for the OpenCode Go subscription route. Model-only:
@@ -30,6 +31,7 @@ pub use anthropic_messages::{
 pub use claude_model::{ClaudeModelProvider, claude_refusal_fallback_model};
 #[cfg(feature = "codex")]
 pub use codex_model::CodexModelProvider;
+pub use gemini_model::{GEMINI_LABEL, GeminiModelProvider};
 
 pub use chat_stream::{
     ChatGitCredential, ChatProviderAuth, ChatStreamEvent, ChatStreamRequest,
