@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.21.6)
+## Unreleased (since 0.22.0)
+
+## 0.22.0 (2026-11-19)
 
 - Hover tooltips, such as the keybindings tooltip on the palette hint and the
   status-line details, close as soon as you type or press Esc instead of
