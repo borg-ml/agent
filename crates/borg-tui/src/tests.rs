@@ -206,6 +206,39 @@ fn watcher_yield_labels_ready_as_waiting_until_resumed_or_restarted() {
     }
 }
 
+// A turn blocked in `wait_agent` is waiting on other agents, not working.
+#[test]
+fn a_turn_blocked_in_wait_agent_shows_waiting() {
+    let session = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "wait-1".to_string(),
+            name: "wait_agent".to_string(),
+            input: serde_json::json!({}),
+            input_ref: None,
+            parent_tool_call_id: None,
+        },
+    ));
+    assert_eq!(transcript.status_label(SessionStatus::Running), "waiting");
+    transcript.apply(&SessionEvent::new(
+        session,
+        2,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "wait-1".to_string(),
+            output: "{}".to_string(),
+            output_ref: None,
+            is_error: false,
+            input: None,
+            input_ref: None,
+            parent_tool_call_id: None,
+        },
+    ));
+    assert_eq!(transcript.status_label(SessionStatus::Running), "running");
+}
+
 #[test]
 fn completion_alert_policies_respect_window_focus() {
     assert!(!completion_alert_enabled(CompletionAlertPolicy::Off, false));

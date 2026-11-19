@@ -317,6 +317,10 @@ pub struct TranscriptCore {
     pub model_request: Option<ModelRequestDisplay>,
     pub live_turn_closed: bool,
     pub waiting_on_watchers: bool,
+    /// Blocking waits (`wait_agent`, `await_watchers`) open in this turn. The
+    /// session is still Running, but it is waiting on others, not working.
+    #[serde(default)]
+    pub open_waits: HashSet<String>,
     pub subagent_snapshots: HashMap<Uuid, SubagentSnapshot>,
     /// Settled children dropped from `subagent_snapshots` to bound memory.
     /// Remembered by id so the team's inactive count stays the real total.
@@ -406,6 +410,7 @@ impl Default for TranscriptCore {
             model_request: None,
             live_turn_closed: false,
             waiting_on_watchers: false,
+            open_waits: HashSet::new(),
             subagent_snapshots: HashMap::new(),
             pruned_settled_children: HashSet::new(),
             agent_names: HashMap::new(),
@@ -451,6 +456,32 @@ impl Default for TranscriptCore {
             last_edit: None,
             pending_entry_insertions: Vec::new(),
             next_image_number: 1,
+        }
+    }
+}
+
+fn is_blocking_wait(name: &str, input: &serde_json::Value) -> bool {
+    let name = match name {
+        "capability" => input
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(name),
+        _ => name,
+    };
+    matches!(
+        name.rsplit("__").next().unwrap_or(name),
+        "wait_agent" | "await_watchers"
+    )
+}
+
+impl TranscriptCore {
+    /// Waiting rather than working: parked on watchers between turns, or
+    /// blocked in a wait for other agents inside one.
+    pub fn is_waiting(&self, status: SessionStatus) -> bool {
+        match status {
+            SessionStatus::Ready => self.waiting_on_watchers,
+            SessionStatus::Running => !self.open_waits.is_empty(),
+            _ => false,
         }
     }
 }
@@ -880,6 +911,19 @@ impl TranscriptCore {
             }
             SessionEventKind::TurnStarted { .. } | SessionEventKind::SessionStarted => {
                 self.waiting_on_watchers = false;
+                self.open_waits.clear();
+            }
+            SessionEventKind::TurnCompleted { .. } => self.open_waits.clear(),
+            SessionEventKind::ToolStarted {
+                tool_call_id,
+                name,
+                input,
+                ..
+            } if is_blocking_wait(name, input) => {
+                self.open_waits.insert(tool_call_id.clone());
+            }
+            SessionEventKind::ToolCompleted { tool_call_id, .. } => {
+                self.open_waits.remove(tool_call_id);
             }
             // The durable Ready boundary carries the wait in its detail. Unlike
             // the ephemeral `goal_yielded`, it survives both a dropped live
@@ -4917,15 +4961,22 @@ impl TranscriptCore {
                 SessionStatus::Failed => SubagentStatus::Failed,
             };
             snapshot.detail = meta.status_detail.clone();
-            snapshot.lifecycle = Some(meta.status_lifecycle.unwrap_or_else(|| {
-                if !meta.approvals.is_empty() {
-                    SubagentLifecycle::WaitingForApproval
-                } else if meta.waiting_on_watchers {
+            snapshot.lifecycle = Some(match meta.status_lifecycle {
+                // A child blocked in a wait for its own agents shows as waiting.
+                Some(SubagentLifecycle::Running) if meta.waiting_on_watchers => {
                     SubagentLifecycle::WaitingOnWatchers
-                } else {
-                    snapshot.status.into()
                 }
-            }));
+                Some(lifecycle) => lifecycle,
+                None => {
+                    if !meta.approvals.is_empty() {
+                        SubagentLifecycle::WaitingForApproval
+                    } else if meta.waiting_on_watchers {
+                        SubagentLifecycle::WaitingOnWatchers
+                    } else {
+                        snapshot.status.into()
+                    }
+                }
+            });
         }
         if newer {
             let usage = &meta.usage;

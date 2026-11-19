@@ -1859,7 +1859,7 @@ impl Transcript {
     }
 
     fn status_label(&self, status: SessionStatus) -> &'static str {
-        if status == SessionStatus::Ready && self.waiting_on_watchers {
+        if self.is_waiting(status) {
             "waiting"
         } else {
             status_label(status)

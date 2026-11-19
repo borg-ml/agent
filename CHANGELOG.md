@@ -5,6 +5,9 @@ Git comparison.
 
 ## Unreleased (since 0.22.0)
 
+- An agent blocked waiting for its subagents (`wait_agent`) shows as
+  "waiting" in the status bar and the agent list, instead of "running".
+
 - When a Gemini subscription's quota is spent (for example "Individual quota
   reached"), Borg reports it once as a usage limit and waits for Google's
   reset instead of resending the request in a loop of identical HTTP 429

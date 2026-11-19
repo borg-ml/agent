@@ -694,7 +694,8 @@ impl ViewReducer {
             permission_mode: config.permission_mode,
             response_language: config.response_language,
         });
-        self.core.meta.waiting_on_watchers = self.core.waiting_on_watchers;
+        self.core.meta.waiting_on_watchers =
+            self.core.waiting_on_watchers || !self.core.open_waits.is_empty();
         self.core.meta.goal = self.core.goal.as_ref().map(ViewGoal::from);
         self.core.meta.plan = self.core.todos.clone();
         let usage = &self.core.session_usage;
