@@ -18,7 +18,7 @@ Git comparison.
   and reset time show on the provider page, in `borg accounts` and in
   `get_provider_capabilities`. Several Google accounts can be connected with
   `--account NAME`; Gemini switches between them only by hand unless you
-  choose an automatic strategy. Gemini never falls back to API-key billing.
+  choose an automatic strategy. The status bar names the plan by tier, such as "pro sub". Gemini never falls back to API-key billing.
 - A director whose session host retries after a database connection failure
   no longer loses its subagents. The retry used to restore every child while
   their still-running actors held the child locks, so `list_agents` showed

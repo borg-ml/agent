@@ -732,6 +732,10 @@ impl ProviderCapability {
                     (CodingProvider::Codex, "pro_500" | "pro-500" | "pro 500" | "pro500") => {
                         "pro 500".to_string()
                     }
+                    // Google reports "Google AI Pro"; the tier is what matters.
+                    (CodingProvider::Gemini, plan) if plan.starts_with("google ai ") => {
+                        format!("{} sub", &plan["google ai ".len()..])
+                    }
                     _ => format!("{plan} sub"),
                 })
                 .unwrap_or_else(|| "sub".to_string()),
@@ -3564,6 +3568,9 @@ mod tests {
             capability.usage.as_mut().unwrap().plan = Some(reported.to_string());
             assert_eq!(capability.billing_label().as_deref(), Some(expected));
         }
+        capability.provider = CodingProvider::Gemini;
+        capability.usage.as_mut().unwrap().plan = Some("Google AI Pro".to_string());
+        assert_eq!(capability.billing_label().as_deref(), Some("pro sub"));
         capability.billing = Some(BillingLane::Endpoint);
         assert_eq!(capability.billing_label().as_deref(), Some("endpoint"));
         assert_eq!(ProviderAuthMethod::ApiKey.label(), "api key");
