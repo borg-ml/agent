@@ -12606,6 +12606,23 @@ fn self_matching_pgrep_wait_loops_are_recognised() {
     assert!(refused(
         r#"until [ -z "$(pgrep -f 'cargo test')" ]; do sleep 1; done"#
     ));
+    // A here-document's body is data: the `while True:` of an embedded Python
+    // script opens no shell loop for a later one-shot `pgrep -f` to wait in.
+    assert!(!refused(
+        "cat > /tmp/guard.py <<'EOF'\nimport time\nwhile True:\n    time.sleep(5)\nEOF\n\
+         setsid nohup python3 /tmp/guard.py & disown\nsleep 1; pgrep -f /tmp/guard.py | head -2"
+    ));
+    assert!(!refused(
+        "cat <<-END > notes.txt\n\twhile pgrep -f build; do sleep 1; done\n\tEND\necho ok"
+    ));
+    // A real wait loop after a here-document is still one.
+    assert!(refused(
+        "cat > a.txt <<EOF\nwhile ready\nEOF\nwhile pgrep -f cargo; do sleep 1; done"
+    ));
+    // `<<` with no closing line (an arithmetic shift) hides nothing.
+    assert!(refused(
+        "echo $(( 1 << 2 ))\nwhile pgrep -f cargo; do sleep 1; done"
+    ));
     // `pgrep -f` that runs once beside a loop that terminates on its own.
     assert!(!refused(
         "cat /tmp/tests.log 2>/dev/null | tail -5; ls -t /run/jobs/ | head -3 | while read j; \

@@ -12981,6 +12981,10 @@ fn shell_tokens(command: &str) -> Vec<ShellToken> {
     let mut tokens = Vec::new();
     let (mut word, mut quoted, mut substitutes) = (String::new(), false, false);
     let mut quote = None;
+    // Here-documents opened on the current line: their bodies start after its
+    // newline and are data, not shell (a `while True:` in an embedded Python
+    // script is no loop).
+    let mut heredocs: Vec<(String, bool)> = Vec::new();
     let mut characters = command.chars().peekable();
     while let Some(character) = characters.next() {
         match (quote, character) {
@@ -13005,9 +13009,34 @@ fn shell_tokens(command: &str) -> Vec<ShellToken> {
             (None, '&') if word.ends_with(['<', '>']) || characters.peek() == Some(&'>') => {
                 word.push(character)
             }
+            (None, '<') if word.is_empty() && characters.peek() == Some(&'<') => {
+                characters.next();
+                if characters.next_if_eq(&'<').is_some() {
+                    // `<<<` is a here-string: an ordinary word follows.
+                    word.push_str("<<<");
+                } else if let Some(delimiter) = heredoc_delimiter(&mut characters) {
+                    heredocs.push(delimiter);
+                }
+            }
             (None, ';' | '&' | '|' | '(' | ')' | '`' | '\n') => {
                 flush(&mut tokens, &mut word, &mut quoted, &mut substitutes);
                 tokens.push(ShellToken::Break);
+                if character == '\n' {
+                    for (delimiter, strip_tabs) in std::mem::take(&mut heredocs) {
+                        // Skip the body only when its closing line exists: a `<<`
+                        // that was really an arithmetic shift skips nothing.
+                        let Some(length) = heredoc_body_length(
+                            &characters.clone().collect::<String>(),
+                            &delimiter,
+                            strip_tabs,
+                        ) else {
+                            break;
+                        };
+                        for _ in 0..length {
+                            characters.next();
+                        }
+                    }
+                }
             }
             (None, _) if character.is_whitespace() => {
                 flush(&mut tokens, &mut word, &mut quoted, &mut substitutes)
@@ -13017,6 +13046,51 @@ fn shell_tokens(command: &str) -> Vec<ShellToken> {
     }
     flush(&mut tokens, &mut word, &mut quoted, &mut substitutes);
     tokens
+}
+
+/// The delimiter after `<<` (and whether `<<-` strips leading tabs), with its
+/// quotes removed: `EOF`, `'EOF'`, `"EOF"`, `\EOF`.
+fn heredoc_delimiter(
+    characters: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Option<(String, bool)> {
+    let strip_tabs = characters.next_if_eq(&'-').is_some();
+    while characters
+        .next_if(|next| *next == ' ' || *next == '\t')
+        .is_some()
+    {}
+    let mut delimiter = String::new();
+    let mut open = None;
+    while let Some(&next) = characters.peek() {
+        match open {
+            Some(quote) if next == quote => open = None,
+            Some(_) => delimiter.push(next),
+            None if next == '\'' || next == '"' => open = Some(next),
+            None if next == '\\' => {}
+            None if next.is_whitespace() || ";&|()<>".contains(next) => break,
+            None => delimiter.push(next),
+        }
+        characters.next();
+    }
+    (!delimiter.is_empty()).then_some((delimiter, strip_tabs))
+}
+
+/// Characters from the start of `rest` through a here-document's closing
+/// line, or `None` when no line closes it.
+fn heredoc_body_length(rest: &str, delimiter: &str, strip_tabs: bool) -> Option<usize> {
+    let mut length = 0;
+    for line in rest.split_inclusive('\n') {
+        length += line.chars().count();
+        let text = line.strip_suffix('\n').unwrap_or(line);
+        let text = if strip_tabs {
+            text.trim_start_matches('\t')
+        } else {
+            text
+        };
+        if text == delimiter {
+            return Some(length);
+        }
+    }
+    None
 }
 
 /// Seconds slept by a command that does nothing but sleep, optionally

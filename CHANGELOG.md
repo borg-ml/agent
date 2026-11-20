@@ -5,6 +5,10 @@ Git comparison.
 
 ## Unreleased (since 0.22.1)
 
+- A command that writes a script through a here-document is no longer refused
+  as a `pgrep -f` wait loop because the script's own `while` loop (for example
+  Python's `while True:`) was read as shell: here-document bodies are data.
+
 ## 0.22.1 (2026-11-19)
 
 - An agent blocked waiting for its subagents (`wait_agent`) shows as
