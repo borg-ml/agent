@@ -2447,12 +2447,16 @@ async fn compact_native_context_now(
                 },
             )
             .await?;
+            let post_compaction_tokens = estimated_post_compaction_context_tokens(
+                journal.context_events(),
+                launch.provider,
+            );
             record(
                 journal,
                 events,
                 session_id,
                 SessionEventKind::ContextWindowUpdated {
-                    context_tokens: 0,
+                    context_tokens: post_compaction_tokens,
                     context_window_tokens,
                 },
             )
@@ -5051,12 +5055,17 @@ async fn run_agent_session_store_kernel_inner(
                                     && let Some(context_window_tokens) =
                                         journal.state(session_id).await?.usage.context_window_tokens
                                 {
+                                    let post_compaction_tokens =
+                                        estimated_post_compaction_context_tokens(
+                                            journal.context_events(),
+                                            launch.provider,
+                                        );
                                     record(
                                         &mut journal,
                                         &events,
                                         session_id,
                                         SessionEventKind::ContextWindowUpdated {
-                                            context_tokens: 0,
+                                            context_tokens: post_compaction_tokens,
                                             context_window_tokens,
                                         },
                                     )
@@ -8551,6 +8560,15 @@ pub(crate) fn native_conversation(
     provider: CodingProvider,
 ) -> Result<Vec<borg_provider::provider::ModelMessage>> {
     native_conversation_with_images(events, provider, HashMap::new())
+}
+
+fn estimated_post_compaction_context_tokens(
+    events: &[SessionEvent],
+    provider: CodingProvider,
+) -> u64 {
+    native_conversation(events, provider)
+        .map(|messages| crate::native_harness::estimated_messages_tokens(&messages))
+        .unwrap_or(0)
 }
 
 async fn native_conversation_with_historical_images(

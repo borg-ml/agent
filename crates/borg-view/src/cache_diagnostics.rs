@@ -266,7 +266,7 @@ impl CacheDiagnostics {
 
     pub fn update_context_tokens(&mut self, tokens: u64) {
         if let Some(previous) = self.previous.as_mut() {
-            previous.reusable_context_tokens = Some(tokens);
+            previous.reusable_context_tokens = (tokens > 0).then_some(tokens);
         }
     }
 
@@ -1149,6 +1149,116 @@ mod tests {
         assert_eq!(
             idle.cause,
             CacheMissCause::Idle(Duration::from_secs(31 * 60 - 1))
+        );
+    }
+
+    #[test]
+    fn zero_context_tokens_does_not_claim_zero_token_resend() {
+        let mut diagnostics = CacheDiagnostics::default();
+        let at = Utc::now();
+        diagnostics.observe(at, signature("gpt-5.6-sol", "high"), usage(1_000, 99_000));
+        diagnostics.update_context_tokens(0);
+        let status = diagnostics
+            .status(at, &signature("gpt-5.6-sol", "low"))
+            .expect("effort change warning");
+        assert_eq!(status.resend_tokens, None);
+        let guidance = status.cold_cache_guidance();
+        assert!(!guidance.contains("0 tokens"), "{guidance}");
+    }
+
+    #[test]
+    fn completed_compaction_clears_summarizer_usage_from_cache_diagnostics() {
+        use crate::core::{SessionDisplayConfig, TranscriptCore};
+        use borg_agent_runtime::{
+            PermissionMode, ResponseLanguage, SessionEvent, SessionEventKind, SpeedSupport,
+        };
+        use std::path::PathBuf;
+        use uuid::Uuid;
+
+        let mut core = TranscriptCore::default();
+        let session_id = Uuid::new_v4();
+        let op_id = Uuid::new_v4();
+        let at = Utc::now();
+        let mut seq = 1u64;
+        let mut push = |core: &mut TranscriptCore, kind: SessionEventKind| {
+            let event = SessionEvent {
+                id: Uuid::new_v4(),
+                session_id,
+                sequence: seq,
+                created_at: at,
+                kind,
+            };
+            seq += 1;
+            core.apply(&event);
+        };
+        core.config = Some(SessionDisplayConfig {
+            cwd: PathBuf::from("/tmp"),
+            provider: CodingProvider::Codex,
+            model: Some("gpt-5.6-sol".to_string()),
+            effort: Some("high".to_string()),
+            response_language: ResponseLanguage::English,
+            fast: false,
+            ultrafast: false,
+            permission_mode: PermissionMode::FullAccess,
+            speed_support: SpeedSupport::default(),
+        });
+        push(
+            &mut core,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "context_compaction".to_string(),
+                payload: serde_json::json!({
+                    "operation_id": op_id,
+                    "status": "started",
+                    "summary": "Compacting context",
+                }),
+            },
+        );
+        // The compaction summarizer records its own usage before the completed
+        // boundary event arrives.
+        push(
+            &mut core,
+            SessionEventKind::UsageUpdated {
+                provider_duration_ms: 0,
+                turn_id: None,
+                provider_context_reused: None,
+                input_tokens: 1_000,
+                output_tokens: 500,
+                cached_input_tokens: 50_000,
+                cache_creation_input_tokens: 0,
+                total_tokens: 51_500,
+                context_tokens: Some(51_000),
+                context_window_tokens: Some(200_000),
+                cost_usd: None,
+                cost_microusd: None,
+                cost_basis: "unavailable".to_string(),
+            },
+        );
+        push(
+            &mut core,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "context_compaction".to_string(),
+                payload: serde_json::json!({
+                    "operation_id": op_id,
+                    "status": "completed",
+                    "summary": "Compacted checkpoint summary",
+                    "native": true,
+                }),
+            },
+        );
+        push(
+            &mut core,
+            SessionEventKind::ContextWindowUpdated {
+                context_tokens: 1_200,
+                context_window_tokens: 200_000,
+            },
+        );
+        assert!(
+            core.cache_diagnostics
+                .status(at, &signature("gpt-5.6-sol", "low"))
+                .is_none(),
+            "completed compaction must clear the summarizer call from cache diagnostics"
         );
     }
 }

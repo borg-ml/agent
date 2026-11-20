@@ -2875,6 +2875,11 @@ impl TranscriptCore {
         if existing.is_none() && started {
             self.finish_reasoning(event.created_at);
             self.cache_diagnostics.reset();
+        } else if state == ExecutionState::Complete {
+            // The compaction summarizer emits UsageUpdated before its completed
+            // boundary event; forget that summarizer request so it is not
+            // treated as a warm conversation prefix for the next turn.
+            self.cache_diagnostics.reset();
         }
         if let Some(index) = existing {
             if let Some(TranscriptEntry::Compaction {

@@ -26828,3 +26828,33 @@ async fn model_switch_rebinds_the_live_executor_before_replaying_context() {
     actor.await.unwrap().unwrap();
     scratch.discard().await;
 }
+
+#[test]
+fn estimated_post_compaction_context_tokens_counts_summary_and_retained_tail() {
+    let session_id = Uuid::new_v4();
+    let summary = "Checkpoint summary ".repeat(40);
+    let tail = vec![borg_provider::provider::ModelMessage::user(
+        "Recent retained request ".repeat(20),
+    )];
+    let events = vec![SessionEvent {
+        id: Uuid::new_v4(),
+        session_id,
+        sequence: 1,
+        created_at: chrono::Utc::now(),
+        kind: SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "context_compaction".to_string(),
+            payload: serde_json::json!({
+                "status": "completed",
+                "native": true,
+                "summary": summary,
+                COMPACTION_RETAINED_TAIL_FIELD: tail,
+            }),
+        },
+    }];
+    let tokens = estimated_post_compaction_context_tokens(&events, CodingProvider::Codex);
+    assert!(
+        tokens > 0,
+        "post-compaction context tokens must count the summary and retained tail, got {tokens}"
+    );
+}

@@ -5,6 +5,8 @@ Git comparison.
 
 ## Unreleased (since 0.22.1)
 
+- After automatic or manual `/compact` compaction, the context gauge now estimates the post-compaction context size from the compaction summary and retained tail instead of resetting to 0 tokens, and completed compactions clear the summarizer call from prompt-cache diagnostics so cold-cache warnings no longer report "up to 0 tokens".
+
 - A command that writes a script through a here-document is no longer refused
   as a `pgrep -f` wait loop because the script's own `while` loop (for example
   Python's `while True:`) was read as shell: here-document bodies are data.
