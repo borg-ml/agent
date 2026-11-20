@@ -18,10 +18,12 @@ const MAX_BLU_EXTENSIONS: usize = 128;
 const MAX_EXTENSION_HISTORY_VERSIONS: usize = 32;
 /// Settings sections that change what Borg will execute or trust: MCP server
 /// commands, extension trust policy, approval reviewers, provider gateways, and
-/// capability grants. A model writing these is escalating its own privileges,
-/// so the write needs a human decision in every mode short of Full Access.
+/// capability grants, and model routes that may opt into API billing. A model
+/// writing these is escalating its own privileges, so the write needs a human
+/// decision in every mode short of Full Access.
 pub(crate) const TRUSTED_SETTINGS_SECTIONS: &[&str] = &[
     "scout",
+    "models",
     "mcp",
     "extensions",
     "approvals",
@@ -50,6 +52,7 @@ pub(crate) fn trusted_settings_sections(tool: &str, arguments: &Value) -> Vec<St
 
 const SETTINGS_SECTIONS: &[&str] = &[
     "scout",
+    "models",
     "capabilities",
     "prompt",
     "extensions",
@@ -226,7 +229,7 @@ impl SelfServiceContext {
             "hot_reload": ["commands.aliases", "keybindings", "scout", "search"],
             "next_turn_reload": ["extensions", "mcp", "providers"],
             "restart_required": [
-                "capabilities", "team", "approvals", "updates", "prompt"
+                "capabilities", "team", "approvals", "updates", "prompt", "models"
             ]
         }))
     }
@@ -368,9 +371,9 @@ impl SelfServiceContext {
             "hot_reloaded": ["commands.aliases", "keybindings", "scout"],
             "next_turn_reloaded": ["extensions", "mcp"],
             "restart_required": [
-                "capabilities", "team", "approvals", "updates", "prompt"
+                "capabilities", "team", "approvals", "updates", "prompt", "models"
             ],
-            "note": "Aliases and keybindings reload in the running TUI; scout settings apply on the next scout call. Blu and base MCP catalogs swap at the next turn boundary; capability/team/approval/update/prompt changes require a new session."
+            "note": "Aliases and keybindings reload in the running TUI; scout settings apply on the next scout call. Blu and base MCP catalogs swap at the next turn boundary; capability/team/approval/update/prompt/models changes require a new session."
         }))
     }
 
@@ -2198,6 +2201,51 @@ fn validate_settings_shape(root: &toml::Value) -> Result<()> {
         let settings: crate::subagents::ScoutSettings = scout.clone().try_into()?;
         settings.routes()?;
     }
+    if let Some(models) = root.get("models") {
+        check_keys(models, &["fallback", "chains"], "models")?;
+        let mut lists = Vec::new();
+        if let Some(fallback) = models.get("fallback") {
+            lists.push(("models.fallback".to_string(), fallback));
+        }
+        if let Some(chains) = models.get("chains") {
+            let chains = chains.as_table().context("models.chains must be a table")?;
+            lists.extend(
+                chains
+                    .iter()
+                    .map(|(name, chain)| (format!("models.chains.{name}"), chain)),
+            );
+        }
+        for (name, list) in lists {
+            let entries = list
+                .as_array()
+                .with_context(|| format!("{name} must be an array"))?;
+            for entry in entries {
+                let spec = match entry {
+                    toml::Value::String(spec) => spec.as_str(),
+                    toml::Value::Table(route) => {
+                        check_table_keys(route, &["route", "allow_api_billing"], &name)?;
+                        ensure!(
+                            route
+                                .get("allow_api_billing")
+                                .is_none_or(toml::Value::is_bool),
+                            "{name}: allow_api_billing must be a boolean"
+                        );
+                        route
+                            .get("route")
+                            .and_then(toml::Value::as_str)
+                            .with_context(|| {
+                                format!("{name}: a route table needs a `route` string")
+                            })?
+                    }
+                    _ => bail!("{name} entries must be route strings or route tables"),
+                };
+                if !spec.trim().starts_with("chain:") {
+                    crate::ModelRoute::parse(spec)
+                        .with_context(|| format!("{name}: invalid route `{spec}`"))?;
+                }
+            }
+        }
+    }
     if let Some(search) = root.get("search") {
         check_keys(search, &["backend"], "search")?;
         if let Some(backend) = search.get("backend") {
@@ -2855,6 +2903,32 @@ sibling_flag = "theirs"
         assert_eq!(selected.expect("readable"), exa_mcp);
         assert!(rejected.is_err());
         assert_eq!(after_rejection.expect("readable"), exa_mcp);
+    }
+
+    #[test]
+    fn models_settings_are_trusted_and_every_route_is_validated() {
+        let models = |value: Value| json_to_toml(json!({ "models": value })).unwrap();
+        assert_eq!(
+            trusted_settings_sections("update_agent_settings", &json!({"updates": {"models": {}}})),
+            ["models"]
+        );
+        validate_settings_shape(&models(json!({
+            "fallback": ["gemini-4-neon@high", "chain:paid"],
+            "chains": {"paid": [{"route": "gpt-6.1-sol@xhigh", "allow_api_billing": true}]}
+        })))
+        .expect("valid chain");
+        for invalid in [
+            json!({"fallback": [" "]}),
+            json!({"fallback": [42]}),
+            json!({"fallback": [{"route": "gpt-6.1-sol", "allow_api_billing": "yes"}]}),
+            json!({"chains": {"paid": ["@high"]}}),
+            json!({"fallbacks": []}),
+        ] {
+            assert!(
+                validate_settings_shape(&models(invalid.clone())).is_err(),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]

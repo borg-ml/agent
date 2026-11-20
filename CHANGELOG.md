@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.22.1)
 
+- `update_agent_settings` can now edit `[models]` (the fallback chain and named
+  chains). Each route is validated before saving; like other trust-bearing
+  sections, the write needs approval short of Full Access, and the new chain
+  applies to new sessions.
+
 - After automatic or manual `/compact` compaction, the context gauge now estimates the post-compaction context size from the compaction summary and retained tail instead of resetting to 0 tokens, and completed compactions clear the summarizer call from prompt-cache diagnostics so cold-cache warnings no longer report "up to 0 tokens".
 
 - A command that writes a script through a here-document is no longer refused
