@@ -23,7 +23,9 @@ impl ProviderModelCatalog {
     }
 }
 
-pub const CODEX_SELECTABLE_MODELS: [(&str, &str); 5] = [
+pub const CODEX_SELECTABLE_MODELS: [(&str, &str); 7] = [
+    ("gpt-6.2-astra", "Astra 6.2"),
+    ("gpt-6.2-sol", "Sol 6.2"),
     ("gpt-6-astra", "Astra"),
     ("gpt-6.1-sol", "Sol 6.1"),
     ("gpt-6.1-terra", "Terra 6.1"),

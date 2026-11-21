@@ -5,6 +5,10 @@ Git comparison.
 
 ## Unreleased (since 0.22.1)
 
+- Added `gpt-6.2-astra` (Astra 6.2) and `gpt-6.2-sol` (Sol 6.2) to the
+  Codex model picker, subagent and peer model choices, with their 1.05M
+  context window on the OpenAI API route.
+
 - Gemini `/usage` (and `/status`, `borg accounts`, the Providers page, and
   `get_provider_capabilities`) now reads Google's quota summary to show both
   the 5-hour rolling and weekly allowance windows alongside any separate
