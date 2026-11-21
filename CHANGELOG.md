@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.22.1)
+## Unreleased (since 0.22.2)
+
+## 0.22.2 (2026-11-21)
 
 - Added `gpt-6.2-astra` (Astra 6.2) and `gpt-6.2-sol` (Sol 6.2) to the
   Codex model picker, subagent and peer model choices, with their 1.05M
