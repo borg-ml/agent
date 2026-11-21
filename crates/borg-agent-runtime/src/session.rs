@@ -2447,10 +2447,8 @@ async fn compact_native_context_now(
                 },
             )
             .await?;
-            let post_compaction_tokens = estimated_post_compaction_context_tokens(
-                journal.context_events(),
-                launch.provider,
-            );
+            let post_compaction_tokens =
+                estimated_post_compaction_context_tokens(journal.context_events(), launch.provider);
             record(
                 journal,
                 events,
