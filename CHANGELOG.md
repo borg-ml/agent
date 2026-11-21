@@ -5,6 +5,17 @@ Git comparison.
 
 ## Unreleased (since 0.22.1)
 
+- Gemini `/usage` (and `/status`, `borg accounts`, the Providers page, and
+  `get_provider_capabilities`) now reads Google's quota summary to show both
+  the 5-hour rolling and weekly allowance windows alongside any separate
+  per-model weekly pool (such as Gemini 4 Argon), instead of only the rolling
+  per-model windows; multi-account Gemini balancing now also uses those shared
+  pool windows.
+
+- Reasoning blocks and the `Action details · Reasoned` view now keep a blank
+  line between thinking paragraphs instead of packing every paragraph flush
+  against the next.
+
 - `update_agent_settings` can now edit `[models]` (the fallback chain and named
   chains). Each route is validated before saving; like other trust-bearing
   sections, the write needs approval short of Full Access, and the new chain

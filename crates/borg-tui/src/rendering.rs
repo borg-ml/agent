@@ -191,6 +191,9 @@ struct ReasoningWrap {
     /// The completed-line prefix these lines cover, byte for byte.
     covered: String,
     lines: Vec<Line<'static>>,
+    /// A blank line arrived after the last rendered paragraph; emit one blank
+    /// separator line before the next non-empty line, never at the top or end.
+    pending_blank: bool,
 }
 
 thread_local! {
@@ -214,7 +217,14 @@ fn reasoning_lines(source: &str, width: usize) -> Vec<Line<'static>> {
         // unit and none of it is stable to reuse between frames: a trailing
         // `**` turns a plain line into a bold one. Nothing to do but redo it.
         REASONING_WRAP.with(|cell| *cell.borrow_mut() = None);
-        return wrap_reasoning_items(reasoning_items_from_lines(source.lines()), width);
+        let mut lines = Vec::new();
+        let mut pending_blank = false;
+        append_reasoning_lines(source.lines(), width, &mut lines, &mut pending_blank);
+        return if lines.is_empty() {
+            vec![Line::default()]
+        } else {
+            lines
+        };
     }
     incremental_reasoning_lines(source, width)
 }
@@ -231,27 +241,27 @@ fn incremental_reasoning_lines(source: &str, width: usize) -> Vec<Line<'static>>
     let reusable = REASONING_WRAP
         .with(|cell| cell.borrow_mut().take())
         .filter(|wrap| wrap.width == width && completed.starts_with(&wrap.covered));
-    let (covered, mut lines) = reusable.map_or_else(
-        || (String::new(), Vec::new()),
-        |wrap| (wrap.covered, wrap.lines),
+    let (covered, mut lines, mut pending_blank) = reusable.map_or_else(
+        || (String::new(), Vec::new(), false),
+        |wrap| (wrap.covered, wrap.lines, wrap.pending_blank),
     );
     if completed.len() > covered.len() {
-        lines.extend(wrap_reasoning_items(
-            reasoning_items_from_lines(completed[covered.len()..].lines()),
+        append_reasoning_lines(
+            completed[covered.len()..].lines(),
             width,
-        ));
+            &mut lines,
+            &mut pending_blank,
+        );
     }
     // Only the completed prefix is kept. The line still being written is
     // wrapped into the returned lines but never into the cache: caching it
     // would append it again on the next frame, and it is the one line whose
     // content can still change.
     let cacheable = lines.clone();
+    let cacheable_pending_blank = pending_blank;
     let tail = &source[completed.len()..];
     if !tail.trim().is_empty() {
-        lines.extend(wrap_reasoning_items(
-            reasoning_items_from_lines(tail.lines()),
-            width,
-        ));
+        append_reasoning_lines(tail.lines(), width, &mut lines, &mut pending_blank);
     }
     if lines.is_empty() {
         return vec![Line::default()];
@@ -261,53 +271,51 @@ fn incremental_reasoning_lines(source: &str, width: usize) -> Vec<Line<'static>>
             width,
             covered: completed.to_string(),
             lines: cacheable,
+            pending_blank: cacheable_pending_blank,
         });
     });
     lines
 }
 
-fn wrap_reasoning_items(
-    items: impl IntoIterator<Item = String>,
+/// Pure line-by-line wrapping that preserves a single blank separator line
+/// between paragraphs while ignoring leading, trailing, or repeated blank lines.
+fn append_reasoning_lines<'a>(
+    raw_lines: impl Iterator<Item = &'a str>,
     width: usize,
-) -> Vec<Line<'static>> {
-    items
-        .into_iter()
-        .flat_map(|item| {
-            super::wrap_display(&item, width.max(1))
-                .into_iter()
-                .map(|line| {
-                    Line::from(Span::styled(
-                        line,
-                        Style::default()
-                            .fg(Color::Gray)
-                            .add_modifier(Modifier::ITALIC),
-                    ))
-                })
-        })
-        .collect()
-}
-
-/// The non-bold path's per-line extraction, kept separate from the choice
-/// between the two paths so the incremental render can reuse it line by line.
-///
-/// Pure per line, which is what makes reuse sound: a terminated line yields the
-/// same items for the rest of the stream's life.
-fn reasoning_items_from_lines<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<String> {
-    lines
-        .filter_map(|raw_line| {
-            let line = raw_line.trim();
-            if line.is_empty() {
-                return None;
+    out: &mut Vec<Line<'static>>,
+    pending_blank: &mut bool,
+) {
+    let style = Style::default()
+        .fg(Color::Gray)
+        .add_modifier(Modifier::ITALIC);
+    let width = width.max(1);
+    for raw_line in raw_lines {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            if !out.is_empty() {
+                *pending_blank = true;
             }
-            let line = line.replace("**", "");
-            let line = line
-                .strip_prefix("• ")
-                .or_else(|| line.strip_prefix("- "))
-                .or_else(|| line.strip_prefix("* "))
-                .unwrap_or(line.as_str());
-            Some(line.to_string())
-        })
-        .collect()
+            continue;
+        }
+        let line = line.replace("**", "");
+        let line = line
+            .strip_prefix("• ")
+            .or_else(|| line.strip_prefix("- "))
+            .or_else(|| line.strip_prefix("* "))
+            .unwrap_or(line.as_str())
+            .trim();
+        if line.is_empty() {
+            continue;
+        }
+        if std::mem::take(pending_blank) {
+            out.push(Line::default());
+        }
+        out.extend(
+            super::wrap_display(line, width)
+                .into_iter()
+                .map(|wrapped| Line::from(Span::styled(wrapped, style))),
+        );
+    }
 }
 
 fn bold_reasoning_thoughts(mut source: &str) -> Option<Vec<&str>> {
@@ -1748,6 +1756,48 @@ mod tests {
         assert_eq!(lines[1].to_string(), "  │ Restoring card padding");
         assert!(lines.iter().all(|line| !line.to_string().contains("**")));
         assert!(lines.iter().all(|line| !line.to_string().contains('•')));
+    }
+
+    /// Models separate thinking paragraphs with blank lines (`\n\n` or
+    /// `\n\n\n`). Keeping one blank line between paragraphs — both on a full
+    /// render and as blank lines stream in incrementally — prevents dense walls
+    /// of italic text while avoiding leading, trailing, or doubled blank rows.
+    #[test]
+    fn reasoning_renderer_separates_paragraphs_with_a_blank_line_even_incrementally() {
+        let render = |source: &str| {
+            super::reasoning_lines(source, 80)
+                .iter()
+                .map(Line::to_string)
+                .collect::<Vec<_>>()
+        };
+
+        let full = "\n\nFirst paragraph.\n\n\nSecond paragraph.\n\nThird paragraph.\n\n\n";
+        let expected = vec![
+            "First paragraph.",
+            "",
+            "Second paragraph.",
+            "",
+            "Third paragraph.",
+        ];
+        assert_eq!(render(full), expected);
+
+        // Stream across newline boundaries to exercise `pending_blank` in the
+        // incremental wrap cache.
+        let mut streamed = String::new();
+        for piece in [
+            "First paragraph.",
+            "\n",
+            "\n",
+            "\n",
+            "Second",
+            " paragraph.",
+            "\n\n",
+            "Third paragraph.\n\n\n",
+        ] {
+            streamed.push_str(piece);
+            let _ = render(&streamed);
+        }
+        assert_eq!(render(&streamed), expected);
     }
 
     #[test]

@@ -631,34 +631,33 @@ fn claude_provider_usage(
     }
 }
 
-/// Gemini meters each model separately. The provider is exhausted only when
-/// every model is, since a session can still switch to one with capacity.
+/// Gemini meters its shared model pool (5-hour and weekly) globally, plus any
+/// separate per-model bucket such as Gemini 4 Argon. When global pool windows
+/// are present, exhausting any global window exhausts the provider; when only
+/// per-model fallback windows are reported, every model must be exhausted.
 fn gemini_provider_usage(quota: borg_provider::gemini_subscription::Quota) -> ProviderUsage {
-    // Every thinking tier of a model shares one allowance, so one row per
-    // model ("Gemini 4 Neon (High)" and "(Low)" become "Gemini 4 Neon").
-    let mut windows: Vec<ProviderUsageWindow> = Vec::new();
-    for window in quota.windows {
-        let Some(remaining) = window.remaining_fraction else {
-            continue;
-        };
-        let label = window
-            .label
-            .split(" (")
-            .next()
-            .unwrap_or(&window.label)
-            .to_string();
-        let used_percent = (100.0 - remaining * 100.0).round().clamp(0.0, 100.0) as u8;
-        match windows.iter_mut().find(|known| known.label == label) {
-            Some(known) => known.used_percent = known.used_percent.max(used_percent),
-            None => windows.push(ProviderUsageWindow {
-                label,
+    let windows: Vec<ProviderUsageWindow> = quota
+        .windows
+        .into_iter()
+        .filter_map(|window| {
+            let remaining = window.remaining_fraction?;
+            let used_percent = (100.0 - remaining * 100.0).round().clamp(0.0, 100.0) as u8;
+            Some(ProviderUsageWindow {
+                label: window.label,
                 used_percent,
                 resets_at: window.resets_at,
-                global: false,
-            }),
-        }
-    }
-    let exhausted = !windows.is_empty() && windows.iter().all(|window| window.used_percent >= 100);
+                global: window.global,
+            })
+        })
+        .collect();
+    let has_global = windows.iter().any(|window| window.global);
+    let exhausted = if has_global {
+        windows
+            .iter()
+            .any(|window| window.global && window.used_percent >= 100)
+    } else {
+        !windows.is_empty() && windows.iter().all(|window| window.used_percent >= 100)
+    };
     ProviderUsage {
         availability: if windows.is_empty() {
             ProviderUsageAvailability::Unknown
@@ -868,6 +867,53 @@ mod tests {
     /// The Go plan reports its own allowance, so its windows drive admission
     /// like any other reported quota: a blocked or fully spent window stops new
     /// work on that login instead of letting a turn fail mid-flight.
+    /// Gemini's shared 5-hour and weekly windows govern the provider globally,
+    /// while a separate per-model window such as Gemini 4 Argon stays advisory
+    /// so spending Argon alone does not mark the whole subscription exhausted.
+    #[test]
+    fn gemini_global_weekly_and_rolling_windows_gate_admission() {
+        use borg_provider::gemini_subscription::{Quota, QuotaWindow};
+        let window = |label: &str, remaining: f64, global: bool| QuotaWindow {
+            label: label.to_string(),
+            remaining_fraction: Some(remaining),
+            resets_at: None,
+            global,
+        };
+
+        // Model-scoped Argon exhausted while global 5-hour and Weekly still have headroom.
+        let usage = gemini_provider_usage(Quota {
+            tier: Some("Google AI Pro".to_string()),
+            windows: vec![
+                window("5-hour", 0.85, true),
+                window("Weekly", 0.60, true),
+                window("Weekly · Gemini 4 Argon", 0.0, false),
+            ],
+        });
+        assert_eq!(usage.availability, ProviderUsageAvailability::Available);
+        assert_eq!(usage.windows.len(), 3);
+        assert!(usage.windows[0].global && usage.windows[1].global);
+        assert!(!usage.windows[2].global);
+
+        // Exhausting either global pool window marks Gemini exhausted and blocks admission.
+        for exhausted_windows in [
+            vec![window("5-hour", 0.0, true), window("Weekly", 0.60, true)],
+            vec![window("5-hour", 0.85, true), window("Weekly", 0.0, true)],
+        ] {
+            let mut capability = subscription_capability(CodingProvider::Gemini);
+            capability.authenticated = true;
+            capability.can_spawn = true;
+            capability.usage = Some(gemini_provider_usage(Quota {
+                tier: Some("Google AI Pro".to_string()),
+                windows: exhausted_windows,
+            }));
+            apply_spawn_admission(&mut capability);
+            assert!(
+                !capability.can_spawn,
+                "an exhausted global Gemini window must not admit new work"
+            );
+        }
+    }
+
     #[test]
     fn opencode_go_windows_reach_the_capability_and_gate_admission() {
         use borg_provider::provider::opencode_model::UsageWindow;

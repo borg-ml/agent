@@ -236,9 +236,8 @@ async fn wire_model(model: &str, effort: Option<&str>, auth_file: Option<PathBuf
         .map(|(_, ids)| ids);
     let ids = match cached {
         Some(ids) => ids,
-        None => match gemini_subscription::quota(auth_file).await {
-            Ok(quota) => {
-                let ids: Vec<String> = quota.windows.into_iter().map(|w| w.model).collect();
+        None => match gemini_subscription::available_model_ids(auth_file).await {
+            Ok(ids) => {
                 if let Ok(mut cache) = CACHE.lock() {
                     *cache = Some((Instant::now(), ids.clone()));
                 }

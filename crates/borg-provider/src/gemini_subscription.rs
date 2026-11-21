@@ -425,14 +425,15 @@ async fn checked_json(response: reqwest::Response, label: &str) -> Result<Value>
     response_json(response).await
 }
 
-/// One model the subscription serves, with its remaining allowance.
+/// One allowance window reported by a Gemini subscription.
 #[derive(Clone, Debug, PartialEq)]
 pub struct QuotaWindow {
-    /// The wire id, which may carry a thinking tier (`gemini-3.8-flash-high`).
-    pub model: String,
     pub label: String,
     pub remaining_fraction: Option<f64>,
     pub resets_at: Option<chrono::DateTime<Utc>>,
+    /// Whether exhausting this window stops the shared Gemini model pool
+    /// (5-hour and weekly pool limits) rather than one separate model.
+    pub global: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -441,16 +442,83 @@ pub struct Quota {
     pub windows: Vec<QuotaWindow>,
 }
 
-/// The models this login may select and each one's remaining allowance, in the
-/// order Antigravity lists them. Never starts a model turn.
+enum CodeAssistError {
+    Auth(anyhow::Error),
+    Other(anyhow::Error),
+}
+
+impl CodeAssistError {
+    fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            Self::Auth(error) | Self::Other(error) => error,
+        }
+    }
+}
+
+/// The wire model ids this login can call, in the order Antigravity lists them.
+pub(crate) async fn available_model_ids(auth_file: Option<PathBuf>) -> Result<Vec<String>> {
+    let mut access = access_from(auth_file.clone(), None).await?;
+    let client = client()?;
+    let response = post_project_json(
+        &client,
+        &mut access,
+        &auth_file,
+        "fetchAvailableModels",
+        "Gemini model list",
+    )
+    .await
+    .map_err(CodeAssistError::into_anyhow)?;
+    Ok(listed_gemini_model_ids(&response))
+}
+
+/// The subscription's remaining allowance windows: prefers the pooled summary
+/// (`retrieveUserQuotaSummary`, which exposes both 5-hour rolling and weekly
+/// windows plus separate model pools such as Gemini 4 Argon) and falls back to
+/// per-model `fetchAvailableModels` when the summary is unavailable or empty.
+/// Never starts a model turn.
 pub async fn quota(auth_file: Option<PathBuf>) -> Result<Quota> {
     let path = match &auth_file {
         Some(path) => path.clone(),
         None => auth_path()?,
     };
     let tier = account_at(&path)?.and_then(|account| account.tier);
-    let response = available_models(auth_file).await?;
-    let models = response["models"].as_object().cloned().unwrap_or_default();
+    let mut access = access_from(auth_file.clone(), None).await?;
+    let client = client()?;
+    match post_project_json(
+        &client,
+        &mut access,
+        &auth_file,
+        "retrieveUserQuotaSummary",
+        "Gemini quota summary",
+    )
+    .await
+    {
+        Ok(summary) => {
+            let windows = quota_windows_from_summary(&summary);
+            if !windows.is_empty() {
+                return Ok(Quota { tier, windows });
+            }
+        }
+        Err(CodeAssistError::Auth(error)) => return Err(error),
+        Err(CodeAssistError::Other(_)) => {}
+    }
+    let models = post_project_json(
+        &client,
+        &mut access,
+        &auth_file,
+        "fetchAvailableModels",
+        "Gemini model list",
+    )
+    .await
+    .map_err(CodeAssistError::into_anyhow)?;
+    Ok(Quota {
+        tier,
+        windows: quota_windows_from_models(&models),
+    })
+}
+
+fn listed_gemini_model_ids(response: &Value) -> Vec<String> {
+    let models = response["models"].as_object();
     // The backend also lists retired aliases and routing ids; Antigravity
     // shows only the ids in its model groups.
     let mut listed: Vec<String> = response["agentModelSorts"]
@@ -461,58 +529,204 @@ pub async fn quota(auth_file: Option<PathBuf>) -> Result<Quota> {
         .flat_map(|group| group["modelIds"].as_array().into_iter().flatten())
         .filter_map(|id| id.as_str().map(str::to_owned))
         .collect();
-    if listed.is_empty() {
+    if listed.is_empty()
+        && let Some(models) = models
+    {
         listed = models.keys().cloned().collect();
     }
-    let mut windows = Vec::new();
+    let mut ids = Vec::new();
     for id in listed {
-        if windows
-            .iter()
-            .any(|window: &QuotaWindow| window.model == id)
-            || !id.starts_with("gemini-")
-            || id.contains("image")
-        {
+        if ids.contains(&id) || !id.starts_with("gemini-") || id.contains("image") {
             continue;
         }
-        let model = &models.get(&id).cloned().unwrap_or_default();
-        windows.push(QuotaWindow {
-            label: model["displayName"].as_str().unwrap_or(&id).to_owned(),
-            remaining_fraction: model["quotaInfo"]["remainingFraction"]
-                .as_f64()
-                .map(|fraction| fraction.clamp(0.0, 1.0)),
-            resets_at: model["quotaInfo"]["resetTime"]
-                .as_str()
-                .and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok())
-                .map(|time| time.with_timezone(&Utc)),
-            model: id,
-        });
+        ids.push(id);
     }
-    Ok(Quota { tier, windows })
+    ids
+}
+
+fn parse_reset_time(value: &Value) -> Option<chrono::DateTime<Utc>> {
+    value
+        .as_str()
+        .and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok())
+        .map(|time| time.with_timezone(&Utc))
+}
+
+fn quota_windows_from_summary(response: &Value) -> Vec<QuotaWindow> {
+    let mut raw_buckets: Vec<(Option<&str>, &Value)> = Vec::new();
+    if let Some(groups) = response["groups"].as_array() {
+        for group in groups {
+            let group_name = group["displayName"]
+                .as_str()
+                .map(str::trim)
+                .filter(|name| !name.is_empty());
+            if let Some(buckets) = group["buckets"].as_array() {
+                for bucket in buckets {
+                    raw_buckets.push((group_name, bucket));
+                }
+            }
+        }
+    }
+    if raw_buckets.is_empty()
+        && let Some(buckets) = response["buckets"].as_array()
+    {
+        for bucket in buckets {
+            raw_buckets.push((None, bucket));
+        }
+    }
+
+    let mut seen_ids: Vec<String> = Vec::new();
+    let mut ranked: Vec<(u8, QuotaWindow)> = Vec::new();
+    for (group_name, bucket) in raw_buckets {
+        if bucket["disabled"].as_bool() == Some(true) {
+            continue;
+        }
+        let bucket_id = bucket["bucketId"].as_str().unwrap_or_default().trim();
+        let id = bucket_id.to_ascii_lowercase();
+        if !id.starts_with("gemini-") || seen_ids.contains(&id) {
+            continue;
+        }
+        let resets_at = parse_reset_time(&bucket["resetTime"]);
+        let remaining_fraction = bucket["remainingFraction"]
+            .as_f64()
+            .filter(|fraction| fraction.is_finite())
+            .map(|fraction| fraction.clamp(0.0, 1.0))
+            .or_else(|| {
+                // Proto3 JSON omits zero float fields; an enabled bucket with a
+                // resetTime and no remainingAmount is exhausted (0% left).
+                (bucket["remainingAmount"].is_null() && resets_at.is_some()).then_some(0.0)
+            });
+        let Some(remaining_fraction) = remaining_fraction else {
+            continue;
+        };
+        seen_ids.push(id.clone());
+
+        let window_kind = bucket["window"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase);
+        let window_label = match window_kind.as_deref() {
+            Some("5h") => Some("5-hour"),
+            Some("weekly") => Some("Weekly"),
+            Some("daily") => Some("Daily"),
+            Some("monthly") => Some("Monthly"),
+            _ if id.ends_with("-5h") => Some("5-hour"),
+            _ if id.ends_with("-weekly") => Some("Weekly"),
+            _ => None,
+        };
+        let display_name = bucket["displayName"]
+            .as_str()
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
+        let shared_pool = matches!(id.as_str(), "gemini-5h" | "gemini-weekly")
+            || group_name.is_some_and(|name| name.eq_ignore_ascii_case("Gemini Models"));
+        let (rank, global, label) = if shared_pool {
+            let rank = match window_label {
+                Some("5-hour") => 0,
+                Some("Weekly") => 1,
+                _ => 2,
+            };
+            let label = window_label
+                .or(display_name)
+                .unwrap_or(bucket_id)
+                .to_owned();
+            (rank, true, label)
+        } else {
+            let label = match (window_label, group_name) {
+                (Some(window), Some(group)) => format!("{window} · {group}"),
+                _ => display_name.or(group_name).unwrap_or(bucket_id).to_owned(),
+            };
+            (3, false, label)
+        };
+        ranked.push((
+            rank,
+            QuotaWindow {
+                label,
+                remaining_fraction: Some(remaining_fraction),
+                resets_at,
+                global,
+            },
+        ));
+    }
+    ranked.sort_by_key(|(rank, _)| *rank);
+    ranked.into_iter().map(|(_, window)| window).collect()
+}
+
+fn quota_windows_from_models(response: &Value) -> Vec<QuotaWindow> {
+    let models = response["models"].as_object().cloned().unwrap_or_default();
+    let mut windows: Vec<QuotaWindow> = Vec::new();
+    for id in listed_gemini_model_ids(response) {
+        let model = &models.get(&id).cloned().unwrap_or_default();
+        let resets_at = parse_reset_time(&model["quotaInfo"]["resetTime"]);
+        let remaining_fraction = model["quotaInfo"]["remainingFraction"]
+            .as_f64()
+            .filter(|fraction| fraction.is_finite())
+            .map(|fraction| fraction.clamp(0.0, 1.0))
+            .or_else(|| resets_at.is_some().then_some(0.0));
+        let Some(remaining_fraction) = remaining_fraction else {
+            continue;
+        };
+        // Every thinking tier of a model shares one allowance, so one row per
+        // model ("Gemini 4 Neon (High)" and "(Low)" become "Gemini 4 Neon").
+        let raw_label = model["displayName"].as_str().unwrap_or(&id);
+        let label = raw_label.split(" (").next().unwrap_or(raw_label).to_owned();
+        match windows.iter_mut().find(|known| known.label == label) {
+            Some(known) => {
+                if let Some(existing) = known.remaining_fraction {
+                    known.remaining_fraction = Some(existing.min(remaining_fraction));
+                } else {
+                    known.remaining_fraction = Some(remaining_fraction);
+                }
+            }
+            None => windows.push(QuotaWindow {
+                label,
+                remaining_fraction: Some(remaining_fraction),
+                resets_at,
+                global: false,
+            }),
+        }
+    }
+    windows
 }
 
 /// `auth_file` reads a named account's authority; `None` reads the selected one.
-async fn available_models(auth_file: Option<PathBuf>) -> Result<Value> {
-    let mut access = access_from(auth_file.clone(), None).await?;
-    let client = client()?;
+async fn post_project_json(
+    client: &reqwest::Client,
+    access: &mut SubscriptionAccess,
+    auth_file: &Option<PathBuf>,
+    method: &str,
+    label: &str,
+) -> std::result::Result<Value, CodeAssistError> {
     for attempt in 0..2 {
         let response = client
-            .post(format!("{CODE_ASSIST_ENDPOINT}:fetchAvailableModels"))
+            .post(format!("{CODE_ASSIST_ENDPOINT}:{method}"))
             .bearer_auth(&access.token)
             .header(reqwest::header::USER_AGENT, user_agent().await)
             .json(&json!({"project": access.project}))
             .send()
             .await
-            .context("Gemini model list connection failed")?;
-        if attempt == 0 && response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            let account = access.account.clone();
-            access = access_from(auth_file.clone(), Some(access.token)).await?;
-            ensure!(
-                access.account == account,
-                "Gemini account changed during quota recovery; retry for the selected account"
-            );
-            continue;
+            .with_context(|| format!("{label} connection failed"))
+            .map_err(CodeAssistError::Other)?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            if attempt == 0 {
+                let account = access.account.clone();
+                *access = access_from(auth_file.clone(), Some(access.token.clone()))
+                    .await
+                    .map_err(CodeAssistError::Auth)?;
+                if access.account != account {
+                    return Err(CodeAssistError::Auth(anyhow::anyhow!(
+                        "Gemini account changed during quota recovery; retry for the selected account"
+                    )));
+                }
+                continue;
+            }
+            return checked_json(response, label)
+                .await
+                .map_err(CodeAssistError::Auth);
         }
-        return checked_json(response, "Gemini model list").await;
+        return checked_json(response, label)
+            .await
+            .map_err(CodeAssistError::Other);
     }
     unreachable!("the second attempt always returns")
 }
@@ -797,4 +1011,126 @@ async fn response_json(response: reqwest::Response) -> Result<Value> {
         bytes.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&bytes).context("invalid Gemini response")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Summary buckets drive `/usage` and multi-account balancing: Gemini's
+    /// shared 5-hour and weekly pools are global (ordered 5-hour before
+    /// Weekly), separate model groups such as Gemini 4 Argon stay model-scoped,
+    /// third-party pools and disabled buckets are excluded, and an exhausted
+    /// bucket whose proto3 zero `remainingFraction` was omitted still parses as
+    /// 0% left instead of disappearing.
+    #[test]
+    fn quota_summary_parses_shared_weekly_and_model_pools_and_exhausted_zeros() {
+        let summary = json!({
+            "groups": [
+                {
+                    "displayName": "Gemini Models",
+                    "buckets": [
+                        {
+                            "bucketId": "gemini-weekly",
+                            "displayName": "Weekly Limit Remaining",
+                            "window": "weekly",
+                            "resetTime": "2026-11-28T16:02:18Z",
+                            "remainingFraction": 0.82
+                        },
+                        {
+                            "bucketId": "gemini-5h",
+                            "displayName": "Five Hour Limit Remaining",
+                            "window": "5h",
+                            "resetTime": "2026-11-21T21:02:18Z"
+                        }
+                    ]
+                },
+                {
+                    "displayName": "Claude and GPT models",
+                    "buckets": [
+                        {
+                            "bucketId": "3p-weekly",
+                            "window": "weekly",
+                            "resetTime": "2026-11-28T16:03:41Z",
+                            "remainingFraction": 1.0
+                        }
+                    ]
+                },
+                {
+                    "displayName": "Gemini 4 Argon",
+                    "buckets": [
+                        {
+                            "bucketId": "gemini-argon-wtu-weekly",
+                            "displayName": "Gemini 4 Argon Weekly Limit",
+                            "window": "weekly",
+                            "resetTime": "2026-11-28T16:03:41Z",
+                            "remainingFraction": 0.5
+                        },
+                        {
+                            "bucketId": "gemini-disabled-weekly",
+                            "window": "weekly",
+                            "disabled": true,
+                            "remainingFraction": 1.0
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let windows = quota_windows_from_summary(&summary);
+        assert_eq!(windows.len(), 3);
+        assert_eq!(windows[0].label, "5-hour");
+        assert_eq!(windows[0].remaining_fraction, Some(0.0));
+        assert!(windows[0].global);
+        assert!(windows[0].resets_at.is_some());
+
+        assert_eq!(windows[1].label, "Weekly");
+        assert_eq!(windows[1].remaining_fraction, Some(0.82));
+        assert!(windows[1].global);
+
+        assert_eq!(windows[2].label, "Weekly · Gemini 4 Argon");
+        assert_eq!(windows[2].remaining_fraction, Some(0.5));
+        assert!(!windows[2].global);
+    }
+
+    /// Fallback per-model responses collapse thinking tiers onto one row and
+    /// treat an omitted zero `remainingFraction` with a `resetTime` as 0% left.
+    #[test]
+    fn quota_models_fallback_collapses_tiers_and_omitted_zero_fraction() {
+        let response = json!({
+            "agentModelSorts": [{
+                "groups": [{
+                    "modelIds": [
+                        "gemini-4-neon-high",
+                        "gemini-4-neon-low",
+                        "gemini-4-argon-high",
+                        "claude-opus-5-5-high"
+                    ]
+                }]
+            }],
+            "models": {
+                "gemini-4-neon-high": {
+                    "displayName": "Gemini 4 Neon (High)",
+                    "quotaInfo": { "remainingFraction": 0.9, "resetTime": "2026-11-21T21:02:18Z" }
+                },
+                "gemini-4-neon-low": {
+                    "displayName": "Gemini 4 Neon (Low)",
+                    "quotaInfo": { "remainingFraction": 0.75, "resetTime": "2026-11-21T21:02:18Z" }
+                },
+                "gemini-4-argon-high": {
+                    "displayName": "Gemini 4 Argon (High)",
+                    "quotaInfo": { "resetTime": "2026-11-28T16:03:05Z" }
+                }
+            }
+        });
+
+        let windows = quota_windows_from_models(&response);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].label, "Gemini 4 Neon");
+        assert_eq!(windows[0].remaining_fraction, Some(0.75));
+        assert!(!windows[0].global);
+        assert_eq!(windows[1].label, "Gemini 4 Argon");
+        assert_eq!(windows[1].remaining_fraction, Some(0.0));
+        assert!(!windows[1].global);
+    }
 }

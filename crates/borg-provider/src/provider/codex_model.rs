@@ -1589,10 +1589,21 @@ impl ResponseState {
                         .reasoning_part
                         .as_ref()
                         .is_some_and(|last| last != &part)
-                        && !self.reasoning.ends_with("\n")
-                        && !text.starts_with("\n")
+                        && !self.reasoning.is_empty()
                     {
-                        format!("\n{text}")
+                        let trailing = self
+                            .reasoning
+                            .bytes()
+                            .rev()
+                            .take_while(|byte| *byte == b'\n')
+                            .count();
+                        let leading = text.bytes().take_while(|byte| *byte == b'\n').count();
+                        let needed = 2usize.saturating_sub(trailing + leading);
+                        if needed > 0 {
+                            format!("{}{text}", "\n".repeat(needed))
+                        } else {
+                            text.to_owned()
+                        }
                     } else {
                         text.to_owned()
                     };
@@ -3028,7 +3039,7 @@ mod tests {
         ] {
             state.event(&event, Some(&tx), "model", "low").unwrap();
         }
-        let expected = "Running validation\nReviewing the diff\nChecking replay safely\nCompleted-only summary\nAtomic summary\nFinal-only summary";
+        let expected = "Running validation\n\nReviewing the diff\n\nChecking replay safely\n\nCompleted-only summary\n\nAtomic summary\n\nFinal-only summary";
         assert_eq!(state.reasoning, expected);
         let mut streamed = String::new();
         while let Ok(event) = rx.try_recv() {
