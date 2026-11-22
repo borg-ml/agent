@@ -11806,6 +11806,7 @@ fn coalesce_pending_team_notifications(
     // for the byte cap must still make progress on its own.
     let mut members = 0usize;
     let mut bytes = 0usize;
+    let mut images = 0usize;
     let mut take = Vec::new();
     for &index in &candidates {
         let prompt = &pending[index];
@@ -11826,12 +11827,14 @@ fn coalesce_pending_team_notifications(
         };
         if !take.is_empty()
             && (members + prompt_members > TEAM_BATCH_MAX_MEMBERS
-                || bytes + separator + prompt_bytes > TEAM_BATCH_MAX_TEXT_BYTES)
+                || bytes + separator + prompt_bytes > TEAM_BATCH_MAX_TEXT_BYTES
+                || images + prompt.attachments.len() > crate::MAX_PROMPT_IMAGES)
         {
             break;
         }
         members += prompt_members;
         bytes += separator + prompt_bytes;
+        images += prompt.attachments.len();
         take.push(index);
     }
     if take.len() < 2 {
@@ -12064,6 +12067,18 @@ fn coalesce_queued_prompts(pending: &mut VecDeque<QueuedPrompt>) {
             retained.push_back(prompt);
         }
     }
+    // The batch becomes one user message, so it stops at that message's image
+    // limit; later prompts stay queued, in order, for the next turn.
+    let mut images = 0;
+    let fits = prompts
+        .iter()
+        .take_while(|prompt| {
+            images += prompt.attachments.len();
+            images <= crate::MAX_PROMPT_IMAGES
+        })
+        .count()
+        .max(1);
+    let mut overflow: VecDeque<QueuedPrompt> = prompts.split_off(fits.min(prompts.len())).into();
     let Some(mut combined) = prompts.pop() else {
         *pending = retained;
         return;
@@ -12100,6 +12115,7 @@ fn coalesce_queued_prompts(pending: &mut VecDeque<QueuedPrompt>) {
     combined.interrupt_batch = true;
     combined.batch = batch;
     pending.push_back(combined);
+    pending.append(&mut overflow);
     pending.append(&mut retained);
 }
 
@@ -12646,9 +12662,15 @@ async fn retry_pending_steers(
         .collect::<HashSet<_>>();
     let mut indices = Vec::new();
     let mut withdrawn = HashSet::new();
+    let mut images = 0;
     for (index, steer) in pending_steers.iter_mut().enumerate() {
         if steer.admission.is_accepted() {
             continue;
+        }
+        // The batch is one user message; later steers wait for the next one.
+        if !indices.is_empty() && images + steer.prompt.attachments.len() > crate::MAX_PROMPT_IMAGES
+        {
+            break;
         }
         match &steer.state {
             PendingSteerState::RetryAtBoundary { error } => {
@@ -12667,6 +12689,7 @@ async fn retry_pending_steers(
         steer.state = PendingSteerState::RetryAtBoundary {
             error: "waiting for batch admission".into(),
         };
+        images += steer.prompt.attachments.len();
         indices.push(index);
     }
     let Some(&first) = indices.first() else {

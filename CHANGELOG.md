@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.22.2)
 
+- Several queued messages that together carry more than four images no
+  longer fail as one rejected turn ("native providers accept at most four
+  images per message"). Batching now stops at four images and the rest are
+  delivered in the next turn.
+
 - Click the directory in the footer (or on the launch screen), or run `/cd`,
   to switch to a fresh session in another directory. The picker lists the
   directories of recently active sessions first, then every directory in your

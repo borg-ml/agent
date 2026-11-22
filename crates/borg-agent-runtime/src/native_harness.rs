@@ -935,7 +935,7 @@ impl NativeHarness {
         // One message each, as before. Admission is taken per steer and only
         // confirmed once that steer's message is recorded.
         for captured in steers {
-            let Some((steer, acks)) = admit_steers(vec![captured]) else {
+            let Some((steer, acks)) = admit_steers(&mut vec![captured]) else {
                 continue;
             };
             let message = native_user_message(&turn.cwd, &steer.text, &steer.attachments).await?;
@@ -1217,9 +1217,8 @@ impl NativeHarness {
                         ).await;
                     }
                     assistant_message_id = Uuid::new_v4();
-                    let mut captured_steers = std::mem::take(&mut queued_steer);
-                    captured_steers.push(captured);
-                    let Some((steer, acks)) = admit_steers(captured_steers) else {
+                    queued_steer.push(captured);
+                    let Some((steer, acks)) = admit_steers(&mut queued_steer) else {
                         // Withdrawn while the stream was ending, so there is
                         // nothing to fold and nothing to claim was delivered.
                         continue;
@@ -1538,7 +1537,7 @@ impl NativeHarness {
                     }
                 }
                 reply_owed = false;
-                if let Some((steer, acks)) = admit_steers(std::mem::take(&mut queued_steer)) {
+                if let Some((steer, acks)) = admit_steers(&mut queued_steer) {
                     // The answer above is already recorded and on screen, so
                     // nothing the model wrote is lost. Ending the turn here
                     // would drop the human's message instead, which is the
@@ -1894,10 +1893,9 @@ impl NativeHarness {
             // that generation arrived before anything collected above, so they
             // lead the folded message. Admission is taken here, and only the
             // steers that survived recall are folded.
-            let mut captured = std::mem::take(&mut queued_steer);
-            captured.append(&mut pending_steer);
+            queued_steer.append(&mut pending_steer);
             let mut folded_steer = false;
-            if let Some((steer, acks)) = admit_steers(captured) {
+            if let Some((steer, acks)) = admit_steers(&mut queued_steer) {
                 folded_steer = true;
                 if steer.human {
                     reply_owed = true;
@@ -1966,7 +1964,7 @@ impl NativeHarness {
                     .and_then(|controls| controls.try_recv().ok())
                 {
                     if let Some(captured) = accept_tool_boundary_control(control)?
-                        && let Some((steer, acks)) = admit_steers(vec![captured])
+                        && let Some((steer, acks)) = admit_steers(&mut vec![captured])
                     {
                         let message =
                             native_user_message(&turn.cwd, &steer.text, &steer.attachments).await?;
@@ -4118,13 +4116,29 @@ impl CapturedSteer {
 /// delivered anyway. Acknowledgements are returned rather than sent: a steer is
 /// only consumed once its merged message is journaled, so the caller records
 /// first and calls [`confirm_steers`] after.
-fn admit_steers(captured: Vec<CapturedSteer>) -> Option<(NativeSteer, Vec<SteerAck>)> {
+fn admit_steers(captured: &mut Vec<CapturedSteer>) -> Option<(NativeSteer, Vec<SteerAck>)> {
+    // A folded steer is one user message, so it may carry no more images than
+    // one message can. Steers past that stay queued for the next boundary.
+    let mut images = 0;
+    let mut fits = 0;
+    for steer in captured.iter() {
+        if fits > 0
+            && !steer.admission.is_recalled()
+            && images + steer.attachments.len() > MAX_NATIVE_USER_IMAGES
+        {
+            break;
+        }
+        if !steer.admission.is_recalled() {
+            images += steer.attachments.len();
+        }
+        fits += 1;
+    }
     let mut text = String::new();
     let mut attachments = Vec::new();
     let mut message_ids = Vec::new();
     let mut acks = Vec::new();
     let mut human = false;
-    for steer in captured {
+    for steer in captured.drain(..fits) {
         if !steer.admission.accept() {
             let _ = steer
                 .ack
@@ -7648,7 +7662,7 @@ mod tests {
                     "capture must not admit: nothing has been journaled yet"
                 );
                 // Admission is where recall is honoured.
-                let (folded, acks) = admit_steers(steers).expect("two steers are still live");
+                let (folded, acks) = admit_steers(&mut steers).expect("two steers are still live");
                 assert_eq!(folded.text, "first\nsecond");
                 assert_eq!(
                     folded.attachments,
@@ -8463,8 +8477,8 @@ mod tests {
                     steer.iter().all(|steer| !steer.admission.is_accepted()),
                     "capture must not admit before the caller journals"
                 );
-                let (folded, acks) =
-                    admit_steers(steer).expect("accepted steering must reach the next model round");
+                let (folded, acks) = admit_steers(&mut steer)
+                    .expect("accepted steering must reach the next model round");
                 assert_eq!(folded.text, "first correction\nsecond correction");
                 assert_eq!(
                     folded.attachments,
@@ -13908,7 +13922,7 @@ mod tests {
             acked.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         ));
-        let (steer, acks) = admit_steers(captured).unwrap();
+        let (steer, acks) = admit_steers(&mut captured).unwrap();
         assert_eq!(steer.message_ids, vec![message_id]);
         assert!(steer.human);
         confirm_steers(acks);
