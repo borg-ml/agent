@@ -10111,7 +10111,11 @@ impl BorgTerminal {
         } else {
             self.transcript.status_label(status)
         };
-        let status_glyph = if status_label == "waiting" {
+        // A turn blocked in a wait renders exactly like an idle session parked
+        // on watchers: one look for "waiting", without the running color,
+        // timer or shimmer.
+        let status_waiting = status_label == "waiting";
+        let status_glyph = if status_waiting {
             "◔"
         } else {
             activity_glyph(status)
@@ -10599,7 +10603,10 @@ impl BorgTerminal {
                 footer_height,
                 is_launch_screen,
             );
-            let status_color = focused_subagent_status_color(status, self.focused_child.is_some());
+            let status_color = focused_subagent_status_color(
+                if status_waiting { SessionStatus::Ready } else { status },
+                self.focused_child.is_some(),
+            );
             let (status_area, transcript_area, composer_area, footer_area) = if is_launch_screen {
                 let launch_width = composer_area_width.min(chunks[0].width);
                 let launch_height = composer_height
@@ -11395,7 +11402,7 @@ impl BorgTerminal {
                 frame_cursor = Some(cursor);
             }
             let status_highlight = self.status_hovered && status_is_interruptible;
-            let status_duration = if session_is_active && reconnect_label.is_none() {
+            let status_duration = if session_is_active && !status_waiting && reconnect_label.is_none() {
                 let now = Utc::now();
                 activity_clock.status_duration(now)
             } else {
@@ -11408,7 +11415,7 @@ impl BorgTerminal {
                 status_highlight,
                 status_duration.as_deref(),
             );
-            if session_is_active && self.running_sweeps && !status_highlight {
+            if session_is_active && !status_waiting && self.running_sweeps && !status_highlight {
                 apply_running_status_shimmer(&mut status_spans, running_status_shimmer_phase());
             }
             let status_width = status_spans.iter().map(|span| span.width()).sum::<usize>();

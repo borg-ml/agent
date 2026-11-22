@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.22.2)
 
+- The status line now shows "waiting" one way: a turn blocked in
+  `wait_agent` or `await_watchers` renders like an idle session parked on
+  watchers (gray, no running timer or shimmer) instead of as an orange
+  "waiting 15m".
+
 ## 0.22.2 (2026-11-21)
 
 - Added `gpt-6.2-astra` (Astra 6.2) and `gpt-6.2-sol` (Sol 6.2) to the
