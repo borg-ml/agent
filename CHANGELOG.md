@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.22.2)
 
+- Updated `url` to 2.5.9 (RUSTSEC-2026-0592: stack overflow in
+  `Url::origin()` on nested `blob:` URLs) and replaced the yanked
+  `async-executor` 1.14.0 with 1.14.1, so `just release` passes its
+  dependency audit again.
+
 - Several queued messages that together carry more than four images no
   longer fail as one rejected turn ("native providers accept at most four
   images per message"). Batching now stops at four images and the rest are
