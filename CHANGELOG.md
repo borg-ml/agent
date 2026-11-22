@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.22.2)
 
+- Click the directory in the footer (or on the launch screen), or run `/cd`,
+  to switch to a fresh session in another directory. The picker lists the
+  directories of recently active sessions first, then every directory in your
+  home folder, and filters as you type; `/cd PATH` accepts `~` and relative
+  paths. The session you leave stays saved under `/resume`.
+
 - The status line now shows "waiting" one way: a turn blocked in
   `wait_agent` or `await_watchers` renders like an idle session parked on
   watchers (gray, no running timer or shimmer) instead of as an orange

@@ -692,6 +692,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/clear", "clear conversation context"),
     ("/compact", "compact the current conversation context"),
     ("/resume", "resume a saved Borg session"),
+    ("/cd", "start a new session in another directory"),
     ("/import", "copy threads and memory from another assistant"),
     ("/goal", "view or update the durable goal"),
     ("/todo", "view or update the durable todo list"),
@@ -1443,6 +1444,25 @@ fn git_ahead_hit_area(status: &GitWorktreeStatus, metadata: Rect) -> Option<Rect
     })
 }
 
+/// The footer path sits before the git suffix and the trailing breathing-room
+/// cell; right alignment clips it on the left when the footer is narrow.
+fn cwd_path_hit_area(path: &str, git: Option<&GitWorktreeStatus>, metadata: Rect) -> Option<Rect> {
+    if path.is_empty() {
+        return None;
+    }
+    let trailing = 1 + git.map_or(0, |status| {
+        format!("{STATUS_SEPARATOR}{}", status.compact_label()).width() as u16
+    });
+    let right = metadata.right().saturating_sub(trailing);
+    let x = right.saturating_sub(path.width() as u16).max(metadata.x);
+    (x < right).then_some(Rect {
+        x,
+        y: metadata.y,
+        width: right - x,
+        height: 1,
+    })
+}
+
 /// Background "commit everything and push" runner for the footer's dirty
 /// worktree indicator. The commit message is drafted by a cheap model (see
 /// [`commit_model_from_environment`]); when that model is unavailable the
@@ -1814,6 +1834,7 @@ pub struct BorgTerminal {
     git_commit: GitCommitState,
     git_status_area: Option<Rect>,
     git_status_hovered: bool,
+    cwd_path_area: Option<Rect>,
     git_pull_area: Option<Rect>,
     git_commit_area: Option<Rect>,
     git_commit_hovered: bool,
@@ -2168,6 +2189,13 @@ impl PickerOption {
     }
 }
 
+/// A directory offered by the `/cd` picker: recent session directories first,
+/// then the directories in the home folder.
+pub struct DirectoryOption {
+    pub path: PathBuf,
+    pub recent: bool,
+}
+
 pub struct ResumeSessionOption {
     pub id: Uuid,
     pub label: String,
@@ -2180,6 +2208,7 @@ enum PickerKind {
     ImportSource,
     ImportPreview { threads: bool, memory: bool },
     Resume,
+    Directory,
     Model,
     HelperModel(HelperKind),
     Effort,
@@ -3359,6 +3388,7 @@ impl BorgTerminal {
             git_commit: GitCommitState::default(),
             git_status_area: None,
             git_status_hovered: false,
+            cwd_path_area: None,
             git_pull_area: None,
             git_commit_area: None,
             git_commit_hovered: false,
@@ -3596,6 +3626,7 @@ impl BorgTerminal {
         self.git_commit = GitCommitState::default();
         self.git_status_area = None;
         self.git_status_hovered = false;
+        self.cwd_path_area = None;
         self.git_pull_area = None;
         self.git_commit_area = None;
         self.git_commit_hovered = false;
@@ -7274,6 +7305,43 @@ impl BorgTerminal {
         });
     }
 
+    pub fn open_directory_picker(&mut self, directories: &[DirectoryOption]) {
+        let mut saw_recent = false;
+        let mut saw_home = false;
+        self.picker = Some(Picker {
+            kind: PickerKind::Directory,
+            title: "Switch directory",
+            options: directories
+                .iter()
+                .map(|directory| {
+                    let section = if directory.recent && !saw_recent {
+                        saw_recent = true;
+                        Some("Recent".to_string())
+                    } else if !directory.recent && !saw_home {
+                        saw_home = true;
+                        Some("~".to_string())
+                    } else {
+                        None
+                    };
+                    // `/cd` expands `~`, so the value can match what is shown
+                    // instead of fuzzy-matching every row's home prefix.
+                    let label = home_relative_path(&directory.path);
+                    PickerOption {
+                        value: label.clone(),
+                        label,
+                        preview: None,
+                        section,
+                        key_hint: None,
+                        disabled: false,
+                    }
+                })
+                .collect(),
+            selected: 0,
+            query: Some(String::new()),
+            viewport_offset: Cell::new(0),
+        });
+    }
+
     pub fn open_effort_picker(&mut self) {
         let provider = self
             .transcript
@@ -8451,6 +8519,16 @@ impl BorgTerminal {
                         {
                             self.pull_upstream_commits();
                             return Ok(UiAction::None);
+                        }
+                        if self
+                            .cwd_path_area
+                            .is_some_and(|area| area.contains(pointer))
+                        {
+                            return Ok(UiAction::Submit {
+                                target: None,
+                                text: "/cd".to_owned(),
+                                attachments: Vec::new(),
+                            });
                         }
                     }
                     if self.team_switcher_open {
@@ -9646,6 +9724,11 @@ impl BorgTerminal {
                 text: format!("/resume {}", picker.selected_value()),
                 attachments: Vec::new(),
             },
+            PickerKind::Directory => UiAction::Submit {
+                target: None,
+                text: format!("/cd {}", picker.selected_value()),
+                attachments: Vec::new(),
+            },
             PickerKind::HelperModel(kind) => {
                 let model = picker.selected_value();
                 let provider = HelperModel::parse(&model).provider();
@@ -10138,6 +10221,7 @@ impl BorgTerminal {
         if cwd_status.is_empty() {
             cwd_status = fish_style_path(&active_cwd);
         }
+        let cwd_path = cwd_status.trim().to_string();
         let mut footer_git_status = None;
         if let Some(git_status) = self.git_status_cache.status_for(&active_cwd) {
             cwd_status.push_str(" · ");
@@ -11573,6 +11657,11 @@ impl BorgTerminal {
             }
             // The splash has no footer, so the path and branch close its one
             // status line instead.
+            let launch_cwd_start = status_spans
+                .iter()
+                .map(|span| span.width())
+                .sum::<usize>()
+                + STATUS_SEPARATOR.width();
             if is_launch_screen && !cwd_status.trim().is_empty() {
                 status_spans.push(Span::styled(
                     format!("{STATUS_SEPARATOR}{}", cwd_status.trim()),
@@ -11607,6 +11696,9 @@ impl BorgTerminal {
             };
             next_status_area =
                 status_hit_area(0, status_width).filter(|_| status_control_is_actionable(status));
+            let launch_cwd_area = is_launch_screen
+                .then(|| status_hit_area(launch_cwd_start, cwd_path.width()))
+                .flatten();
             next_agents_status_area =
                 agents_status_width.and_then(|width| status_hit_area(agents_status_start, width));
             next_goal_status_area =
@@ -12098,6 +12190,7 @@ impl BorgTerminal {
             self.git_status_area = None;
             self.git_pull_area = None;
             self.git_commit_area = None;
+            self.cwd_path_area = launch_cwd_area;
             if !is_launch_screen {
                 let footer_metadata = Some(footer_metadata_text(
                     &footer_status_text(
@@ -12168,6 +12261,8 @@ impl BorgTerminal {
                     self.git_commit_area = footer_git_status
                         .as_ref()
                         .and_then(|status| git_commit_hit_area(status, metadata_rect));
+                    self.cwd_path_area =
+                        cwd_path_hit_area(&cwd_path, footer_git_status.as_ref(), metadata_rect);
                 }
             }
             if showing_primary_controls && !showing_transcript_interaction_hint {
@@ -12783,7 +12878,7 @@ impl BorgTerminal {
         }
         if matches!(
             self.picker.as_ref().map(|picker| picker.kind),
-            Some(PickerKind::Resume)
+            Some(PickerKind::Resume | PickerKind::Directory)
         ) {
             if is_composer_newline(&self.keymap, &key) {
                 self.composer_selection = None;
@@ -17525,6 +17620,20 @@ fn readable_path(path: &Path) -> PathBuf {
         }
     }
     path.to_path_buf()
+}
+
+/// Full path with the home directory written as `~`, for pickers where the
+/// abbreviated footer form would make sibling directories ambiguous.
+fn home_relative_path(path: &Path) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    match home
+        .as_deref()
+        .and_then(|home| path.strip_prefix(home).ok())
+    {
+        Some(relative) if relative.as_os_str().is_empty() => "~".to_string(),
+        Some(relative) => format!("~{}{}", std::path::MAIN_SEPARATOR, relative.display()),
+        None => path.display().to_string(),
+    }
 }
 
 fn fish_style_path(path: &Path) -> String {
