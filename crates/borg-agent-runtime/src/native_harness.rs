@@ -7648,7 +7648,7 @@ mod tests {
                 .unwrap();
             assert!(dropped.is_cancelled());
             if outcome == "success" {
-                let (_, steers) = result.unwrap();
+                let (_, mut steers) = result.unwrap();
                 // Capture does not admit, so the recalled steer is still here.
                 assert_eq!(
                     steers
@@ -8466,7 +8466,7 @@ mod tests {
                 );
             } else {
                 finish_tx.send(json!({"completed":true})).unwrap();
-                let (output, is_error, steer) = task.await.unwrap().unwrap();
+                let (output, is_error, mut steer) = task.await.unwrap().unwrap();
                 assert!(!is_error);
                 assert_eq!(
                     serde_json::from_str::<Value>(&output).unwrap(),
@@ -13903,7 +13903,7 @@ mod tests {
             .unwrap();
             Ok(json!({ "reason": "input_pending" }))
         };
-        let (output, is_error, captured) =
+        let (output, is_error, mut captured) =
             await_tool_with_controls(call, None, false, false, false, &mut controls, || {})
                 .await
                 .unwrap();
