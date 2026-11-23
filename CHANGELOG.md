@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.22.2)
+## Unreleased (since 0.22.3)
+
+## 0.22.3 (2026-11-23)
 
 - A lane job with a stall timeout is no longer killed as stalled (exit 125)
   before it starts. The stall clock now waits for `systemd-run` to hand over
