@@ -5,6 +5,10 @@ Git comparison.
 
 ## Unreleased (since 0.22.3)
 
+- Images reach OpenCode Go vision models again. The Go route lists a model's input
+  modalities as MIME types (`image/png`, `image/jpeg`, ...) while OpenRouter writes
+  `image`; Borg matched only the bare word, so `deepseek-v4.1-flash` looked text-only and
+  every attachment was withheld with "accepts text-only input". Both spellings now count.
 - OpenCode agents start again on hosts where an OpenCode 2.x install sits next to
   a 1.x one: Borg now skips 2.x (whose server API moved under `/api`, which made
   every turn fail with "405 Method Not Allowed") and names the reason in

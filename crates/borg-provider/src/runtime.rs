@@ -465,9 +465,14 @@ pub(crate) fn openrouter_model_entries_from_response(
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string),
                 supports_images: input_modalities.map(|modalities| {
-                    modalities
-                        .iter()
-                        .any(|modality| modality.as_str() == Some("image"))
+                    // Two spellings are in the wild: OpenRouter writes "image", while the Go route
+                    // lists MIME types ("image/png", "image/jpeg", ...). Matching only the bare word
+                    // made every Go entry look text-only, so a vision model's images were withheld.
+                    modalities.iter().any(|modality| {
+                        modality
+                            .as_str()
+                            .is_some_and(|name| name == "image" || name.starts_with("image/"))
+                    })
                 }),
             })
         })
@@ -847,6 +852,14 @@ mod tests {
                     "modalities": { "input": ["text", "image"], "output": ["text"] }
                 },
                 {
+                    "id": "deepseek-v4.1-flash",
+                    "name": "DeepSeek V4.1 Flash",
+                    "modalities": {
+                        "input": ["text", "image/jpeg", "image/png", "image/gif", "image/webp"],
+                        "output": ["text"]
+                    }
+                },
+                {
                     "id": "openrouter/vision",
                     "name": "Vision",
                     "architecture": { "input_modalities": ["text", "image"] }
@@ -860,6 +873,8 @@ mod tests {
         let find = |id: &str| entries.iter().find(|entry| entry.id == id).unwrap();
         assert_eq!(find("glm-5.3").supports_images, Some(false));
         assert_eq!(find("qwen3.7-vl").supports_images, Some(true));
+        // The Go route spells the same fact as MIME types.
+        assert_eq!(find("deepseek-v4.1-flash").supports_images, Some(true));
         assert_eq!(find("openrouter/vision").supports_images, Some(true));
         // A catalog entry that declares no modalities is unknown, not "no".
         assert_eq!(find("silent").supports_images, None);
