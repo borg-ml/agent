@@ -94,9 +94,11 @@ fn recovery_scan_predicate(parts: RecoveryParts, alias: &str) -> String {
 /// child. Parking at shutdown, restore and wakes write snapshot-only rows, so
 /// after any restart the latest row alone carries no cursor and the parent
 /// re-forwarded each child's whole history, one durable row per event, before
-/// any child's current state reached the journal and the Team panel. A row
-/// stored in the opaque body tier is skipped here, which only moves the cursor
-/// back to an older mirrored event.
+/// any child's current state reached the journal and the Team panel. A row in
+/// the opaque body tier counts as carrying an event: mirrors are written
+/// compressed exactly when they carry one (store.rs), and the only other
+/// opaque rows are the rare NUL-bearing ones, for which reading one row too
+/// many is harmless.
 ///
 /// The children are enumerated by skipping through the subagent index one
 /// child at a time rather than grouping every activity row: a director with
@@ -123,7 +125,7 @@ const LATEST_SUBAGENT_ROWS: &str = "e.sequence in ( \
        (select sequence from session_events \
         where session_id = $1 and event_kind = 'subagent_activity' \
           and subagent_session_id = child.id \
-          and jsonb_typeof(event_json -> 'kind' -> 'event') = 'object' \
+          and (event_json is null or jsonb_typeof(event_json -> 'kind' -> 'event') = 'object') \
         order by sequence desc limit 1) \
      ) kept where child.id is not null \
    )";
@@ -132,12 +134,17 @@ impl PostgresSessionStore {
     pub(super) async fn session_row(&self, session_id: Uuid) -> Result<StoredSession> {
         let row = sqlx::query(
             "select parent_session_id, parent_cut_sequence, inherited_event_count, \
-             next_sequence from sessions where id = $1",
+             next_sequence, archive_ref is not null as archived from sessions where id = $1",
         )
         .bind(session_id)
         .fetch_optional(self.pool())
         .await?
         .with_context(|| format!("session {session_id} does not exist"))?;
+        // Every journal read resolves its session here, so this is where an
+        // archived session comes back before anything reads its rows.
+        if row.try_get::<bool, _>("archived")? {
+            self.restore_archived_session(session_id).await?;
+        }
         let parent_cut_sequence: Option<i64> = row.try_get("parent_cut_sequence")?;
         let inherited: i64 = row.try_get("inherited_event_count")?;
         let next_sequence: i64 = row.try_get("next_sequence")?;

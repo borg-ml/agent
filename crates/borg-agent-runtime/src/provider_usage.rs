@@ -91,9 +91,32 @@ pub async fn refresh_session_provider_capabilities(
     {
         return output.clone();
     }
-    let output = refresh_provider_capability_usage(capabilities).await;
+    let mut output = refresh_provider_capability_usage(capabilities).await;
+    round_reset_times(&mut output);
     *slot = Some((Instant::now(), capabilities.to_vec(), output.clone()));
     output
+}
+
+/// Reset times are derived as "now plus the seconds remaining", so they drift
+/// by a fraction of a second on every probe. Sessions journal a capability
+/// snapshot whenever it changes and probe every few seconds, so that drift
+/// alone wrote ~2.3 million snapshots (2.7 GB) into one store. Readers show
+/// minutes at most; rounding to the nearest one keeps real changes only.
+fn round_reset_times(capabilities: &mut [ProviderCapability]) {
+    fn round(usage: &mut Option<crate::ProviderUsage>) {
+        for window in usage.iter_mut().flat_map(|usage| usage.windows.iter_mut()) {
+            if let Some(resets_at) = window.resets_at {
+                let seconds = (resets_at.timestamp() + 30).div_euclid(60) * 60;
+                window.resets_at = chrono::DateTime::from_timestamp(seconds, 0);
+            }
+        }
+    }
+    for capability in capabilities {
+        round(&mut capability.usage);
+        for account in &mut capability.accounts {
+            round(&mut account.usage);
+        }
+    }
 }
 
 pub async fn refresh_provider_capability_usage(

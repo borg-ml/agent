@@ -1947,11 +1947,6 @@ pub trait SessionStore: Send + Sync {
     /// mutation replay-safe, so a backend that could not provide them would
     /// let the relay repeat work it had already done.
     async fn receipt_store(&self) -> Result<std::sync::Arc<dyn crate::receipt::ReceiptBackend>>;
-    /// Reclaim space and prune derived rows.
-    ///
-    /// `vacuum` asks for the engine's heavyweight rewrite -- Postgres's
-    /// `VACUUM` -- rather than the routine pruning of derived rows.
-    async fn compact(&self, vacuum: bool) -> Result<SessionStoreCompaction>;
     /// A cheap readiness probe for startup and `borg doctor`.
     async fn readiness(&self) -> Result<SessionStoreHealth>;
     /// A deeper health check, including an integrity pass.
@@ -2089,21 +2084,6 @@ pub trait SessionStore: Send + Sync {
         provider: CodingProvider,
         account_identity: &str,
     ) -> Result<()>;
-}
-
-/// Outcome of a store's `compact`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionStoreCompaction {
-    /// Mirrored subagent rows removed because the live journal would no
-    /// longer persist them.
-    pub deleted_events: u64,
-    /// Search projection rows that no longer had a journal event.
-    pub deleted_search_rows: u64,
-    pub vacuumed: bool,
-    /// Database size in bytes before and after, from the page count. Without
-    /// a vacuum the file keeps its size and the freed pages are reused.
-    pub bytes_before: i64,
-    pub bytes_after: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

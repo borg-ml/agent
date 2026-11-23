@@ -5,6 +5,43 @@ Git comparison.
 
 ## Unreleased (since 0.22.3)
 
+- The session database stays bounded. On a 168 GB store most of the disk was
+  copies, caches and history nobody had opened in weeks; it now keeps:
+  - **Payloads** (oversized tool output, provider messages) as
+    content-addressed blobs: base64 images are stored decoded, everything
+    else zstd-compressed, and identical content once across sessions.
+  - **Mirrored subagent events**, the parent's copy of every child event
+    (16 GB of 37 GB of events), compressed with the trained event
+    dictionary.
+  - **Provider usage snapshots** only when quota changes. Reset times drifted
+    by a fraction of a second on every 3-second probe, so each session
+    journaled a new snapshot almost every time (2.3 million rows).
+  - **Remote-view and search caches** only for sessions active in the last
+    7 days. Opening an older session in the remote view, or searching it by
+    id, rebuilds them; a global search names the sessions it skipped.
+  - **Workspace session-event pointers**, which nothing reads, for a day,
+    keeping each session's newest so projection resumes where it was.
+- `borg storage archive` moves session trees idle for 30 days
+  (`--older-than-days`) into compressed, content-addressed files in
+  `$BORG_ARCHIVE_DIR` (default `~/.borg/archive`). Archived sessions stay
+  listed and are restored automatically the first time anything reads them
+  (resume, inspect, history, remote view), or with `borg storage restore`.
+  A tree is archived only when every member is idle and none is running.
+- Long-running Borg processes apply this retention in the background every
+  6 hours, one at a time machine-wide. Until an operator has run
+  `borg storage prune --apply` once (after restarting every Borg process on
+  this release, since older ones cannot read rewritten payloads), the
+  background only drops idle caches and old pointers; after it, it also
+  rewrites payloads and, when `BORG_ARCHIVE_DIR` is set, archives.
+  `BORG_STORAGE_MAINTENANCE=0` turns it off.
+- New `borg storage` commands: `prune` applies retention by hand, `backup`
+  takes a pg_dump into the archive directory, and `compact` returns freed
+  space to the filesystem table by table (pg_repack when installed,
+  otherwise VACUUM FULL) after checking free disk space and that no session
+  is running. `prune`, `archive` and `compact` dry-run without `--apply` and
+  require a backup from the last 24 hours. `borg session compact` is removed;
+  `borg storage prune` and `borg storage compact` replace it.
+
 - `borg storage report` shows where the session database's disk goes: every
   table's heap, TOAST, index and dead-row sizes with stale-statistics flags,
   the largest indexes, and sampled breakdowns of events by kind, mirrored

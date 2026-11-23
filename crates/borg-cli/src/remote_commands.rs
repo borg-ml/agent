@@ -2522,6 +2522,11 @@ async fn run_local_agent_session(
         }
     };
     let store: Arc<dyn SessionStore> = Arc::clone(resolved.session());
+    if session_access == LocalSessionAccess::Owned
+        && let Some(authority) = store.postgres_authority()
+    {
+        borg_remote::session_store::postgres::storage::spawn_storage_maintenance(authority.pool);
+    }
     let resolve_ms = resolve_started.elapsed().as_millis() as u64;
     let state_started = std::time::Instant::now();
     let mut session_state = store.state(session_id).await?;

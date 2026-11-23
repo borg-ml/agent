@@ -541,13 +541,39 @@ impl SyncAuthority {
 }
 
 impl SyncAuthority {
+    fn end_rebuild(&self, session: Uuid) {
+        self.rebuilding
+            .lock()
+            .expect("rebuild set")
+            .remove(&session);
+    }
     async fn catch_up(&self, session: Uuid) -> Result<()> {
+        let rebuilding = self
+            .rebuilding
+            .lock()
+            .expect("rebuild set")
+            .contains(&session);
         let owner = self
             .store
             .owning_root_session(session)
             .await?
             .unwrap_or(session);
         if !matches!(self.store.host_launch_owner(owner).await?,Some((host,_)) if host==self.host) {
+            self.end_rebuild(session);
+            return Ok(());
+        }
+        // A session idle past cache retention whose projection was dropped, or
+        // one that is archived, is rebuilt when a viewer opens it rather than
+        // on every catalog pass. (A projector held in memory always has its
+        // checkpoint row, so only archiving can skip a loaded one.)
+        if !rebuilding
+            && crate::projection::idle_without_projection(
+                &self.pg.pool,
+                &scope_key(self.host, Some(session)),
+                session,
+            )
+            .await?
+        {
             return Ok(());
         }
         if let Some(request) = crate::host::scope_registration(self.store.as_ref(), session).await?
@@ -559,6 +585,7 @@ impl SyncAuthority {
                 self.catalog_recovery.store(true, Ordering::Release);
             }
         } else {
+            self.end_rebuild(session);
             return Ok(());
         }
         {
@@ -577,7 +604,9 @@ impl SyncAuthority {
             }
             drop(projectors);
             if count == 128 {
-                self.catalog_recovery.store(true, Ordering::Release);
+                if !rebuilding {
+                    self.catalog_recovery.store(true, Ordering::Release);
+                }
                 return Ok(());
             }
         }
@@ -595,10 +624,13 @@ impl SyncAuthority {
                 self.project(projector, event, Some(revision)).await?;
             }
             if count == 128 {
-                self.catalog_recovery.store(true, Ordering::Release);
+                if !rebuilding {
+                    self.catalog_recovery.store(true, Ordering::Release);
+                }
                 return Ok(());
             }
         }
+        self.end_rebuild(session);
         if self.relay_online.load(Ordering::Acquire) {
             let frames=sqlx::query_scalar::<_,Vec<u8>>("select frame from remote_source_attention where host_id=$1 and source_session_id=$2 order by kind limit 8")
                 .bind(self.host).bind(session).fetch_all(&self.pg.pool).await?;
@@ -682,6 +714,7 @@ impl SyncAuthority {
         if let Err(error) = self.catch_up(session).await {
             // Both this scope and lifted parent metadata may have advanced in
             // memory before persistence failed. Reload only committed state.
+            self.end_rebuild(session);
             self.projectors.lock().await.clear();
             self.catalog_recovery.store(true, Ordering::Release);
             tracing::error!(%session, %error, "projection commit failed; durable cursor retained");
@@ -804,11 +837,24 @@ pub(super) async fn run_publisher(
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             continue;
         }
+        // One chunk of every pending rebuild per turn, so replaying a long
+        // journal for a viewer never holds up live updates to other scopes.
+        let rebuilding: Vec<Uuid> = authority
+            .rebuilding
+            .lock()
+            .expect("rebuild set")
+            .iter()
+            .copied()
+            .collect();
+        for session in &rebuilding {
+            authority.recover_scope(*session).await;
+        }
         let wake = authority.publisher_wake.notified();
         let session = tokio::select! {
             session=inbox.recv()=>match session {Some(session)=>session,None=>return},
             _=wake=>continue,
             _=tokio::time::sleep(std::time::Duration::from_secs(1)), if recovery.load(Ordering::Acquire)=>continue,
+            _=std::future::ready(()), if !rebuilding.is_empty()=>continue,
         };
         drop(authority);
         if session.is_nil() {
@@ -908,6 +954,9 @@ impl SyncAuthority {
                     cursor,
                 },
             )?;
+        } else {
+            self.rebuilding.lock().expect("rebuild set").insert(session);
+            self.publisher_wake.notify_one();
         }
         Ok(())
     }

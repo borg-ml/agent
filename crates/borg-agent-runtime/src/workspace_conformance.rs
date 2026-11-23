@@ -2694,3 +2694,79 @@ async fn work_changes_recover_old_writers_without_notifications() {
     drop((work, messages, store, session));
     scratch.discard().await;
 }
+
+/// Pruning old session-event pointers must keep each session's newest one:
+/// the projection resumes from that watermark, and losing it would make every
+/// session re-project its whole journal into the workspace on next open.
+#[cfg(test)]
+#[tokio::test]
+async fn pruning_session_pointers_keeps_the_projection_watermark_and_messages() {
+    let url = crate::session_store::postgres::testing::required_test_url();
+    let scratch = ScratchDatabase::create(&url).await;
+    let session = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
+        .await
+        .expect("bootstrap scratch schema");
+    let store = PostgresWorkspaceStore::from_pool(session.pool().clone());
+    let (workspace, author, second, _) = workspace_with_members(&store).await;
+    let old = Utc::now() - chrono::Duration::days(30);
+    let pointer = |source: Uuid, sequence: u64| {
+        let mut event = session_projection(workspace, source);
+        event.created_at = old;
+        if let WorkspaceEventKind::SessionEvent {
+            session_sequence, ..
+        } = &mut event.kind
+        {
+            *session_sequence = sequence;
+        }
+        event
+    };
+    store
+        .append_session_event_batch(&[pointer(author, 1), pointer(author, 2), pointer(second, 1)])
+        .await
+        .unwrap();
+    store
+        .append(message_event(
+            workspace,
+            author,
+            "kept",
+            Audience::Workspace,
+            "kept",
+        ))
+        .await
+        .unwrap();
+    store
+        .append_session_event_batch(&[pointer(author, 3)])
+        .await
+        .unwrap();
+
+    let deleted = session
+        .prune_session_event_pointers(Utc::now() - chrono::Duration::days(7), |_, _, _| {})
+        .await
+        .unwrap();
+    assert_eq!(deleted, 2);
+    for (source, watermark) in [(author, 3), (second, 1)] {
+        assert_eq!(
+            store
+                .latest_projected_session_sequence(workspace, source)
+                .await
+                .unwrap(),
+            watermark
+        );
+    }
+    let kinds: Vec<_> = store
+        .replay(workspace, author, 0, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|event| event.kind)
+        .collect();
+    assert_eq!(kinds.len(), 3);
+    assert!(
+        kinds
+            .iter()
+            .any(|kind| matches!(kind, WorkspaceEventKind::Message { .. }))
+    );
+    drop(store);
+    session.pool().close().await;
+    scratch.discard().await;
+}

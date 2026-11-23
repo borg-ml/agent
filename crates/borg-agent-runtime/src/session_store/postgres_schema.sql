@@ -80,6 +80,10 @@ create table if not exists sessions (
 
 create index if not exists idx_sessions_activity on sessions (updated_at desc);
 
+-- Set while the session's events, payloads and actions live in an archive
+-- file (see postgres/archive.rs); the row itself stays so it is still listed.
+alter table sessions add column if not exists archive_ref text;
+
 create table if not exists session_model_access (
     session_id       uuid not null references sessions (id) on delete cascade,
     provider         text not null,
@@ -241,6 +245,48 @@ create table if not exists session_payloads (
 create index if not exists idx_session_payloads_event
     on session_payloads (session_id, event_id);
 
+-- Payload bodies are content-addressed blobs (see postgres/payloads.rs).
+-- `payload` is only set on rows written by releases before blobs; a row with
+-- a null `payload` is the ordered concatenation of its parts.
+alter table session_payloads alter column payload drop not null;
+
+-- When background retention last ran (postgres/storage.rs), and when an
+-- operator last ran `borg storage prune --apply`, which is what lets the
+-- background also rewrite payloads and archive.
+create table if not exists borg_storage_maintenance (
+    id                integer     primary key check (id = 1),
+    last_run          timestamptz not null,
+    operator_prune_at timestamptz
+);
+
+create table if not exists session_blobs (
+    hash    bytea  primary key,
+    -- 0: body is the bytes; 1: body is their zstd frame.
+    codec   smallint not null,
+    raw_len bigint not null,
+    body    bytea  not null
+);
+
+-- Bodies are already compressed (zstd, or images): skip pglz's attempt.
+alter table session_blobs alter column body set storage external;
+
+create table if not exists session_payload_parts (
+    payload_id uuid    not null references session_payloads (id) on delete cascade,
+    ordinal    integer not null,
+    blob_hash  bytea   not null references session_blobs (hash),
+    -- The blob holds decoded bytes of a canonical base64 run.
+    base64     boolean not null,
+    primary key (payload_id, ordinal)
+);
+
+create index if not exists idx_session_payload_parts_blob
+    on session_payload_parts (blob_hash);
+
+-- Retention deletes in bulk from these; the default 20% threshold left
+-- tens of gigabytes of dead rows and stale planner statistics between runs.
+alter table session_payloads set
+    (autovacuum_vacuum_scale_factor = 0.02, autovacuum_analyze_scale_factor = 0.02);
+
 -- Search is a disposable projection, exactly as in SQLite: session_events is
 -- the only source of truth and this table can be dropped and rebuilt. It
 -- exists so that history stays queryable even though event_body is compressed
@@ -274,6 +320,10 @@ create index if not exists idx_session_event_search_tsv
 -- Substring/trigram recall for identifiers that do not tokenise as words.
 create index if not exists idx_session_event_search_trgm
     on session_event_search using gin (body gin_trgm_ops);
+
+-- Idle-session retention deletes in bulk (see storage.rs).
+alter table session_event_search set
+    (autovacuum_vacuum_scale_factor = 0.02, autovacuum_analyze_scale_factor = 0.02);
 
 create table if not exists session_actions (
     action_id         uuid        primary key,

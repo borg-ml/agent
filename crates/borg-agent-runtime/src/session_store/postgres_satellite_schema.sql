@@ -68,6 +68,10 @@ create index if not exists idx_workspace_events_messages
     on workspace_events (workspace_id, sequence)
     where is_message;
 
+-- Pointer retention deletes in bulk; see storage.rs.
+alter table workspace_events set
+    (autovacuum_vacuum_scale_factor = 0.02, autovacuum_analyze_scale_factor = 0.02);
+
 create table if not exists workspace_deliveries (
     workspace_id      text    not null,
     sequence          bigint  not null,

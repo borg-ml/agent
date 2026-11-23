@@ -119,7 +119,7 @@ impl PostgresSessionStore {
                 "select event_json, event_body, dict_id from session_events \
                  where session_id = $1 and event_kind = 'subagent_activity' \
                    and subagent_session_id = $2 and sequence < $3 \
-                   and jsonb_typeof(event_json -> 'kind' -> 'event') = 'object' \
+                   and (event_json is null or jsonb_typeof(event_json -> 'kind' -> 'event') = 'object') \
                  order by sequence desc limit 1",
             )
             .bind(session_id)

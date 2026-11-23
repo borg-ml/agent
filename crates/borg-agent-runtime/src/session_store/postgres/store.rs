@@ -31,10 +31,10 @@ use crate::session_store::{
     SessionActionState, SessionActionTransition, SessionEvent, SessionEventKind,
     SessionHistoryIndexDocument, SessionHistoryPage, SessionHistoryQuery, SessionHistorySearchMode,
     SessionLineage, SessionLiveEvent, SessionPayloadKind, SessionPayloadRef, SessionRecovery,
-    SessionState, SessionStatus, SessionStore, SessionStoreCompaction, SessionStoreFork,
-    SessionStoreHealth, SessionSummary, SessionWorkspaceBinding, deferred_json_payload,
-    deferred_provider_payload, deferred_text_payload, deferred_tool_output_payload, event_kind,
-    historical_projection_json, oversized_provider_payload_bytes,
+    SessionState, SessionStatus, SessionStore, SessionStoreFork, SessionStoreHealth,
+    SessionSummary, SessionWorkspaceBinding, deferred_json_payload, deferred_provider_payload,
+    deferred_text_payload, deferred_tool_output_payload, event_kind, historical_projection_json,
+    oversized_provider_payload_bytes,
 };
 
 fn reasoning_snapshot(
@@ -396,11 +396,37 @@ impl PostgresSessionStore {
         // this costs one branch rather than a new mechanism. The trade is that
         // these rows are opaque to ad-hoc SQL -- exactly the documented trade
         // for any cold row.
-        let body_value = serde_json::to_value(&compact_event)?;
+        //
+        // A mirrored child event is a copy of a row the child's own journal
+        // keeps readable, and these copies were the largest share of the
+        // journal (16 GB of 37 GB measured). At ~2 KB each they sit under
+        // TOAST's compression threshold, so they are written compressed with
+        // the trained dictionary instead -- a fraction of the size, and out of
+        // the jsonb containment index that existed for readable history.
         let body_text = serde_json::to_string(&compact_event)?;
-        let nul_bearing = body_text.contains("\\u0000");
-        let body = if nul_bearing { None } else { Some(body_value) };
-        let body_bytes = nul_bearing.then(|| body_text.into_bytes());
+        let mirror = matches!(
+            &compact_event.kind,
+            SessionEventKind::SubagentActivity { event: Some(_), .. }
+        );
+        let (body, body_bytes, dict_id) = if mirror {
+            let dictionary = self.append_dictionary(transaction).await?;
+            match super::body::compress_at(
+                body_text.as_bytes(),
+                dictionary.as_deref(),
+                super::body::APPEND_COMPRESSION_LEVEL,
+            )? {
+                super::body::StoredBody::Compressed { bytes, dict_id } => {
+                    (None, Some(bytes), dict_id)
+                }
+                super::body::StoredBody::Readable(_) => {
+                    unreachable!("compression produces a compressed body")
+                }
+            }
+        } else if body_text.contains("\\u0000") {
+            (None, Some(body_text.into_bytes()), None)
+        } else {
+            (Some(serde_json::to_value(&compact_event)?), None, None)
+        };
         let projection_json = serde_json::to_string(&state)?;
         // Only checkpoint rows carry a projection; the rest replay forward from
         // the newest one. Identical policy to SQLite, and the single largest
@@ -417,10 +443,10 @@ impl PostgresSessionStore {
 
         sqlx::query(
             "insert into session_events \
-             (session_id, sequence, event_id, event_kind, event_json, event_body, \
+             (session_id, sequence, event_id, event_kind, event_json, event_body, dict_id, \
               projection_json, fork_inheritable, recovery_relevant, message_id, created_at, \
               subagent_session_id, provider_event_kind) \
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
         )
         .bind(event.session_id)
         .bind(i64::try_from(event.sequence).context("session sequence exceeds a bigint")?)
@@ -428,6 +454,7 @@ impl PostgresSessionStore {
         .bind(&stored_event_kind)
         .bind(&body)
         .bind(body_bytes.as_deref())
+        .bind(dict_id)
         .bind(historical_projection)
         .bind(event.kind.is_fork_inheritable())
         .bind(event.kind.is_recovery_relevant())
@@ -898,19 +925,15 @@ async fn store_payload(
         kind,
         byte_len: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
     };
-    sqlx::query(
-        "insert into session_payloads \
-         (id, session_id, event_id, payload_kind, payload, byte_len, created_at) \
-         values ($1, $2, $3, $4, $5, $6, $7) on conflict (id) do nothing",
+    super::payloads::insert_payload(
+        transaction,
+        id,
+        event.session_id,
+        event.id,
+        kind.as_str(),
+        bytes,
+        event.created_at,
     )
-    .bind(id)
-    .bind(event.session_id)
-    .bind(event.id)
-    .bind(kind.as_str())
-    .bind(bytes)
-    .bind(i64::try_from(bytes.len()).context("session payload exceeds a bigint")?)
-    .bind(event.created_at)
-    .execute(&mut **transaction)
     .await?;
     Ok(payload)
 }
@@ -1241,12 +1264,9 @@ impl SessionStore for PostgresSessionStore {
     }
 
     async fn load_payload(&self, payload: &SessionPayloadRef) -> Result<Vec<u8>> {
-        let bytes: Option<Vec<u8>> =
-            sqlx::query_scalar("select payload from session_payloads where id = $1")
-                .bind(payload.id)
-                .fetch_optional(self.pool())
-                .await?;
-        bytes.with_context(|| format!("session payload {} is missing", payload.id))
+        self.read_payload(payload.id)
+            .await?
+            .with_context(|| format!("session payload {} is missing", payload.id))
     }
 
     async fn contains_message(&self, session_id: Uuid, message_id: Uuid) -> Result<bool> {
@@ -1570,10 +1590,6 @@ impl SessionStore for PostgresSessionStore {
         ))
     }
 
-    async fn compact(&self, vacuum: bool) -> Result<SessionStoreCompaction> {
-        Self::compact(self, vacuum).await
-    }
-
     async fn readiness(&self) -> Result<SessionStoreHealth> {
         Self::readiness(self).await
     }
@@ -1625,24 +1641,18 @@ impl SessionStore for PostgresSessionStore {
         payload: &SessionPayloadRef,
         bytes: &[u8],
     ) -> Result<()> {
-        sqlx::query(
-            "insert into session_payloads \
-             (id, session_id, event_id, payload_kind, payload, byte_len, created_at) \
-             values ($1, $2, $3, $4, $5, $6, $7) on conflict (id) do nothing",
+        let mut transaction = self.pool().begin().await?;
+        super::payloads::insert_payload(
+            &mut transaction,
+            payload.id,
+            session_id,
+            event_id,
+            payload.kind.as_str(),
+            bytes,
+            Utc::now(),
         )
-        .bind(payload.id)
-        .bind(session_id)
-        .bind(event_id)
-        .bind(
-            serde_json::to_value(payload.kind)?
-                .as_str()
-                .unwrap_or_default(),
-        )
-        .bind(bytes)
-        .bind(i64::try_from(bytes.len()).context("payload exceeds a bigint")?)
-        .bind(Utc::now())
-        .execute(self.pool())
         .await?;
+        transaction.commit().await?;
         Ok(())
     }
 

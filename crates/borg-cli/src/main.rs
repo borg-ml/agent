@@ -22,8 +22,8 @@ mod lane_service_commands;
 mod protection;
 mod remote_commands;
 mod session_commands;
-mod storage_commands;
 mod sleep_inhibitor;
+mod storage_commands;
 mod terminal_ui {
     pub(crate) use borg_tui::*;
 }

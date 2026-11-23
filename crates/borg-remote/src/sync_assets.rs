@@ -1,7 +1,6 @@
 use super::*;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use borg_view::wire::{AssetRef, TextField};
-use sqlx::Row;
 
 impl SyncAuthority {
     #[allow(clippy::too_many_arguments)]
@@ -49,23 +48,26 @@ impl SyncAuthority {
             )
         } else {
             let payload = Uuid::parse_str(&asset_id)?;
-            let row=sqlx::query("select payload_kind,byte_len,substring(payload from $3::integer for $4::integer) body from session_payloads where id=$1 and session_id=$2")
-                .bind(payload).bind(session).bind(i32::try_from(start.checked_add(1).ok_or_else(||anyhow::anyhow!("asset offset exhausted"))?)?).bind(i32::try_from(budget)?).fetch_optional(&self.pg.pool).await?.ok_or_else(||anyhow::anyhow!("asset outside source scope"))?;
-            let kind: String = row.try_get("payload_kind")?;
+            let mut connection = self.pg.pool.acquire().await?;
+            let slice = crate::session_store::postgres::payloads::read_payload_range(
+                &mut connection,
+                payload,
+                Some(session),
+                start,
+                budget,
+            )
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("asset outside source scope"))?;
             ensure!(
                 matches!(
-                    kind.as_str(),
+                    slice.kind.as_str(),
                     "tool_input" | "tool_output" | "tool_result_input" | "final_text"
                 ),
                 "private provider/auth asset is not viewable"
             );
-            let total = usize::try_from(row.try_get::<i64, _>("byte_len")?)?;
+            let total = usize::try_from(slice.byte_len)?;
             ensure!(start <= total, "asset offset outside body");
-            (
-                row.try_get::<Vec<u8>, _>("body")?,
-                total,
-                "text/plain".to_owned(),
-            )
+            (slice.bytes, total, "text/plain".to_owned())
         };
         let next = start
             .checked_add(data.len())

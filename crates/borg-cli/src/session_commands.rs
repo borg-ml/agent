@@ -98,9 +98,6 @@ pub(crate) async fn run(command: SessionCommand) -> Result<()> {
                     output,
                     json,
                 } => export_session(store.as_ref(), session, output, json).await,
-                SessionCommand::Compact { no_vacuum, json } => {
-                    compact_store(store.as_ref(), !no_vacuum, json).await
-                }
                 SessionCommand::Import { .. }
                 | SessionCommand::Snapshot { .. }
                 | SessionCommand::Restore { .. }
@@ -112,32 +109,8 @@ pub(crate) async fn run(command: SessionCommand) -> Result<()> {
     }
 }
 
-async fn compact_store(store: &dyn SessionStore, vacuum: bool, json: bool) -> Result<()> {
-    let outcome = store.compact(vacuum).await?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&outcome)?);
-        return Ok(());
-    }
-    println!(
-        "Removed {} stale mirrored subagent rows and {} orphaned search rows.",
-        outcome.deleted_events, outcome.deleted_search_rows
-    );
-    if outcome.vacuumed {
-        println!(
-            "Session store: {} -> {}",
-            human_bytes(outcome.bytes_before),
-            human_bytes(outcome.bytes_after)
-        );
-    } else {
-        println!(
-            "Session store stays at {}; freed pages are reused. Run without --no-vacuum to shrink the file.",
-            human_bytes(outcome.bytes_before)
-        );
-    }
-    Ok(())
-}
-
-pub(crate) async fn open_postgres() -> Result<borg_remote::session_store::postgres::PostgresSessionStore> {
+pub(crate) async fn open_postgres()
+-> Result<borg_remote::session_store::postgres::PostgresSessionStore> {
     borg_remote::session_store::factory::open_postgres(
         &borg_remote::session_store::factory::SessionStoreConfig::from_env(),
     )

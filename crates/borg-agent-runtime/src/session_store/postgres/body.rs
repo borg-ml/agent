@@ -79,17 +79,29 @@ impl StoredBody {
 /// been trained -- the very first events in an empty database have no corpus to
 /// train from.
 pub fn compress(json: &[u8], dictionary: Option<&EventDictionary>) -> Result<StoredBody> {
+    compress_at(json, dictionary, COLD_COMPRESSION_LEVEL)
+}
+
+/// Compression level for bodies compressed as they are appended (mirrored
+/// subagent events): the append waits on it, and on records this small a
+/// trained dictionary, not the level, decides the ratio.
+pub const APPEND_COMPRESSION_LEVEL: i32 = 3;
+
+/// [`compress`] at an explicit zstd level.
+pub fn compress_at(
+    json: &[u8],
+    dictionary: Option<&EventDictionary>,
+    level: i32,
+) -> Result<StoredBody> {
     let bytes = match dictionary {
         Some(dictionary) => {
-            let mut compressor =
-                zstd::bulk::Compressor::with_dictionary(COLD_COMPRESSION_LEVEL, &dictionary.bytes)
-                    .context("failed to build a dictionary compressor")?;
+            let mut compressor = zstd::bulk::Compressor::with_dictionary(level, &dictionary.bytes)
+                .context("failed to build a dictionary compressor")?;
             compressor
                 .compress(json)
                 .context("failed to compress an event body with a dictionary")?
         }
-        None => zstd::bulk::compress(json, COLD_COMPRESSION_LEVEL)
-            .context("failed to compress an event body")?,
+        None => zstd::bulk::compress(json, level).context("failed to compress an event body")?,
     };
     Ok(StoredBody::Compressed {
         bytes,

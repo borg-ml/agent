@@ -413,19 +413,30 @@ impl PostgresSessionStore {
         // most recently active sessions first within a time budget, and a
         // session left over makes the page say so instead of silently
         // contributing nothing.
+        //
+        // Only sessions active within cache retention are indexed here: the
+        // index of an idle session is dropped by `borg storage prune`, and
+        // rebuilding every idle session on each global search would grow it
+        // back without bound. Searching one of them by session id indexes it.
         let mut unindexed_sessions = 0usize;
+        let mut idle_unindexed_sessions = 0usize;
         if text.is_some() {
-            let sessions: Vec<Uuid> = sqlx::query_scalar(
-                "select id from sessions where inherited_event_count = 0 \
+            let sessions: Vec<(Uuid, bool)> = sqlx::query_as(
+                "select id, updated_at > now() - make_interval(days => $1) from sessions \
+                 where inherited_event_count = 0 \
                  and exists (select 1 from session_events e where e.session_id = sessions.id \
                    and not exists (select 1 from session_event_search s \
                      where s.session_id = e.session_id and s.event_id = e.event_id)) \
                  order by updated_at desc",
             )
+            .bind(i32::try_from(super::storage::IDLE_CACHE_DAYS)?)
             .fetch_all(self.pool())
             .await?;
+            let (sessions, idle): (Vec<_>, Vec<_>) =
+                sessions.into_iter().partition(|(_, recent)| *recent);
+            idle_unindexed_sessions = idle.len();
             let deadline = std::time::Instant::now() + GLOBAL_PROJECTION_BUDGET;
-            for (index, session_id) in sessions.iter().enumerate() {
+            for (index, (session_id, _)) in sessions.iter().enumerate() {
                 if std::time::Instant::now() >= deadline {
                     unindexed_sessions = sessions.len() - index;
                     break;
@@ -452,6 +463,28 @@ impl PostgresSessionStore {
             page.backend = format!(
                 "{} ({unindexed_sessions} sessions not yet indexed; each all_sessions search indexes more, newest first)",
                 page.backend
+            );
+        }
+        let archived: i64 = if text.is_some() {
+            sqlx::query_scalar("select count(*) from sessions where archive_ref is not null")
+                .fetch_one(self.pool())
+                .await?
+        } else {
+            0
+        };
+        if archived > 0 {
+            page.search_incomplete = true;
+            page.backend = format!(
+                "{} ({archived} archived sessions are not searched; search one by session id to restore and include it)",
+                page.backend
+            );
+        }
+        if idle_unindexed_sessions > 0 {
+            page.search_incomplete = true;
+            page.backend = format!(
+                "{} ({idle_unindexed_sessions} sessions idle over {} days are not in the global index; search one by session id to include it)",
+                page.backend,
+                super::storage::IDLE_CACHE_DAYS
             );
         }
         Ok(page)
@@ -876,33 +909,27 @@ impl PostgresSessionStore {
                 }
                 let take = (*payload_budget)
                     .min(usize::try_from(reference.byte_len).unwrap_or(usize::MAX));
-                let row = sqlx::query(
-                    "select payload_kind, byte_len, substring(payload from 1 for $1) as payload \
-                     from session_payloads where id = $2",
+                let mut connection = self.pool().acquire().await?;
+                let slice = super::payloads::read_payload_range(
+                    &mut connection,
+                    reference.id,
+                    None,
+                    0,
+                    take,
                 )
-                // `substring(bytea from int for int)` is the only bytea
-                // overload Postgres has: passing a bigint here resolves to no
-                // function at all and fails the whole read. The cap is a byte
-                // budget that never approaches i32::MAX, so the clamp is a
-                // formality rather than a silent truncation.
-                .bind(i32::try_from(take).unwrap_or(i32::MAX))
-                .bind(reference.id)
-                .fetch_optional(self.pool())
                 .await?
                 .with_context(|| format!("session payload {} does not exist", reference.id))?;
                 ensure!(
-                    row.try_get::<String, _>("payload_kind")? == reference.kind.as_str(),
+                    slice.kind == reference.kind.as_str(),
                     "session payload {} has a different typed kind",
                     reference.id
                 );
-                let stored_len = u64::try_from(row.try_get::<i64, _>("byte_len")?)
-                    .context("negative payload length")?;
                 ensure!(
-                    stored_len == reference.byte_len,
+                    slice.byte_len == reference.byte_len,
                     "session payload {} length does not match its reference",
                     reference.id
                 );
-                let bytes: Vec<u8> = row.try_get("payload")?;
+                let bytes = slice.bytes;
                 let mut text = String::from_utf8_lossy(&bytes).into_owned();
                 let text_truncated = bound_history_text(&mut text, payload_budget);
                 let truncated = bytes.len() as u64 != reference.byte_len || text_truncated;

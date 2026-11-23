@@ -379,17 +379,6 @@ pub(crate) enum SessionCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Drop journal rows the current release never persists (mirrored
-    /// subagent heartbeats and streaming deltas) and shrink the store file.
-    Compact {
-        /// Delete stale rows but skip the VACUUM that rewrites the file.
-        /// The VACUUM needs exclusive access and free disk roughly equal to
-        /// the live data size.
-        #[arg(long)]
-        no_vacuum: bool,
-        #[arg(long)]
-        json: bool,
-    },
     /// Report, or with --apply delete online, the workspace delivery rows
     /// releases up to 0.16.5 wrote for every workspace-wide event. Deletes
     /// run in bounded per-workspace batches and resume where they stopped.
@@ -437,6 +426,70 @@ pub(crate) enum StorageCommand {
         sample_percent: f64,
         #[arg(long)]
         json: bool,
+    },
+    /// Apply retention online, in short batched transactions: compress
+    /// mirrored subagent events, rewrite raw payloads as deduplicated
+    /// compressed blobs, drop the remote view and search index of sessions
+    /// idle over 7 days (rebuilt when next opened or searched), and delete
+    /// workspace session-event pointers older than a day (keeping each
+    /// session's newest). Takes no exclusive locks; freed space is reused by
+    /// Postgres and returned to the filesystem by `borg storage compact`.
+    /// Run it only once every Borg process runs this release: older ones
+    /// cannot read rewritten payloads. After it, background maintenance
+    /// rewrites payloads and archives too. Without --apply it only reports
+    /// what each step would touch.
+    Prune {
+        #[arg(long)]
+        apply: bool,
+        /// Run even without a backup from the last 24 hours.
+        #[arg(long)]
+        no_backup_check: bool,
+    },
+    /// Move sessions idle for --older-than-days (default 30) out of the hot
+    /// tables into compressed, content-addressed archive files. Only whole
+    /// session trees go, when no member is running or was touched since the
+    /// cutoff. Archived sessions stay listed and are restored automatically
+    /// when read. Without --apply it lists what would be archived.
+    Archive {
+        #[arg(long, default_value_t = 30)]
+        older_than_days: i64,
+        /// Archive directory (default: $BORG_ARCHIVE_DIR or ~/.borg/archive).
+        #[arg(long)]
+        archive_dir: Option<PathBuf>,
+        /// Stop after this many sessions.
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        apply: bool,
+        #[arg(long)]
+        no_backup_check: bool,
+    },
+    /// Bring an archived session back into the hot tables now.
+    Restore { session: Uuid },
+    /// Dump the whole session database with pg_dump into the archive
+    /// directory's backups/ folder (directory format, zstd, parallel).
+    Backup {
+        #[arg(long)]
+        archive_dir: Option<PathBuf>,
+        #[arg(long, default_value_t = 4)]
+        jobs: u32,
+    },
+    /// Return freed space to the filesystem, table by table, with pg_repack
+    /// when installed or else VACUUM FULL. Checks free disk space and that no
+    /// session is running first. VACUUM FULL locks each table exclusively
+    /// while it is rewritten, so run it in a quiet window. Without --apply it
+    /// prints the plan: commands, locks and rough durations.
+    Compact {
+        /// Only these tables (default: every table over 256 MiB).
+        #[arg(long = "table")]
+        tables: Vec<String>,
+        #[arg(long)]
+        apply: bool,
+        /// Proceed even when sessions are running or free space looks short.
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        no_backup_check: bool,
     },
 }
 

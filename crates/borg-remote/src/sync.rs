@@ -117,6 +117,10 @@ pub struct SyncAuthority {
     store: Arc<dyn SessionStore>,
     pg: crate::session_store::postgres::publication::PostgresAuthority,
     projectors: Mutex<HashMap<Uuid, projector::Projector>>,
+    /// Scopes a viewer opened whose projection is behind the journal, most
+    /// often because idle-cache retention dropped it. The publisher replays
+    /// them a chunk per turn, between live updates.
+    rebuilding: std::sync::Mutex<std::collections::HashSet<Uuid>>,
     projection: ProjectionStore,
     ledger: crate::command_ledger::CommandLedger,
     outbound: mpsc::Sender<TunnelFrame>,
@@ -147,6 +151,7 @@ impl SyncAuthority {
             ledger: crate::command_ledger::CommandLedger::open(authority.pool.clone()).await?,
             pg: authority,
             projectors: Mutex::new(HashMap::new()),
+            rebuilding: std::sync::Mutex::new(std::collections::HashSet::new()),
             store,
             outbound,
             commands,

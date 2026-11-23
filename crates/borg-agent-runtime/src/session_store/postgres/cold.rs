@@ -51,7 +51,16 @@ pub struct ColdAgeOutcome {
 #[derive(Debug, Clone, Default)]
 pub struct DictionaryCache {
     entries: Arc<RwLock<HashMap<i32, Arc<EventDictionary>>>>,
+    /// The newest dictionary id and when it was looked up, so appends do not
+    /// query for it every time.
+    latest: Arc<RwLock<LatestDictionary>>,
 }
+
+/// When the newest dictionary id was looked up, and what it was.
+type LatestDictionary = Option<(std::time::Instant, Option<i32>)>;
+
+/// How long appends trust a looked-up newest dictionary id.
+const LATEST_DICTIONARY_TTL: Duration = Duration::from_secs(600);
 
 impl DictionaryCache {
     fn get(&self, dict_id: i32) -> Option<Arc<EventDictionary>> {
@@ -69,6 +78,50 @@ impl DictionaryCache {
 }
 
 impl PostgresSessionStore {
+    /// The newest trained dictionary for compressing a body on append, read
+    /// through `connection` (the append's own transaction) and cached. Never
+    /// trains one: training reads thousands of bodies, which an append must
+    /// not wait for; `borg storage prune` trains when none exists.
+    pub(super) async fn append_dictionary(
+        &self,
+        connection: &mut sqlx::PgConnection,
+    ) -> Result<Option<Arc<EventDictionary>>> {
+        let cached = self
+            .dictionaries
+            .latest
+            .read()
+            .ok()
+            .and_then(|latest| *latest)
+            .filter(|(checked, _)| checked.elapsed() < LATEST_DICTIONARY_TTL);
+        let dict_id = match cached {
+            Some((_, dict_id)) => dict_id,
+            None => {
+                let dict_id: Option<i32> =
+                    sqlx::query_scalar("select max(dict_id) from session_event_dicts")
+                        .fetch_one(&mut *connection)
+                        .await?;
+                if let Ok(mut latest) = self.dictionaries.latest.write() {
+                    *latest = Some((std::time::Instant::now(), dict_id));
+                }
+                dict_id
+            }
+        };
+        let Some(dict_id) = dict_id else {
+            return Ok(None);
+        };
+        if let Some(dictionary) = self.dictionaries.get(dict_id) {
+            return Ok(Some(dictionary));
+        }
+        let bytes: Vec<u8> =
+            sqlx::query_scalar("select dict_bytes from session_event_dicts where dict_id = $1")
+                .bind(dict_id)
+                .fetch_one(&mut *connection)
+                .await?;
+        let dictionary = Arc::new(EventDictionary { dict_id, bytes });
+        self.dictionaries.insert(Arc::clone(&dictionary));
+        Ok(Some(dictionary))
+    }
+
     /// Load a dictionary by id, through the cache.
     pub async fn dictionary(&self, dict_id: i32) -> Result<Arc<EventDictionary>> {
         if let Some(cached) = self.dictionaries.get(dict_id) {

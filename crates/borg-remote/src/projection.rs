@@ -165,8 +165,16 @@ impl ProjectionStore {
             .execute(&mut *tx)
             .await?;
         if let Some((id, session, event, body)) = asset {
-            sqlx::query("insert into session_payloads(id,session_id,event_id,payload_kind,payload,byte_len,created_at) values($1,$2,$3,'final_text',$4,$5,now())")
-                .bind(id).bind(session).bind(event).bind(body).bind(body.len() as i64).execute(&mut *tx).await?;
+            crate::session_store::postgres::payloads::insert_payload(
+                &mut tx,
+                id,
+                session,
+                event,
+                "final_text",
+                body,
+                chrono::Utc::now(),
+            )
+            .await?;
         }
         if let Some((message, turn)) = turn {
             sqlx::query("insert into remote_turn_results values($1,$2,$3) on conflict(scope,message_id) do update set frame=excluded.frame")
@@ -215,6 +223,29 @@ impl ProjectionStore {
         tx.commit().await?;
         Ok(Some(frames))
     }
+}
+
+/// Whether a catalog pass should leave `session` for a viewer to rebuild on
+/// demand: it went idle past cache retention with no projection left, or it
+/// is archived (reading it would restore it from the archive).
+pub async fn idle_without_projection(
+    pool: &PgPool,
+    scope: &str,
+    session: uuid::Uuid,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "select coalesce((select archive_ref is not null from sessions where id = $2), false) \
+            or (not exists (select 1 from remote_view_checkpoints where scope = $1) \
+                and coalesce((select updated_at < now() - make_interval(days => $3) \
+                              from sessions where id = $2), true))",
+    )
+    .bind(scope)
+    .bind(session)
+    .bind(i32::try_from(
+        crate::session_store::postgres::storage::IDLE_CACHE_DAYS,
+    )?)
+    .fetch_one(pool)
+    .await?)
 }
 
 /// Never use a shared literal `host` scope in a multi-host journal.

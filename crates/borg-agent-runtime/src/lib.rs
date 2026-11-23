@@ -145,8 +145,8 @@ pub use session_store::{
     ClaimedActionTransition, EventPersistence, RecoveryParts, SESSION_PROJECTION_VERSION,
     SessionConfiguration, SessionHistoryHit, SessionHistoryIndexDocument, SessionHistoryPage,
     SessionHistoryPayload, SessionHistoryQuery, SessionHistorySearchMode, SessionLiveEvent,
-    SessionRecovery, SessionState, SessionStore, SessionStoreCompaction, SessionStoreFork,
-    SessionStoreHealth, SessionSummary, SessionUsage, SessionWorkspaceBinding,
+    SessionRecovery, SessionState, SessionStore, SessionStoreFork, SessionStoreHealth,
+    SessionSummary, SessionUsage, SessionWorkspaceBinding,
 };
 pub use subagents::{
     AgentToolDispatcher, AgentToolServer, DEFAULT_MAX_SUBAGENTS, MAX_MESSAGE_ATTACHMENT_BYTES,

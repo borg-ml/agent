@@ -7,9 +7,7 @@ use uuid::Uuid;
 
 use super::PostgresSessionStore;
 use crate::SessionEvent;
-use crate::session_store::{
-    EventPersistence, SessionState, SessionStoreCompaction, SessionWorkspaceBinding,
-};
+use crate::session_store::{EventPersistence, SessionState, SessionWorkspaceBinding};
 
 /// Rows examined per transaction while compacting.
 const COMPACT_BATCH: i64 = 2_000;
@@ -22,16 +20,10 @@ pub struct RetentionOutcome {
 }
 
 impl PostgresSessionStore {
-    /// Drop rows the live journal would no longer persist, and search rows that
-    /// no longer have an event.
-    ///
-    /// `vacuum` runs a plain `vacuum analyze`, which returns space to the table
-    /// for reuse and refreshes planner statistics. It deliberately does NOT run
-    /// `vacuum full`: that takes an exclusive lock and rewrites the table, which
-    /// on a shared journal would stall every agent on the machine -- exactly the
-    /// contention this backend exists to remove.
-    pub async fn compact(&self, vacuum: bool) -> Result<SessionStoreCompaction> {
-        let bytes_before = self.journal_bytes().await?;
+    /// Drop rows the live journal would no longer persist (mirrored subagent
+    /// rows older releases wrote durably), and search rows that no longer have
+    /// an event. Returns `(events, search rows)` deleted.
+    pub async fn prune_stale_rows(&self) -> Result<(u64, u64)> {
         let mut deleted_events = 0u64;
         let mut cursor: Option<(Uuid, i64)> = None;
         loop {
@@ -95,26 +87,7 @@ impl PostgresSessionStore {
         .await?
         .rows_affected();
 
-        if vacuum {
-            // Cannot run inside a transaction, hence the raw execution.
-            sqlx::raw_sql("vacuum analyze").execute(self.pool()).await?;
-        }
-        let bytes_after = self.journal_bytes().await?;
-        Ok(SessionStoreCompaction {
-            deleted_events,
-            deleted_search_rows,
-            vacuumed: vacuum,
-            bytes_before,
-            bytes_after,
-        })
-    }
-
-    async fn journal_bytes(&self) -> Result<i64> {
-        Ok(
-            sqlx::query_scalar("select pg_database_size(current_database())::bigint")
-                .fetch_one(self.pool())
-                .await?,
-        )
+        Ok((deleted_events, deleted_search_rows))
     }
 
     /// Delete whole sessions last touched before `cutoff`.
@@ -653,7 +626,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compaction_prunes_stale_projections_and_reports_sizes() {
+    async fn pruning_removes_orphaned_search_rows() {
         let Some(url) = test_url() else {
             eprintln!("skipping: BORG_TEST_SESSIONS_URL is not set");
             return;
@@ -691,23 +664,14 @@ mod tests {
             .await
             .expect("delete event");
 
-        let outcome = store.compact(false).await.expect("compact");
+        let (_, search_rows) = store.prune_stale_rows().await.expect("prune");
         assert_eq!(
-            outcome.deleted_search_rows, 1,
+            search_rows, 1,
             "a search row without an event must be pruned"
         );
-        assert!(!outcome.vacuumed);
-        assert!(outcome.bytes_before > 0 && outcome.bytes_after > 0);
 
-        // Compaction is idempotent.
-        assert_eq!(
-            store
-                .compact(false)
-                .await
-                .expect("compact")
-                .deleted_search_rows,
-            0
-        );
+        // Pruning is idempotent.
+        assert_eq!(store.prune_stale_rows().await.expect("prune").1, 0);
         scratch.discard().await;
     }
 }

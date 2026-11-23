@@ -20,6 +20,7 @@ use sqlx::{ConnectOptions, Executor};
 use super::{SESSION_SCHEMA_VERSION, SessionStoreHealth};
 
 pub mod actions;
+pub mod archive;
 pub mod body;
 pub mod cold;
 pub mod delivery_maintenance;
@@ -28,6 +29,7 @@ pub mod harness;
 pub mod host;
 pub mod live_text;
 pub mod maintenance;
+pub mod payloads;
 pub mod publication;
 pub mod recovery;
 pub mod runtime;

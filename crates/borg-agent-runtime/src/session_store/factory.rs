@@ -395,8 +395,7 @@ mod tests {
     }
 
     use crate::session_store::{
-        RawSessionEvent, RecoveryParts, SessionLineage, SessionStoreCompaction, SessionStoreHealth,
-        SessionWorkspaceBinding,
+        RawSessionEvent, RecoveryParts, SessionLineage, SessionStoreHealth, SessionWorkspaceBinding,
     };
     use crate::session_store::{
         RuntimeCheckpoint, RuntimeManifest, RuntimeManifestActivation, SessionHistoryIndexDocument,
@@ -841,9 +840,6 @@ mod tests {
         async fn receipt_store(
             &self,
         ) -> Result<std::sync::Arc<dyn crate::receipt::ReceiptBackend>> {
-            unimplemented!("journal access is not part of this test")
-        }
-        async fn compact(&self, _vacuum: bool) -> Result<SessionStoreCompaction> {
             unimplemented!("journal access is not part of this test")
         }
         async fn readiness(&self) -> Result<SessionStoreHealth> {
