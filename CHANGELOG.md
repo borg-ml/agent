@@ -21,12 +21,13 @@ Git comparison.
     id, rebuilds them; a global search names the sessions it skipped.
   - **Workspace session-event pointers**, which nothing reads, for a day,
     keeping each session's newest so projection resumes where it was.
-- `borg storage archive` moves session trees idle for 30 days
+- `borg storage archive` moves sessions idle for 30 days
   (`--older-than-days`) into compressed, content-addressed files in
   `$BORG_ARCHIVE_DIR` (default `~/.borg/archive`). Archived sessions stay
   listed and are restored automatically the first time anything reads them
   (resume, inspect, history, remote view), or with `borg storage restore`.
-  A tree is archived only when every member is idle and none is running.
+  A session is archived only when it and all its descendants are idle and
+  none is running, so active sessions and their ancestors stay.
 - Long-running Borg processes apply this retention in the background every
   6 hours, one at a time machine-wide. Until an operator has run
   `borg storage prune --apply` once (after restarting every Borg process on

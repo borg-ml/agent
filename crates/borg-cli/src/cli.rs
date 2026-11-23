@@ -446,10 +446,11 @@ pub(crate) enum StorageCommand {
         no_backup_check: bool,
     },
     /// Move sessions idle for --older-than-days (default 30) out of the hot
-    /// tables into compressed, content-addressed archive files. Only whole
-    /// session trees go, when no member is running or was touched since the
-    /// cutoff. Archived sessions stay listed and are restored automatically
-    /// when read. Without --apply it lists what would be archived.
+    /// tables into compressed, content-addressed archive files. A session
+    /// goes only when it and every descendant (owned children and forks)
+    /// is idle and not running, so active sessions and their ancestors stay.
+    /// Archived sessions stay listed and are restored automatically when
+    /// read. Without --apply it lists what would be archived.
     Archive {
         #[arg(long, default_value_t = 30)]
         older_than_days: i64,

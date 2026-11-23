@@ -50,35 +50,32 @@ pub struct ArchivedSession {
     pub payload_bytes: u64,
 }
 
-/// Sessions eligible for archiving, oldest tree first. A session is archived
-/// only together with its whole tree -- its owner root, everything that root
-/// owns, and forks of any of them -- and only when every member is untouched
-/// since `cutoff` and none is running. So an active session's ancestors and
-/// relatives stay hot, and a director never finds its children archived.
+/// Sessions eligible for archiving, oldest first: untouched since `cutoff`,
+/// not running, and with no descendant -- owned child or fork, at any depth
+/// -- that is running or was touched since `cutoff`. So an active session
+/// and its ancestors stay hot. A director does not read an archived child
+/// unless its mirror of that child is behind, which restores it then.
 pub async fn archive_candidates(
     store: &PostgresSessionStore,
     cutoff: DateTime<Utc>,
     limit: usize,
 ) -> Result<Vec<Uuid>> {
     Ok(sqlx::query_scalar(
-        "with recursive tree(root, id) as ( \
-             select id, id from sessions where owner_session_id is null \
+        "with recursive family(root, id) as ( \
+             select id, id from sessions \
              union \
-             select t.root, s.id from sessions s join tree t \
-               on s.owner_session_id = t.id or s.parent_session_id = t.id), \
-         idle_roots as ( \
-             select t.root, max(s.updated_at) as touched from tree t \
-             join sessions s on s.id = t.id group by t.root \
-             having bool_and(s.updated_at < $1 \
-                 and coalesce(s.state_json::jsonb ->> 'status', '') \
-                     not in ('running', 'waiting_for_approval'))), \
+             select f.root, s.id from sessions s join family f \
+               on s.owner_session_id = f.id or s.parent_session_id = f.id), \
          busy as ( \
-             select t.id from tree t where t.root not in (select root from idle_roots)) \
-         select s.id from idle_roots r join tree t on t.root = r.root \
-         join sessions s on s.id = t.id \
-         where s.archive_ref is null and s.id not in (select id from busy) \
+             select distinct f.root from family f join sessions d on d.id = f.id \
+             where d.updated_at >= $1 \
+                or coalesce(d.state_json::jsonb ->> 'status', '') \
+                   in ('running', 'waiting_for_approval')) \
+         select s.id from sessions s \
+         where s.archive_ref is null and s.updated_at < $1 \
+           and s.id not in (select root from busy) \
            and exists (select 1 from session_events e where e.session_id = s.id) \
-         group by s.id order by min(r.touched), s.id limit $2",
+         order by s.updated_at limit $2",
     )
     .bind(cutoff)
     .bind(i64::try_from(limit).unwrap_or(i64::MAX))
@@ -695,6 +692,43 @@ mod tests {
             output.as_bytes()
         );
         assert!(!store.restore_archived_session(session_id).await.unwrap());
+
+        // An active session's ancestors stay hot, however old they are.
+        let child = Uuid::new_v4();
+        store.create_session(child).await.unwrap();
+        store
+            .append(SessionEvent::new(
+                child,
+                0,
+                SessionEventKind::SessionStarted,
+            ))
+            .await
+            .unwrap();
+        let set_owner_and_age = |id: Uuid, owner: Option<Uuid>, days: i64| {
+            sqlx::query(
+                "update sessions set owner_session_id = coalesce($2, owner_session_id), \
+                 updated_at = now() - make_interval(days => $3) where id = $1",
+            )
+            .bind(id)
+            .bind(owner)
+            .bind(i32::try_from(days).unwrap())
+            .execute(store.pool())
+        };
+        set_owner_and_age(session_id, None, 40).await.unwrap();
+        set_owner_and_age(child, Some(session_id), 0).await.unwrap();
+        let cutoff = Utc::now() - chrono::Duration::days(30);
+        assert!(
+            archive_candidates(&store, cutoff, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        set_owner_and_age(child, None, 40).await.unwrap();
+        let mut candidates = archive_candidates(&store, cutoff, 10).await.unwrap();
+        candidates.sort();
+        let mut expected = vec![session_id, child];
+        expected.sort();
+        assert_eq!(candidates, expected);
         scratch.discard().await;
     }
 }

@@ -738,7 +738,7 @@ const MAINTENANCE_LOCK: i64 = 0x0B01_65E5_5702;
 const MAINTENANCE_INTERVAL_HOURS: i32 = 6;
 /// Payloads rewritten per pass; the rest wait for later passes.
 const MAINTENANCE_PAYLOADS: usize = 500;
-/// Session trees archived per pass.
+/// Sessions archived per pass.
 const MAINTENANCE_ARCHIVES: usize = 100;
 
 /// Run retention in the background for as long as this process lives, so
@@ -748,7 +748,7 @@ const MAINTENANCE_ARCHIVES: usize = 100;
 /// last-run row make one pass run machine-wide per interval. A pass drops
 /// the derived caches of idle sessions and old workspace pointers, which any
 /// release reads correctly or rebuilds. Rewriting legacy payloads and
-/// archiving idle session trees (when `BORG_ARCHIVE_DIR` names an archive
+/// archiving idle sessions (when `BORG_ARCHIVE_DIR` names an archive
 /// directory; `BORG_ARCHIVE_AFTER_DAYS`, default 30) change data an older
 /// release cannot read, so they wait until an operator has run `borg storage
 /// prune --apply` once -- after restarting every Borg process on this
