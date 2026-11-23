@@ -823,7 +823,16 @@ impl PostgresSessionStore {
         if !locked {
             return Ok(());
         }
-        let result = self.maintenance_steps().await;
+        // A bootstrap that could not get its locks (a long pg_dump) is
+        // finished here, off any session's start path.
+        if self.schema_incomplete() {
+            self.ensure_schema().await?;
+        }
+        let result = if self.schema_incomplete() {
+            Ok(())
+        } else {
+            self.maintenance_steps().await
+        };
         sqlx::query("select pg_advisory_unlock($1)")
             .bind(MAINTENANCE_LOCK)
             .execute(&mut *lock)

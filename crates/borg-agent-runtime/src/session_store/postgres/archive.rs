@@ -40,6 +40,60 @@ const ROW_TABLES: [&str; 3] = [
     "session_action_transitions",
 ];
 
+/// Whether `sessions.archive_ref` exists. A store whose migration could not
+/// get its locks (see schema.rs) runs without it, and reads must not name it
+/// until it exists. Present stays present; absent is rechecked each minute.
+#[derive(Debug, Default)]
+pub struct ColumnCache {
+    present: std::sync::atomic::AtomicBool,
+    absent_since: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+impl ColumnCache {
+    /// A migration just ran: look again on next use.
+    pub(super) fn forget_absent(&self) {
+        if let Ok(mut absent) = self.absent_since.lock() {
+            *absent = None;
+        }
+    }
+}
+
+impl PostgresSessionStore {
+    pub(super) async fn archive_column(&self) -> Result<bool> {
+        use std::sync::atomic::Ordering;
+        let cache = &self.archive_column;
+        if cache.present.load(Ordering::Acquire) {
+            return Ok(true);
+        }
+        if let Ok(absent) = cache.absent_since.lock()
+            && absent.is_some_and(|since| since.elapsed() < std::time::Duration::from_secs(60))
+        {
+            return Ok(false);
+        }
+        let present: bool = sqlx::query_scalar(
+            "select exists (select 1 from pg_attribute where attrelid = to_regclass('sessions') \
+               and attname = 'archive_ref' and not attisdropped)",
+        )
+        .fetch_one(self.pool())
+        .await?;
+        if present {
+            cache.present.store(true, Ordering::Release);
+        } else if let Ok(mut absent) = cache.absent_since.lock() {
+            *absent = Some(std::time::Instant::now());
+        }
+        Ok(present)
+    }
+
+    async fn require_archive_column(&self) -> Result<()> {
+        ensure!(
+            self.archive_column().await?,
+            "the session schema has not finished migrating (sessions.archive_ref is missing); \
+             it completes on its own once no long reader such as pg_dump holds its locks"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ArchivedSession {
     pub session_id: Uuid,
@@ -60,6 +114,7 @@ pub async fn archive_candidates(
     cutoff: DateTime<Utc>,
     limit: usize,
 ) -> Result<Vec<Uuid>> {
+    store.require_archive_column().await?;
     Ok(sqlx::query_scalar(
         "with recursive family(root, id) as ( \
              select id, id from sessions \
@@ -306,6 +361,7 @@ impl PostgresSessionStore {
         session_id: Uuid,
         dir: &Path,
     ) -> Result<Option<ArchivedSession>> {
+        self.require_archive_column().await?;
         let sessions_dir = dir.join("sessions");
         std::fs::create_dir_all(&sessions_dir)?;
         let mut snapshot = self.pool().begin().await?;
@@ -470,6 +526,9 @@ impl PostgresSessionStore {
     /// Bring an archived session back into the hot tables. Returns whether
     /// anything was restored; a session that is not archived is a no-op.
     pub async fn restore_archived_session(&self, session_id: Uuid) -> Result<bool> {
+        if !self.archive_column().await? {
+            return Ok(false);
+        }
         let mut transaction = self.pool().begin().await?;
         let archive_ref: Option<String> =
             sqlx::query_scalar("select archive_ref from sessions where id = $1 for update")

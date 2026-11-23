@@ -233,19 +233,35 @@ pub async fn idle_without_projection(
     scope: &str,
     session: uuid::Uuid,
 ) -> Result<bool> {
-    Ok(sqlx::query_scalar(
-        "select coalesce((select archive_ref is not null from sessions where id = $2), false) \
-            or (not exists (select 1 from remote_view_checkpoints where scope = $1) \
-                and coalesce((select updated_at < now() - make_interval(days => $3) \
-                              from sessions where id = $2), true))",
+    let row: Option<(bool, bool)> = sqlx::query_as(
+        "select s.updated_at > now() - make_interval(days => $3), \
+                exists (select 1 from remote_view_checkpoints where scope = $1) \
+         from sessions s where s.id = $2",
     )
     .bind(scope)
     .bind(session)
     .bind(i32::try_from(
         crate::session_store::postgres::storage::IDLE_CACHE_DAYS,
     )?)
+    .fetch_optional(pool)
+    .await?;
+    let Some((recent, projected)) = row else {
+        return Ok(true);
+    };
+    // A recently active session is projected as usual (reading it restores
+    // it if it was archived), which keeps this per-event check cheap. Only
+    // idle sessions ask about the archive, through jsonb so the query also
+    // works before `archive_ref` exists.
+    if recent {
+        return Ok(false);
+    }
+    let archived: bool = sqlx::query_scalar(
+        "select (to_jsonb(s) ->> 'archive_ref') is not null from sessions s where s.id = $1",
+    )
+    .bind(session)
     .fetch_one(pool)
-    .await?)
+    .await?;
+    Ok(archived || !projected)
 }
 
 /// Never use a shared literal `host` scope in a multi-host journal.

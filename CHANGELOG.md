@@ -5,6 +5,16 @@ Git comparison.
 
 ## Unreleased (since 0.22.3)
 
+- Starting Borg no longer fails with "opening the Borg session cluster timed
+  out after 30s" while a long reader such as `pg_dump` runs, including
+  `borg storage backup`. Opening checks the schema in the catalog and runs no
+  DDL when it is already complete, whichever release last recorded its
+  fingerprint, so mixed releases stop re-migrating each other. A migration
+  that cannot get its locks is skipped: the session opens on the existing
+  schema and background maintenance finishes the migration later.
+  `borg storage compact` skips tables other sessions hold locks on rather
+  than queueing an exclusive lock behind them.
+
 - The session database stays bounded. On a 168 GB store most of the disk was
   copies, caches and history nobody had opened in weeks; it now keeps:
   - **Payloads** (oversized tool output, provider messages) as

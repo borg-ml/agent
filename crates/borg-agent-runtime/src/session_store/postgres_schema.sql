@@ -40,6 +40,7 @@ create table if not exists borg_session_schema (
     id      integer primary key generated always as identity check (id = 1),
     version bigint  not null
 );
+alter table borg_session_schema add column if not exists definition_hash text;
 
 -- Versioned, corpus-trained zstd dictionaries for session_events.event_json.
 --

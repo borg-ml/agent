@@ -161,9 +161,8 @@ async fn write_parts(connection: &mut PgConnection, payload_id: Uuid, bytes: &[u
     Ok(())
 }
 
-/// Insert one payload. Idempotent on `id`: a retried write stores nothing new.
 #[allow(clippy::too_many_arguments)]
-pub async fn insert_payload(
+async fn insert_payload_blobs(
     connection: &mut PgConnection,
     id: Uuid,
     session_id: Uuid,
@@ -190,6 +189,70 @@ pub async fn insert_payload(
         write_parts(connection, id, bytes).await?;
     }
     Ok(())
+}
+
+/// Insert one payload. Idempotent on `id`: a retried write stores nothing new.
+///
+/// Falls back to the legacy raw column when the blob schema is not there
+/// yet: a store opened while its migration could not get its locks (see
+/// schema.rs) must still journal oversized payloads.
+pub async fn insert_payload(
+    connection: &mut PgConnection,
+    id: Uuid,
+    session_id: Uuid,
+    event_id: Uuid,
+    kind: &str,
+    bytes: &[u8],
+    created_at: DateTime<Utc>,
+) -> Result<()> {
+    use sqlx::Connection;
+    let mut savepoint = connection.begin().await?;
+    match insert_payload_blobs(
+        &mut savepoint,
+        id,
+        session_id,
+        event_id,
+        kind,
+        bytes,
+        created_at,
+    )
+    .await
+    {
+        Ok(()) => {
+            savepoint.commit().await?;
+            Ok(())
+        }
+        Err(error) if schema_not_migrated(&error) => {
+            savepoint.rollback().await?;
+            sqlx::query(
+                "insert into session_payloads \
+                 (id, session_id, event_id, payload_kind, payload, byte_len, created_at) \
+                 values ($1, $2, $3, $4, $5, $6, $7) on conflict (id) do nothing",
+            )
+            .bind(id)
+            .bind(session_id)
+            .bind(event_id)
+            .bind(kind)
+            .bind(bytes)
+            .bind(i64::try_from(bytes.len()).context("session payload exceeds a bigint")?)
+            .bind(created_at)
+            .execute(&mut *connection)
+            .await?;
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// A missing blob table or a still NOT NULL `payload` column.
+fn schema_not_migrated(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<sqlx::Error>()
+            .and_then(sqlx::Error::as_database_error)
+            .and_then(|error| error.code())
+            .is_some_and(|code| matches!(code.as_ref(), "42P01" | "42703" | "23502"))
+    })
 }
 
 /// A byte range of one payload.

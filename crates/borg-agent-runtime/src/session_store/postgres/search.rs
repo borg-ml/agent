@@ -465,7 +465,7 @@ impl PostgresSessionStore {
                 page.backend
             );
         }
-        let archived: i64 = if text.is_some() {
+        let archived: i64 = if text.is_some() && self.archive_column().await? {
             sqlx::query_scalar("select count(*) from sessions where archive_ref is not null")
                 .fetch_one(self.pool())
                 .await?

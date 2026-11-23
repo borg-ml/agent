@@ -151,6 +151,7 @@ create table if not exists agent_instances (
     -- row is still advertised by discovery.
     exited_at      text
 );
+alter table agent_instances add column if not exists status text;
 
 create table if not exists borg_autonomy_schema (
     id      integer primary key generated always as identity check (id = 1),

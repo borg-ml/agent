@@ -330,6 +330,26 @@ async fn compact(requested: Vec<String>, apply: bool, force: bool) -> Result<()>
         "refusing to compact while sessions are active; stop them or pass --force"
     );
     for table in &tables {
+        // An exclusive request queued behind a lock holder -- above all a
+        // pg_dump, which holds every table for its whole run -- stalls every
+        // reader and writer of the table until it is granted. Never queue.
+        let holders: Vec<String> = sqlx::query_scalar(
+            "select distinct coalesce(nullif(a.application_name, ''), a.backend_type) \
+                    || ' (pid ' || a.pid || ')' \
+             from pg_locks l join pg_stat_activity a on a.pid = l.pid \
+             where l.relation = $1::regclass and l.granted and l.pid <> pg_backend_pid()",
+        )
+        .bind(&table.name)
+        .fetch_all(pool)
+        .await?;
+        if !holders.is_empty() {
+            println!(
+                "{}: skipped; held by {} (re-run once they finish)",
+                table.name,
+                holders.join(", ")
+            );
+            continue;
+        }
         let before = table_bytes(pool, &table.name).await?;
         if let Some(free) = report.data_directory.as_deref().and_then(|dir| {
             borg_remote::session_store::postgres::storage::filesystem_free_bytes(Path::new(dir))
@@ -362,9 +382,8 @@ async fn compact(requested: Vec<String>, apply: bool, force: bool) -> Result<()>
         } else {
             let progress = tokio::spawn(report_rewrite_progress(pool.clone(), table.name.clone()));
             let mut connection = pool.acquire().await?;
-            // Never queue an exclusive request behind a long transaction:
-            // while it waits, every new reader of the table waits behind it.
-            sqlx::query("set lock_timeout = '10s'")
+            // Bound the wait for a holder that appeared since the check.
+            sqlx::query("set lock_timeout = '3s'")
                 .execute(&mut *connection)
                 .await?;
             let result = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(

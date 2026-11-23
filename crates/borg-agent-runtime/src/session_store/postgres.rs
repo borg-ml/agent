@@ -13,9 +13,8 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use sha2::{Digest, Sha256};
+use sqlx::ConnectOptions;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
-use sqlx::{ConnectOptions, Executor};
 
 use super::{SESSION_SCHEMA_VERSION, SessionStoreHealth};
 
@@ -33,6 +32,7 @@ pub mod payloads;
 pub mod publication;
 pub mod recovery;
 pub mod runtime;
+pub mod schema;
 pub mod search;
 pub mod storage;
 pub mod store;
@@ -98,6 +98,11 @@ pub struct PostgresSessionStore {
     workspace_override: Option<WorkspaceStoreOverride>,
     workspace: std::sync::Arc<crate::workspace_postgres::PostgresWorkspaceStore>,
     autonomy: std::sync::Arc<crate::autonomy_postgres::PostgresAutonomyStore>,
+    /// The last bootstrap could not apply every statement (see schema.rs);
+    /// background maintenance retries it.
+    schema_incomplete: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Whether `sessions.archive_ref` exists, cached; see `archive_column`.
+    archive_column: std::sync::Arc<archive::ColumnCache>,
 }
 
 /// A workspace projection supplied by the embedding controller.
@@ -226,6 +231,8 @@ impl PostgresSessionStore {
             pool,
             dictionaries: cold::DictionaryCache::default(),
             workspace_override: None,
+            schema_incomplete: Default::default(),
+            archive_column: Default::default(),
         };
         store.ensure_schema().await?;
         store.clear_stranded_turn_live_state().await?;
@@ -302,115 +309,6 @@ impl PostgresSessionStore {
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
-    }
-
-    /// Serialize real migrations, but never repeat unchanged DDL against live writers.
-    pub async fn ensure_schema(&self) -> Result<()> {
-        let mut hash = Sha256::new();
-        hash.update(SESSION_SCHEMA_VERSION.to_le_bytes());
-        hash.update(POSTGRES_SCHEMA_SQL);
-        hash.update(POSTGRES_SATELLITE_SCHEMA_SQL);
-        let fingerprint = hex::encode(hash.finalize());
-        for attempt in 0..6 {
-            match self.ensure_schema_once(&fingerprint).await {
-                Ok(()) => return Ok(()),
-                Err(error) => {
-                    let transient = retryable_transaction_error(&error);
-                    if !transient || attempt == 5 {
-                        return Err(error);
-                    }
-                    tracing::warn!(
-                        attempt = attempt + 1,
-                        "retrying contended Postgres schema bootstrap"
-                    );
-                    tokio::time::sleep(Duration::from_millis(100 << attempt)).await;
-                }
-            }
-        }
-        unreachable!()
-    }
-
-    async fn ensure_schema_once(&self, fingerprint: &str) -> Result<()> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .context("failed to begin the Postgres schema bootstrap")?;
-        sqlx::query("set local lock_timeout = 5000")
-            .execute(&mut *transaction)
-            .await?;
-        sqlx::query("select pg_advisory_xact_lock($1)")
-            .bind(SCHEMA_BOOTSTRAP_LOCK)
-            .execute(&mut *transaction)
-            .await
-            .context("failed to take the Postgres schema bootstrap lock")?;
-        let metadata_exists: bool = sqlx::query_scalar("select to_regclass($1) is not null")
-            .bind("borg_session_schema")
-            .fetch_one(&mut *transaction)
-            .await?;
-        if metadata_exists {
-            let stored: Option<(i64, Option<String>)> = sqlx::query_as(
-                "select version, to_jsonb(s) ->> $1 from borg_session_schema s where id = 1",
-            )
-            .bind("definition_hash")
-            .fetch_optional(&mut *transaction)
-            .await?;
-            if let Some((version, applied)) = stored {
-                anyhow::ensure!(
-                    version <= SESSION_SCHEMA_VERSION,
-                    "unsupported future Borg session schema version {version}; current is {SESSION_SCHEMA_VERSION}"
-                );
-                if version == SESSION_SCHEMA_VERSION && applied.as_deref() == Some(fingerprint) {
-                    transaction.commit().await?;
-                    return Ok(());
-                }
-            }
-        }
-        // gin_trgm_ops in the schema requires pg_trgm. Attempted here rather
-        // than in the .sql file because it needs privileges the journal role
-        // may not hold in a managed deployment, where an operator installs it
-        // once up front; a failure is only fatal if the dependent index is
-        // then missing, which the schema application below surfaces.
-        if let Err(error) = transaction
-            .execute("create extension if not exists pg_trgm")
-            .await
-        {
-            tracing::debug!(%error, "pg_trgm extension not created; assuming it is already installed");
-        }
-        sqlx::raw_sql(POSTGRES_SCHEMA_SQL)
-            .execute(&mut *transaction)
-            .await
-            .context("failed to apply the Postgres session schema")?;
-        sqlx::raw_sql(POSTGRES_SATELLITE_SCHEMA_SQL)
-            .execute(&mut *transaction)
-            .await
-            .context("failed to apply the Postgres satellite schema")?;
-        sqlx::query("alter table agent_instances add column if not exists status text")
-            .execute(&mut *transaction)
-            .await?;
-        sqlx::query(
-            "alter table borg_session_schema add column if not exists definition_hash text",
-        )
-        .execute(&mut *transaction)
-        .await?;
-        // `id` is `generated always as identity` with `check (id = 1)`, so the
-        // single row must be written with an explicit id and OVERRIDING SYSTEM
-        // VALUE; a plain insert would allocate id=2 and trip the check.
-        sqlx::query(
-            "insert into borg_session_schema (id, version, definition_hash) overriding system value \
-             values (1, $1, $2) \
-             on conflict (id) do update set version = excluded.version, definition_hash = excluded.definition_hash",
-        )
-        .bind(SESSION_SCHEMA_VERSION)
-        .bind(fingerprint)
-        .execute(&mut *transaction)
-        .await
-        .context("failed to record the Postgres session schema version")?;
-        transaction
-            .commit()
-            .await
-            .context("failed to commit the Postgres schema bootstrap")?;
-        Ok(())
     }
 
     /// This machine and OS user, as one stable string.
@@ -906,10 +804,15 @@ mod tests {
         };
         let scratch = ScratchDatabase::create(&url).await;
         let store = PostgresSessionStore::connect(&scratch.url).await.unwrap();
-        sqlx::query("update borg_session_schema set definition_hash = null")
-            .execute(store.pool())
-            .await
-            .unwrap();
+        // A schema that really needs migrating: a complete one would be left
+        // alone, fingerprint and all.
+        sqlx::raw_sql(
+            "update borg_session_schema set definition_hash = null; \
+             alter table sessions drop column archive_ref",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
         let mut blocker = store.pool.begin().await.unwrap();
         sqlx::query("select pg_advisory_xact_lock($1)")
             .bind(SCHEMA_BOOTSTRAP_LOCK)

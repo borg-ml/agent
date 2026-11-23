@@ -132,14 +132,18 @@ const LATEST_SUBAGENT_ROWS: &str = "e.sequence in ( \
 
 impl PostgresSessionStore {
     pub(super) async fn session_row(&self, session_id: Uuid) -> Result<StoredSession> {
-        let row = sqlx::query(
+        let query = if self.archive_column().await? {
             "select parent_session_id, parent_cut_sequence, inherited_event_count, \
-             next_sequence, archive_ref is not null as archived from sessions where id = $1",
-        )
-        .bind(session_id)
-        .fetch_optional(self.pool())
-        .await?
-        .with_context(|| format!("session {session_id} does not exist"))?;
+             next_sequence, archive_ref is not null as archived from sessions where id = $1"
+        } else {
+            "select parent_session_id, parent_cut_sequence, inherited_event_count, \
+             next_sequence, false as archived from sessions where id = $1"
+        };
+        let row = sqlx::query(query)
+            .bind(session_id)
+            .fetch_optional(self.pool())
+            .await?
+            .with_context(|| format!("session {session_id} does not exist"))?;
         // Every journal read resolves its session here, so this is where an
         // archived session comes back before anything reads its rows.
         if row.try_get::<bool, _>("archived")? {
