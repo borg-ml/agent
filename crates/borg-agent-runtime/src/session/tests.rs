@@ -5919,8 +5919,16 @@ fn queued_team_notifications_batch_without_borrowing_priority_or_losing_members(
         ..note("autonomy job", "job.png")
     };
     let continuation = note("usage limit continuation", "limit.png");
+    // Only the first notes carry an image, so the member cap, not the
+    // per-message image cap, is what bounds this batch.
     let notes: Vec<QueuedPrompt> = (0..40)
-        .map(|i| note(&format!("note {i}"), "note.png"))
+        .map(|i| {
+            let mut prompt = note(&format!("note {i}"), "note.png");
+            if i >= crate::MAX_PROMPT_IMAGES {
+                prompt.attachments.clear();
+            }
+            prompt
+        })
         .collect();
     let note_ids: Vec<Uuid> = notes.iter().map(|prompt| prompt.message_id).collect();
 
@@ -5955,7 +5963,7 @@ fn queued_team_notifications_batch_without_borrowing_priority_or_losing_members(
     );
     assert_eq!(
         merged.attachments.len(),
-        TEAM_BATCH_MAX_MEMBERS,
+        crate::MAX_PROMPT_IMAGES,
         "every member's attachments survive the merge"
     );
     for index in 0..TEAM_BATCH_MAX_MEMBERS {

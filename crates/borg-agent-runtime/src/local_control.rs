@@ -2546,10 +2546,14 @@ mod tests {
             .spawn()
             .expect("flock is required for the Linux owner recovery test");
 
+        // flock takes the lock before it execs sleep; the recorded executable
+        // identity is only stable once that exec has happened.
+        let comm = format!("/proc/{}/comm", owner.id());
         for _ in 0..100 {
             if SessionWriterLease::try_acquire(&lock_path)
                 .unwrap()
                 .is_none()
+                && fs::read_to_string(&comm).is_ok_and(|name| name.trim() == "sleep")
             {
                 break;
             }
