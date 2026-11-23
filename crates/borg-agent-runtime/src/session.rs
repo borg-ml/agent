@@ -6037,6 +6037,10 @@ async fn run_agent_session_store_kernel_inner(
                 ACTOR_STEP_POLL,
             )))
         });
+        // Consultations can take many minutes. They run beside the actor, so
+        // provider events, the watchdog and Esc keep flowing; dropping the set
+        // at the end of the turn aborts any that are still running.
+        let mut consultations = tokio::task::JoinSet::new();
         let mut watchdog = TurnWatchdog::new(TurnPhase::AwaitingProvider);
         let mut watchdog_poll = tokio::time::interval(TURN_WATCHDOG_POLL_INTERVAL);
         // A sleeping host freezes the monotonic clock, so ticks would otherwise
@@ -7981,7 +7985,7 @@ async fn run_agent_session_store_kernel_inner(
                     let Some(request) = request else {
                         continue;
                     };
-                    let result: std::result::Result<ConsultationResult, String> = async {
+                    let consultation: std::result::Result<ConsultationRequest, String> = async {
                         anyhow::ensure!(
                             !request.prompt.trim().is_empty(),
                             "consultation prompt must not be empty"
@@ -8000,37 +8004,55 @@ async fn run_agent_session_store_kernel_inner(
                         } else {
                             default_consultation_effort(provider)
                         });
-                        executor
-                            .consult(ConsultationRequest {
-                                access: crate::ModelAccessContext {
-                                    session_id, store: dispatcher.session_store(),
-                                    provider_context: launch.capabilities.runtime_provider_context.clone(),
-                                    parent_session_id: dispatcher.parent_session_id().await,
-                                    request_prefix: native_request_prefix(journal.context_events()),
-                                },
-                                message_id: Uuid::new_v4(),
-                                provider,
-                                model,
-                                effort,
-                                cwd: launch.cwd.clone(),
-                                prompt: request.prompt,
-                                response_language: launch.response_language,
-                            })
-                            .await
-                            .map_err(|error| anyhow::anyhow!("{error:#}"))
+                        Ok(ConsultationRequest {
+                            access: crate::ModelAccessContext {
+                                session_id, store: dispatcher.session_store(),
+                                provider_context: launch.capabilities.runtime_provider_context.clone(),
+                                parent_session_id: dispatcher.parent_session_id().await,
+                                request_prefix: native_request_prefix(journal.context_events()),
+                            },
+                            message_id: Uuid::new_v4(),
+                            provider,
+                            model,
+                            effort,
+                            cwd: launch.cwd.clone(),
+                            prompt: request.prompt,
+                            response_language: launch.response_language,
+                        })
                     }
                     .await
-                    .map_err(|error| format!("{error:#}"));
+                    .map_err(|error: anyhow::Error| format!("{error:#}"));
+                    match consultation {
+                        Ok(consultation) => {
+                            let executor = Arc::clone(&executor);
+                            let response = request.response;
+                            consultations.spawn(async move {
+                                let result = executor
+                                    .consult(consultation)
+                                    .await
+                                    .map_err(|error| format!("{error:#}"));
+                                (response, result)
+                            });
+                        }
+                        Err(error) => {
+                            request.response.send(Err(error)).ok();
+                        }
+                    }
+                }
+                Some(joined) = consultations.join_next(), if !consultations.is_empty() => {
+                    let Ok((response, result)) = joined else {
+                        continue;
+                    };
                     if let Ok(consultation) = &result {
                         record(
                             &mut journal,
                             &events,
                             session_id,
-                        native_usage_event(&consultation.usage, Some(prompt.message_id)),
+                            native_usage_event(&consultation.usage, Some(prompt.message_id)),
                         )
                         .await?;
                     }
-                    request.response.send(result).ok();
+                    response.send(result).ok();
                 }
                 kind = next_provider_event(&mut provider_carry, &mut provider_events),
                     if provider_events_open || !provider_carry.is_empty() => {

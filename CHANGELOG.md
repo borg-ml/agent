@@ -5,6 +5,13 @@ Git comparison.
 
 ## Unreleased (since 0.22.3)
 
+- `consult_model` no longer freezes the session while the consulted model
+  works. A long review (an xhigh Opus consult can take ten minutes) used to
+  hold the session loop, so its tool rows stayed on "Generating tool call",
+  status and stall reporting stopped, Esc and steering waited, and two
+  consultations ran one after the other. Consultations now run in the
+  background and are cancelled with the turn.
+
 - Removed the duplicate 180-second reasoning-stream stall watchdog that could
   cancel turns after 3 minutes of silence (for example while Gemini buffered a
   large tool call or a model reasoned silently between summary chunks) and
