@@ -339,13 +339,33 @@ pub(crate) async fn probe_path(runtime: Runtime, path: &Path) -> Result<(), Stri
         }
     };
     if output.status.success() {
+        if runtime == Runtime::OpenCode
+            && let Some(major) = leading_major_version(&output.stdout)
+            && major >= 2
+        {
+            // OpenCode 2 serves its HTTP API under /api with new routes; Borg's client speaks the
+            // 1.x server API, so a 2.x install fails every turn with 405 on POST /session.
+            return Err(format!(
+                "OpenCode {major}.x is not supported yet (its server API moved under /api); install OpenCode 1.x"
+            ));
+        }
         return Ok(());
     }
-    let _ = runtime;
     let detail = first_meaningful_line(&output.stderr)
         .or_else(|| first_meaningful_line(&output.stdout))
         .unwrap_or_else(|| format!("exited with {}", output.status));
     Err(format!("`--version` failed: {detail}"))
+}
+
+/// The major version from `--version` output such as `1.18.31` or `opencode v2.2.5`.
+fn leading_major_version(bytes: &[u8]) -> Option<u64> {
+    let text = String::from_utf8_lossy(bytes);
+    let line = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let version = line.strip_prefix("opencode ").unwrap_or(line).trim_start_matches('v');
+    if !version.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return None;
+    }
+    version.split('.').next()?.parse().ok()
 }
 
 fn first_meaningful_line(bytes: &[u8]) -> Option<String> {
@@ -410,6 +430,14 @@ pub fn candidate_paths(runtime: Runtime) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opencode_major_version_is_read_from_either_spelling() {
+        assert_eq!(leading_major_version(b"1.18.31\n"), Some(1));
+        assert_eq!(leading_major_version(b"opencode v2.2.5\n"), Some(2));
+        assert_eq!(leading_major_version(b"\n"), None);
+        assert_eq!(leading_major_version(b"true (GNU coreutils) 9.4\n"), None);
+    }
 
     #[test]
     fn every_runtime_has_distinct_identity() {

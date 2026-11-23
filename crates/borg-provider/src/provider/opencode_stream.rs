@@ -901,6 +901,15 @@ pub async fn resolve_model(requested: Option<&str>) -> Result<String> {
             ensure_in_go_catalog(&go_catalog_ids().await?, model)?;
             Ok(model.to_string())
         }
+        // A bare catalogue slug (`deepseek-v4.1-flash`) names the OpenCode Go model of that id:
+        // OpenCode itself refuses a model without a provider prefix.
+        Some(model) if !model.contains('/') => {
+            let prefixed = format!("opencode-go/{model}");
+            match go_catalog_ids().await {
+                Ok(ids) if ids.iter().any(|id| id == &prefixed) => Ok(prefixed),
+                _ => Ok(model.to_string()),
+            }
+        }
         Some(model) => Ok(model.to_string()),
         None => default_model().await,
     }

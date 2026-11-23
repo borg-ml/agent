@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.22.3)
 
+- OpenCode agents start again on hosts where an OpenCode 2.x install sits next to
+  a 1.x one: Borg now skips 2.x (whose server API moved under `/api`, which made
+  every turn fail with "405 Method Not Allowed") and names the reason in
+  `borg doctor`. A bare OpenCode Go model slug such as `deepseek-v4.1-flash` is
+  accepted and means `opencode-go/deepseek-v4.1-flash`.
+
 - Starting Borg no longer fails with "opening the Borg session cluster timed
   out after 30s" while a long reader such as `pg_dump` runs, including
   `borg storage backup`. Opening checks the schema in the catalog and runs no
