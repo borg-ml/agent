@@ -32,6 +32,7 @@ pub mod publication;
 pub mod recovery;
 pub mod runtime;
 pub mod search;
+pub mod storage;
 pub mod store;
 pub mod sync;
 pub mod workflow;

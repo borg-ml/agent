@@ -22,6 +22,7 @@ mod lane_service_commands;
 mod protection;
 mod remote_commands;
 mod session_commands;
+mod storage_commands;
 mod sleep_inhibitor;
 mod terminal_ui {
     pub(crate) use borg_tui::*;
@@ -234,6 +235,7 @@ async fn run() -> Result<()> {
         #[cfg(unix)]
         Command::Worktree(args) => worktree_commands::run(args).await,
         Command::Session { command } => session_commands::run(command).await,
+        Command::Storage { command } => storage_commands::run(command).await,
         Command::Acp(args) => acp::run(args).await,
         Command::Collab { command } => collab::run(command).await,
         Command::Doctor { json, deep } => doctor(json, deep).await,

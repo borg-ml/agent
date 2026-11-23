@@ -68,6 +68,7 @@ impl Cli {
                 | "workspaces"
                 | "worktree"
                 | "session"
+                | "storage"
                 | "acp"
                 | "collab"
                 | "doctor"
@@ -196,6 +197,11 @@ pub(crate) enum Command {
     Session {
         #[command(subcommand)]
         command: SessionCommand,
+    },
+    /// Measure, archive and compact the session database.
+    Storage {
+        #[command(subcommand)]
+        command: StorageCommand,
     },
     /// Serve Borg as an Agent Client Protocol agent over stdio.
     Acp(AcpArgs),
@@ -416,6 +422,19 @@ pub(crate) enum SessionCommand {
     DropTestDatabases {
         #[arg(long)]
         apply: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum StorageCommand {
+    /// Break the database down by table, event kind, payload kind, session
+    /// and age. Read-only; large tables are block-sampled.
+    Report {
+        /// Percent of each large table's pages to sample.
+        #[arg(long, default_value_t = 1.0)]
+        sample_percent: f64,
         #[arg(long)]
         json: bool,
     },

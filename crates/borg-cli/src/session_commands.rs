@@ -137,7 +137,7 @@ async fn compact_store(store: &dyn SessionStore, vacuum: bool, json: bool) -> Re
     Ok(())
 }
 
-async fn open_postgres() -> Result<borg_remote::session_store::postgres::PostgresSessionStore> {
+pub(crate) async fn open_postgres() -> Result<borg_remote::session_store::postgres::PostgresSessionStore> {
     borg_remote::session_store::factory::open_postgres(
         &borg_remote::session_store::factory::SessionStoreConfig::from_env(),
     )
@@ -266,7 +266,7 @@ async fn drop_test_databases(apply: bool, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn human_bytes(bytes: i64) -> String {
+pub(crate) fn human_bytes(bytes: i64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes.max(0) as f64;
     let mut unit = 0;

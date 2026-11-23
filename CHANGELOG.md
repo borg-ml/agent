@@ -5,6 +5,13 @@ Git comparison.
 
 ## Unreleased (since 0.22.3)
 
+- `borg storage report` shows where the session database's disk goes: every
+  table's heap, TOAST, index and dead-row sizes with stale-statistics flags,
+  the largest indexes, and sampled breakdowns of events by kind, mirrored
+  subagent events, payloads, workspace events, sessions by age, the largest
+  sessions, and the derived remote-view and search caches by session age.
+  Read-only and sampled, so it is safe on a live store.
+
 - `consult_model` no longer freezes the session while the consulted model
   works. A long review (an xhigh Opus consult can take ten minutes) used to
   hold the session loop, so its tool rows stayed on "Generating tool call",
