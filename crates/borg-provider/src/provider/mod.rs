@@ -67,7 +67,7 @@ use crate::runtime::{CostBasis, ProviderCallUsage};
 /// in-flight tools and human approval/interaction waits. The session watchdog
 /// reports quiet providers before this deadline and accounts for host sleep.
 /// Override with `BORG_PROVIDER_STALL_TIMEOUT_SECS`; `0` disables stall failure.
-const PROVIDER_STALL_TIMEOUT_DEFAULT_SECS: u64 = 1200;
+const PROVIDER_STALL_TIMEOUT_DEFAULT_SECS: u64 = 900;
 
 /// Absolute wall-clock ceiling for a single provider call. This is deliberately
 /// separate from the stall timeout: app-server streams can emit internal
@@ -280,10 +280,6 @@ pub enum ProviderProgress {
     },
     Narration {
         text: String,
-    },
-    Phase {
-        name: String,
-        input: Value,
     },
     ToolCallGenerating {
         id: Option<String>,

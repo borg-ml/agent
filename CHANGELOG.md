@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.22.3)
 
+- Removed the duplicate 180-second reasoning-stream stall watchdog that could
+  cancel turns after 3 minutes of silence (for example while Gemini buffered a
+  large tool call or a model reasoned silently between summary chunks) and
+  lowered the default session stall timeout (`BORG_PROVIDER_STALL_TIMEOUT_SECS`)
+  from 20 minutes to 15 minutes.
+
 ## 0.22.3 (2026-11-23)
 
 - A lane job with a stall timeout is no longer killed as stalled (exit 125)

@@ -27,7 +27,7 @@ small smoke is not proof of subscription-quota savings or long-context parity.
 The session actor owns progress supervision for root and child turns across
 providers. After one minute without model progress it reports the quiet state;
 at five minutes it reports “possibly stalled” without terminating the turn.
-A silent model fails after twenty minutes by default. Set
+A silent model fails after fifteen minutes by default. Set
 `BORG_PROVIDER_STALL_TIMEOUT_SECS` to change that budget (`0` disables model-stall
 failure, not status reporting). Usage counters and provider metadata do not count
 as model progress. Startup and drain remain bounded separately.
