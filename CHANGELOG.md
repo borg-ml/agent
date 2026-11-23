@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.22.2)
 
+- A lane job with a stall timeout is no longer killed as stalled (exit 125)
+  before it starts. The stall clock now waits for `systemd-run` to hand over
+  to the workload, which can take seconds while the systemd user manager is
+  busy.
+
 - Updated `url` to 2.5.9 (RUSTSEC-2026-0592: stack overflow in
   `Url::origin()` on nested `blob:` URLs) and replaced the yanked
   `async-executor` 1.14.0 with 1.14.1, so `just release` passes its

@@ -2845,6 +2845,7 @@ impl LaneStore {
         // CPU at the last progress mark: a stall is no log growth and under
         // 50 ms of CPU across the whole workload since then.
         let mut progress_cpu = 0.0;
+        let mut launched = !scoped;
         // Progress reaches the journal at most once a second and only when
         // it changed; otherwise the loop neither locks nor reads the journal
         // and learns of a cancel from its marker file.
@@ -2871,6 +2872,16 @@ impl LaneStore {
                     JobEnd::Exited(code),
                     if oom { "oom-kill" } else { "finished" }.to_owned(),
                 );
+            }
+            // `systemd-run` joins the scope, then waits for the manager to
+            // confirm it before exec'ing the workload: seconds on a loaded
+            // host, and no stall of a workload that has not started.
+            if !launched {
+                launched = fs::read_to_string(format!("/proc/{leader}/comm"))
+                    .map_or(true, |comm| comm.trim_end() != "systemd-run");
+                if !launched {
+                    last_progress = Instant::now();
+                }
             }
             let size = fs::metadata(self.job_dir(id).join("output.log")).map_or(0, |m| m.len());
             let cpu = workload_cpu(cpu_cgroup.as_deref(), scoped, leader);
