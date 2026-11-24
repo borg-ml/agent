@@ -265,8 +265,9 @@ async fn wire_model(model: &str, effort: Option<&str>, auth_file: Option<PathBuf
 /// types, no JSON Schema keywords it does not model, `required` naming only
 /// declared properties, and every array with `items`.
 fn gemini_schema(schema: &Value) -> Value {
-    const UNSUPPORTED: [&str; 22] = [
+    const UNSUPPORTED: [&str; 23] = [
         "additionalProperties",
+        "examples",
         "$schema",
         "$id",
         "$comment",
@@ -803,6 +804,44 @@ mod tests {
             describe_failure(429, brief).1,
             ProviderErrorKind::ConnectionLost
         );
+    }
+
+    #[test]
+    fn tool_parameters_drop_json_schema_examples() {
+        let tool = borg_core::ModelToolDefinition::new(
+            "spawn_agent",
+            "spawn",
+            json!({
+                "type": "object",
+                "properties": {
+                    "model": {
+                        "type": "string",
+                        "description": "Model override",
+                        "examples": ["gemini-4-neon", "gpt-6-luna"]
+                    }
+                },
+                "required": ["model"],
+                "additionalProperties": false
+            }),
+        )
+        .unwrap();
+        let request = ModelTurnRequest {
+            fast: false,
+            ultrafast: false,
+            request_id: None,
+            session_id: None,
+            prompt_cache_key: None,
+            turn_routing: Default::default(),
+            messages: vec![ModelMessage::user("spawn")],
+            tools: vec![tool],
+            output_schema: None,
+        };
+        let body = request_body("gemini-4-neon", None, &request, "me@example.com");
+        let parameters = &body["tools"][0]["functionDeclarations"][0]["parameters"];
+        assert!(parameters["properties"]["model"].get("examples").is_none());
+        assert_eq!(parameters["properties"]["model"]["type"], "STRING");
+        assert_eq!(parameters["properties"]["model"]["description"], "Model override");
+        assert_eq!(parameters["required"], json!(["model"]));
     }
 
     // Gemini rejects a replayed call turn without its thought signature, and

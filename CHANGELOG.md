@@ -5,6 +5,10 @@ Git comparison.
 
 ## Unreleased (since 0.22.3)
 
+- Gemini tool calls no longer fail with HTTP 400 `Unknown name "examples"` when a tool
+  schema contains JSON Schema `examples`; Borg strips that annotation before sending
+  function declarations.
+
 - The working-directory path in the footer and on the launch screen now uses
   the same white, bold underline hover treatment as other clickable status
   controls. `/cd` shows five recent session directories by default, and
