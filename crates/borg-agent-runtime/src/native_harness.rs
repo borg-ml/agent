@@ -9651,6 +9651,59 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn native_tool_surface_exposes_the_delegation_lifecycle() {
+        let root = tempfile::tempdir().unwrap();
+        let dispatcher = crate::AgentToolDispatcher::new(
+            crate::session::SessionGoalTools::disconnected(),
+            crate::session::SessionTodoTools::disconnected(),
+            None,
+            crate::LspService::new(root.path()),
+            crate::CodingProvider::OpenCode,
+            Uuid::new_v4(),
+            true,
+            None,
+            None,
+            root.path().to_path_buf(),
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            crate::native_process::ProcessManager::default(),
+            PermissionMode::FullAccess,
+        );
+        let runtime = NativeToolRuntime {
+            permission: PermissionMode::FullAccess,
+            agent_tools: dispatcher,
+            context: Arc::new(
+                crate::native_context::NativeContext::load(root.path().to_path_buf(), Vec::new())
+                    .await
+                    .unwrap(),
+            ),
+        };
+        let definitions = runtime
+            .tool_definitions(crate::CodingProvider::OpenCode)
+            .unwrap();
+        let spawn = definitions
+            .iter()
+            .find(|definition| definition.name == "spawn_agent")
+            .expect("native request must expose spawn_agent");
+        assert_eq!(
+            spawn.input_schema["required"],
+            json!(["task_name", "message"])
+        );
+        assert!(!spawn.description.is_empty());
+        let wait = definitions
+            .iter()
+            .find(|definition| definition.name == "wait_agent")
+            .expect("native request must expose wait_agent");
+        assert!(
+            wait.input_schema["properties"].get("timeout_ms").is_some(),
+            "wait_agent must expose its blocking timeout"
+        );
+    }
+
     #[test]
     fn native_tool_definitions_have_deterministic_wire_order() {
         let mut definitions = vec![

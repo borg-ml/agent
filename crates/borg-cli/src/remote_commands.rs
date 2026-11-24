@@ -5021,13 +5021,7 @@ async fn run_local_agent_session(
                                 if let Some(live) = live_transcript_events.as_mut() {
                                     live.push_back(event.clone());
                                 }
-                                if event.sequence > 0
-                                    && history
-                                        .last()
-                                        .is_none_or(|loaded| loaded.sequence < event.sequence)
-                                {
-                                    history.push(event.clone());
-                                }
+                                remember_streamed_history_event(&mut history, &event);
                                 if matches!(&event.kind, SessionEventKind::TurnCompleted { .. }) {
                                     // The store retires coalesced live state at every
                                     // terminal turn boundary, including interruption.
@@ -10463,6 +10457,18 @@ fn coalesced_transcript_event(kind: &SessionEventKind) -> bool {
 struct ResumeBootstrapHistory {
     events: Vec<SessionEvent>,
     page_before: u64,
+}
+
+fn remember_streamed_history_event(history: &mut Vec<SessionEvent>, event: &SessionEvent) {
+    if event.sequence == 0 {
+        return;
+    }
+    // Resume can seed coalesced live snapshots after the durable prefix.
+    // Keep later durable rows before those sequence-zero snapshots so a
+    // lazy-page rebuild after the stream ends retains the newest reply.
+    let index =
+        history.partition_point(|loaded| loaded.sequence > 0 && loaded.sequence < event.sequence);
+    history.insert(index, event.clone());
 }
 
 fn merge_tui_history_page(history: &mut Vec<SessionEvent>, older: Vec<SessionEvent>) {

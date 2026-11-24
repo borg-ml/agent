@@ -4032,10 +4032,12 @@ impl TranscriptCore {
         if execution.is_terminal() {
             return;
         }
-        *name = if waiting {
-            "Wait for provider".to_string()
-        } else if label.is_empty() {
-            "Generate".to_string()
+        *name = if label.is_empty() {
+            if waiting {
+                "Wait for provider".to_string()
+            } else {
+                "Generate".to_string()
+            }
         } else {
             format!("Generate {label}")
         };

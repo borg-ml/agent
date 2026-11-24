@@ -3450,6 +3450,11 @@ fn tool_lifecycle_labels_use_progressive_and_past_tense() {
     assert_eq!(tool_lifecycle_label("Reasoning", true), "Reasoned");
     assert_eq!(tool_lifecycle_label("Run", false), "Running…");
     assert_eq!(tool_lifecycle_label("Run", true), "Ran");
+    assert_eq!(
+        tool_lifecycle_label("View commits", false),
+        "Viewing commits…"
+    );
+    assert_eq!(tool_lifecycle_label("View commits", true), "Viewed commits");
     for (name, running, completed) in [
         ("Build project", "Building project…", "Built project"),
         (
@@ -3953,65 +3958,69 @@ fn unkeyed_action_label_refines_the_generic_live_card() {
 }
 
 #[test]
-fn generation_status_hides_action_description_and_preserves_the_card() {
+fn generation_status_preserves_the_action_description_and_card() {
     let session_id = Uuid::new_v4();
     let started_at = Utc::now();
-    let mut transcript = Transcript {
-        core: TranscriptCore {
-            action_descriptors: false,
-            ..TranscriptCore::default()
-        },
-        ..Transcript::default()
-    };
-    let mut preparing = SessionEvent::new(
-        session_id,
-        1,
-        SessionEventKind::ProviderEvent {
-            provider: CodingProvider::Codex,
-            kind: "action/preparing".into(),
-            payload: serde_json::json!({"label": "secret detail", "tool_call_id": "tool-1"}),
-        },
-    );
-    preparing.created_at = started_at;
-    transcript.apply(&preparing);
-
-    for (sequence, waiting) in [(2, true), (3, false)] {
-        transcript.apply(&SessionEvent::new(
+    for action_descriptors in [true, false] {
+        let mut transcript = Transcript::default();
+        transcript.set_action_descriptors(action_descriptors);
+        let mut preparing = SessionEvent::new(
             session_id,
-            sequence,
+            1,
             SessionEventKind::ProviderEvent {
                 provider: CodingProvider::Codex,
-                kind: "action/generation_status".into(),
-                payload: serde_json::json!({
-                    "tool_call_id": "tool-1",
-                    "waiting": waiting,
-                    "label": "secret detail",
-                }),
+                kind: "action/preparing".into(),
+                payload: serde_json::json!({"label": "secret detail", "tool_call_id": "tool-1"}),
             },
-        ));
-        assert_eq!(transcript.order.len(), 1);
-        assert!(matches!(
-            &transcript.order[0],
-            TranscriptEntry::Operation(Operation {
-                execution,
-                ..
-            }) if !execution.is_terminal() && execution.started_at() == started_at
-        ));
-        let rendered = transcript
-            .lines(100)
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            rendered.contains(if waiting {
+        );
+        preparing.created_at = started_at;
+        transcript.apply(&preparing);
+
+        for (sequence, waiting) in [(2, true), (3, false)] {
+            transcript.apply(&SessionEvent::new(
+                session_id,
+                sequence,
+                SessionEventKind::ProviderEvent {
+                    provider: CodingProvider::Codex,
+                    kind: "action/generation_status".into(),
+                    payload: serde_json::json!({
+                        "tool_call_id": "tool-1",
+                        "waiting": waiting,
+                        "label": "secret detail",
+                    }),
+                },
+            ));
+            assert_eq!(transcript.order.len(), 1);
+            assert!(matches!(
+                &transcript.order[0],
+                TranscriptEntry::Operation(Operation {
+                    execution,
+                    ..
+                }) if !execution.is_terminal() && execution.started_at() == started_at
+            ));
+            let rendered = transcript
+                .lines(100)
+                .into_iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let expected = if action_descriptors {
+                "Generating tool call · secret detail…"
+            } else if waiting {
                 "Awaiting tool-call arguments…"
             } else {
                 "Generating tool call…"
-            }),
-            "{rendered}"
-        );
-        assert!(!rendered.contains("secret detail"), "{rendered}");
+            };
+            assert!(
+                rendered.contains(expected),
+                "descriptors={action_descriptors} waiting={waiting}: {rendered}"
+            );
+            assert_eq!(
+                rendered.contains("secret detail"),
+                action_descriptors,
+                "description visibility must follow the user's setting"
+            );
+        }
     }
 }
 
@@ -15453,7 +15462,7 @@ fn agent_lifecycle_and_reasoning_rows_keep_one_continuous_actions_accordion() {
     assert!(!rendered.contains("  ▸ Reasoned\n"), "{rendered}");
     assert!(!rendered.contains("Reasoned (1)"), "{rendered}");
     assert!(rendered.contains("◦ Reasoned"), "{rendered}");
-    assert!(rendered.contains("  ▸ Run (2)"), "{rendered}");
+    assert!(rendered.contains("  ▸ Ran (2)"), "{rendered}");
     assert!(rendered.contains("  ▸ Watch (2)"), "{rendered}");
     assert!(
         rendered.contains("Agent      /root/v391_scaling_audit · started"),
@@ -15718,7 +15727,7 @@ fn returning_to_the_tail_discards_a_stale_growth_anchor() {
         "detached view preserves its content anchor"
     );
     assert_eq!(
-        resolve_pending_scroll_anchor(true, 0, Some(20), 24),
+        resolve_pending_scroll_anchor(true, 7, Some(20), 24),
         0,
         "the live tail wins when wheel motion reaches the bottom"
     );

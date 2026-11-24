@@ -259,12 +259,7 @@ impl Transcript {
         } else {
             None
         };
-        let name = if is_reasoning {
-            label.clone()
-        } else {
-            tool_lifecycle_label(label, execution.is_terminal() && !execution.is_backgrounded())
-                .into_owned()
-        };
+        let name = operation_lifecycle_label(operation).into_owned();
         // The body already spells out a command or a diff; for anything else
         // the header is the only place that says what ran.
         let body_states_action = input
@@ -893,6 +888,17 @@ fn tool_window_summary(entries: &[TranscriptEntry], total: usize, today_prefix: 
 /// An expanded group uses a down triangle; the timestamp starts in the same
 /// column as the collapsed `▸ ` header.
 const TOOL_WINDOW_HEADER_INDENT: &str = "▾ ";
+
+fn operation_lifecycle_label(operation: &Operation) -> Cow<'_, str> {
+    if operation.kind.is_call() {
+        tool_lifecycle_label(
+            &operation.label,
+            operation.execution.is_terminal() && !operation.execution.is_backgrounded(),
+        )
+    } else {
+        Cow::Borrowed(operation.label.as_str())
+    }
+}
 
 fn action_label_style(entry: &TranscriptEntry) -> Style {
     let Some(operation) = entry.operation() else {
@@ -3055,7 +3061,8 @@ impl Transcript {
                     .unwrap_or(entry);
                 let label = summary_entry
                     .operation()
-                    .map_or("", |operation| operation.label.as_str());
+                    .map(operation_lifecycle_label)
+                    .unwrap_or(Cow::Borrowed(""));
                 let summary = format!("{label} ({})", window.total);
                 let row = lines.len();
                 lines.push(tool_window_header(

@@ -9,6 +9,19 @@ Git comparison.
   Provider admission now checks the selected model, so workers such as `opencode-go/hungerg-free`
   can spawn while paid Go models stay blocked; scouts, fallback routes and helper titles use the
   same model-aware rule.
+- Grouped action headers now use the same running/completed tense as their
+  rows (`Ran (2)`, not `Run (2)`), and read-only Git history is labeled
+  `View commit` / `View commits` rather than `Show` / `Shown`.
+- Tool-call progress keeps its action description when the provider pauses
+  for arguments instead of replacing `Generating tool call · …` with the
+  less informative `Awaiting tool-call arguments…`.
+- Resumed transcripts keep durable messages that arrive after a live
+  snapshot, so lazy-loading an older page can no longer drop the newest
+  reply. Resume continues to open anchored at the bottom.
+- Native-harness sessions now expose `spawn_agent` and `wait_agent` as
+  first-class tools with their full schemas instead of mentioning them only in
+  prose. The prompt names both the native tool and its MCP alias correctly, so
+  agents no longer have to search source code to delegate work.
 - Local model context settings no longer cap hosted OpenAI-compatible routes.
   `[local].ctx_size` now applies only to the built-in local server, so OpenCode
   Go and configured gateways keep their own advertised context windows instead

@@ -11571,6 +11571,30 @@ mod exec_args_tests {
             names.contains(&"capability"),
             "the escape hatch needs a schema"
         );
+        // Native models cannot discover an omitted tool's schema through the
+        // capability escape hatch. Spawn/wait are the delegation lifecycle the
+        // prompt instructs them to use.
+        for name in ["spawn_agent", "wait_agent"] {
+            assert!(names.contains(&name), "native surface must expose {name}");
+        }
+        let spawn = promoted
+            .iter()
+            .find(|spec| spec["name"] == "spawn_agent")
+            .expect("spawn_agent schema");
+        assert_eq!(
+            spawn["inputSchema"]["required"],
+            json!(["task_name", "message"])
+        );
+        let wait = promoted
+            .iter()
+            .find(|spec| spec["name"] == "wait_agent")
+            .expect("wait_agent schema");
+        assert!(
+            wait["inputSchema"]["properties"]
+                .get("timeout_ms")
+                .is_some(),
+            "wait_agent must expose its blocking timeout"
+        );
         assert!(!is_promoted_capability("history_index"));
         assert!(!is_promoted_capability("capability"));
         // A name may be claimed once only, or the model sees two schemas for it.
@@ -12507,14 +12531,15 @@ pub(crate) fn exec_tool_spec() -> Value {
 ///
 /// These are the ones whose *use* is not self-evident from their arguments: a
 /// goal's lifecycle, a plan's item identity and status vocabulary, the
-/// addressing rules for another agent, and which of history's several retrieval
-/// modes answers which question. A schema carries that; a name passed as a
-/// string cannot, because by then the guidance is gone.
+/// addressing rules for another agent, spawning and settling a child, and
+/// which of history's several retrieval modes answers which question. A schema
+/// carries that; a name passed as a string cannot, because by then the guidance
+/// is gone.
 ///
 /// The schemas are the catalog's own, taken by name rather than rewritten here.
 /// A second copy of a description is a second thing to forget to update, and
 /// these are descriptions the runtime already depends on.
-pub(crate) fn promoted_capability_tools() -> [&'static str; 14] {
+pub(crate) fn promoted_capability_tools() -> [&'static str; 16] {
     [
         "show_image",
         "get_goal",
@@ -12523,9 +12548,11 @@ pub(crate) fn promoted_capability_tools() -> [&'static str; 14] {
         "get_plan",
         "update_plan",
         "list_agents",
+        "spawn_agent",
         "scout",
         "send_message",
         "followup_task",
+        "wait_agent",
         "query_history",
         "search_files",
         "computer_use",

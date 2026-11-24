@@ -1011,6 +1011,39 @@ async fn older_history_pages_cross_cleaned_up_sequence_gaps() {
 }
 
 #[test]
+fn streamed_durable_rows_stay_ahead_of_resumed_live_snapshots() {
+    let session = Uuid::new_v4();
+    let message = |sequence, text: &str| {
+        SessionEvent::new(
+            session,
+            sequence,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::Assistant,
+                text: text.to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        )
+    };
+    let mut history = vec![message(1, "durable prefix"), message(0, "live snapshot")];
+    remember_streamed_history_event(&mut history, &message(2, "newest reply"));
+    assert_eq!(
+        history
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 0]
+    );
+    history.retain(|event| event.sequence > 0);
+    assert!(history.iter().any(|event| matches!(
+        &event.kind,
+        SessionEventKind::Message { text, .. } if text == "newest reply"
+    )));
+}
+
+#[test]
 fn older_history_pages_merge_around_a_checkpoint_without_duplicate_rows() {
     let session_id = Uuid::new_v4();
     let checkpoint = SessionEvent::new(

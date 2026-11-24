@@ -1304,7 +1304,7 @@ fn is_git_label(label: &str) -> bool {
             | "Push changes"
             | "Merge branch"
             | "Rebase branch"
-            | "Show commit"
+            | "View commit"
             | "Git tags"
             | "Git remotes"
             | "Repository info"
@@ -1638,7 +1638,7 @@ impl GitAction {
             Self::Push => "Push changes",
             Self::Merge => "Merge branch",
             Self::Rebase => "Rebase branch",
-            Self::Show => "Show commit",
+            Self::Show => "View commit",
             Self::Tag => "Git tags",
             Self::Remote => "Git remotes",
             Self::RepositoryInfo => "Repository info",
@@ -1966,7 +1966,7 @@ fn repeated_git_label(action: GitAction) -> String {
         GitAction::Diff => "Compare revisions",
         GitAction::Log => "Review history",
         GitAction::Branch => "Inspect branches",
-        GitAction::Show => "Show commits",
+        GitAction::Show => "View commits",
         GitAction::Tag => "Inspect tags",
         GitAction::Remote => "Inspect remotes",
         GitAction::RepositoryInfo => "Inspect repository",
@@ -4136,7 +4136,7 @@ all green"
             ("git rev-parse --show-toplevel", "Repository info", ""),
             (
                 "git show HEAD; git show HEAD:src/main.rs | sed -n '1,180p'",
-                "Show commits",
+                "View commits",
                 "HEAD, HEAD:src/main.rs",
             ),
             (

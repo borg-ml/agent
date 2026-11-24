@@ -1050,7 +1050,7 @@ mod tests {
             if waiting {
                 assert_eq!(
                     tool_lifecycle_label(&projector.entries[0].title, false),
-                    "Awaiting tool-call arguments…"
+                    "Generating tool call · read configuration…"
                 );
             }
         }
