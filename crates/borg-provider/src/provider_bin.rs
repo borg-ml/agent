@@ -361,7 +361,10 @@ pub(crate) async fn probe_path(runtime: Runtime, path: &Path) -> Result<(), Stri
 fn leading_major_version(bytes: &[u8]) -> Option<u64> {
     let text = String::from_utf8_lossy(bytes);
     let line = text.lines().map(str::trim).find(|line| !line.is_empty())?;
-    let version = line.strip_prefix("opencode ").unwrap_or(line).trim_start_matches('v');
+    let version = line
+        .strip_prefix("opencode ")
+        .unwrap_or(line)
+        .trim_start_matches('v');
     if !version.chars().all(|c| c.is_ascii_digit() || c == '.') {
         return None;
     }
