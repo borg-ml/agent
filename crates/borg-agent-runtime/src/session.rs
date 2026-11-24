@@ -171,7 +171,10 @@ fn title_route(launch: &LaunchSession, openai_api_key_active: bool) -> Option<cr
     let ready = capabilities.title_gateway.is_some()
         || capabilities.provider_capabilities.iter().any(|capability| {
             capability.provider == provider
-                && capability.can_spawn
+                && crate::provider_usage::provider_model_can_spawn(
+                    capability,
+                    Some(model.model_id()),
+                )
                 && match provider {
                     CodingProvider::Codex => {
                         !openai_api_key_active
@@ -7998,7 +8001,12 @@ async fn run_agent_session_store_kernel_inner(
                             resolve_consultation_profile(&request.profile).map_err(|error| {
                                 anyhow::anyhow!("invalid consultation profile: {error}")
                             })?;
-                        crate::subagents::ensure_provider_can_spawn(&launch, provider).await?;
+                        crate::subagents::ensure_provider_can_spawn(
+                            &launch,
+                            provider,
+                            model.as_deref(),
+                        )
+                        .await?;
                         let effort = requested_effort.or_else(|| if provider == launch.provider {
                             launch.effort.clone()
                         } else {

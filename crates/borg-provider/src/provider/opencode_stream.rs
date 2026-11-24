@@ -850,7 +850,9 @@ const PREFERRED_GO_MODELS: &[&str] = &[
 ];
 
 fn is_unstable_go_model(id: &str) -> bool {
-    id.ends_with("-free") || id.contains("preview") || id.contains("alpha")
+    super::super::opencode_model::is_free_go_model(id)
+        || id.contains("preview")
+        || id.contains("alpha")
 }
 
 /// Choose the Go default from the live catalog: an explicitly configured

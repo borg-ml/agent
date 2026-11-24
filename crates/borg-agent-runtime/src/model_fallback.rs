@@ -99,7 +99,7 @@ impl ModelRoute {
         else {
             return true;
         };
-        capability.authenticated
+        crate::provider_usage::provider_model_can_spawn(capability, self.model.as_deref())
             && match capability.billing {
                 Some(BillingLane::ApiKey) => self.allow_api_billing,
                 Some(BillingLane::Subscription | BillingLane::Endpoint) | None => true,

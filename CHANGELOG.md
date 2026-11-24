@@ -5,6 +5,10 @@ Git comparison.
 
 ## Unreleased (since 0.22.3)
 
+- OpenCode Go free models remain available when the paid subscription allowance is exhausted.
+  Provider admission now checks the selected model, so workers such as `opencode-go/hungerg-free`
+  can spawn while paid Go models stay blocked; scouts, fallback routes and helper titles use the
+  same model-aware rule.
 - Local model context settings no longer cap hosted OpenAI-compatible routes.
   `[local].ctx_size` now applies only to the built-in local server, so OpenCode
   Go and configured gateways keep their own advertised context windows instead

@@ -319,7 +319,12 @@ fn apply_spawn_admission(capability: &mut ProviderCapability) {
             capability.billing,
             Some(crate::BillingLane::ApiKey | crate::BillingLane::Endpoint)
         );
-    capability.can_spawn = capability.installed && capability.authenticated && !quota_blocks;
+    // OpenCode Go remains provider-ready when its paid allowance is exhausted:
+    // free models do not consume that allowance. Model-specific callers use
+    // provider_model_can_spawn to keep paid models blocked.
+    capability.can_spawn = capability.installed
+        && capability.authenticated
+        && (!quota_blocks || capability.provider == CodingProvider::OpenCode);
     if capability.provider == CodingProvider::Claude
         && capability.billing == Some(crate::BillingLane::Subscription)
         && borg_provider::provider::claude_native_account_verification_failed_recently()
@@ -327,6 +332,28 @@ fn apply_spawn_admission(capability: &mut ProviderCapability) {
     {
         hold_unverified_claude_transport(capability);
     }
+}
+
+pub(crate) fn provider_model_can_spawn(
+    capability: &ProviderCapability,
+    model: Option<&str>,
+) -> bool {
+    if !capability.installed || !capability.authenticated {
+        return false;
+    }
+    let quota_blocks = capability.provider != CodingProvider::Codex
+        && capability
+            .usage
+            .as_ref()
+            .is_some_and(|usage| usage.availability == ProviderUsageAvailability::Exhausted)
+        && !matches!(
+            capability.billing,
+            Some(crate::BillingLane::ApiKey | crate::BillingLane::Endpoint)
+        );
+    if quota_blocks && capability.provider == CodingProvider::OpenCode {
+        return model.is_some_and(borg_provider::provider::opencode_model::is_free_go_model);
+    }
+    capability.can_spawn
 }
 
 fn hold_unverified_claude_transport(capability: &mut ProviderCapability) {
@@ -965,9 +992,17 @@ mod tests {
             capability.usage = Some(opencode_provider_usage(vec![exhausted_window]));
             apply_spawn_admission(&mut capability);
             assert!(
-                !capability.can_spawn,
-                "an exhausted Go plan must not admit new work"
+                capability.can_spawn,
+                "free Go models keep the provider admissible"
             );
+            assert!(!provider_model_can_spawn(
+                &capability,
+                Some("opencode-go/deepseek-v4.1-flash"),
+            ));
+            assert!(provider_model_can_spawn(
+                &capability,
+                Some("opencode-go/hungerg-free"),
+            ));
             assert!(
                 capability
                     .usage

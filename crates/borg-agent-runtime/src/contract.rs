@@ -638,10 +638,11 @@ pub struct ProviderCapability {
     /// the mechanism was not classified by that older host.
     #[serde(default)]
     pub auth_methods: Vec<ProviderAuthMethod>,
-    /// Whether the host can admit a child on this provider right now. This is
-    /// stronger than `authenticated`: a provider CLI or endpoint may still be
-    /// missing even when credentials exist, or a subscription lane may have
-    /// exhausted its current usage window.
+    /// Whether the host can admit a child on at least one model on this
+    /// provider right now. This is stronger than `authenticated`: a provider
+    /// CLI or endpoint may still be missing even when credentials exist.
+    /// Model-specific admission may be narrower while a subscription is
+    /// exhausted, as with OpenCode Go's free models.
     #[serde(default)]
     pub can_spawn: bool,
     /// Secret-free account capacity metadata. `None` means the provider does

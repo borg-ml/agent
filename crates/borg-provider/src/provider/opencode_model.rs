@@ -73,6 +73,14 @@ pub fn is_go_model(model: &str) -> bool {
     wire_model(model).is_some()
 }
 
+/// Whether `model` names a free Go-route model.
+///
+/// Free models do not consume the Go subscription allowance, so an exhausted
+/// allowance must not prevent Borg from admitting a worker that selects one.
+pub fn is_free_go_model(model: &str) -> bool {
+    wire_model(model).is_some_and(|id| id.ends_with("-free"))
+}
+
 /// The upstream model id for a Borg `opencode-go/<model>` alias.
 ///
 /// Returns `None` for every other model, including bare ids and other OpenCode
@@ -331,6 +339,10 @@ mod tests {
         );
         assert_eq!(wire_model("  opencode-go/glm-5.3  "), Some("glm-5.3"));
         assert!(is_go_model("opencode-go/gpt-5.6-luna"));
+        assert!(is_free_go_model("opencode-go/hungerg-free"));
+        assert!(is_free_go_model("  opencode-go/beam-free  "));
+        assert!(!is_free_go_model("opencode-go/deepseek-v4.1-flash"));
+        assert!(!is_free_go_model("hungerg-free"));
     }
 
     /// The adapter must not treat "authenticated for one OpenCode route" as

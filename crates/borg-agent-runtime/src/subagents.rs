@@ -6068,7 +6068,6 @@ impl SubagentCoordinator {
             .and_then(|parent| parent.effort.clone())
             .or_else(|| launch.effort.clone());
         launch.provider = request.provider.unwrap_or(parent_provider);
-        ensure_provider_can_spawn(&launch, launch.provider).await?;
         validate_subagent_overrides(
             launch.provider,
             request.model.as_deref(),
@@ -6104,6 +6103,7 @@ impl SubagentCoordinator {
                     .context("resolve OpenCode model for spawn")?,
             );
         }
+        ensure_provider_can_spawn(&launch, launch.provider, launch.model.as_deref()).await?;
         if inherits_parent {
             // The parent's live effort is what a worker inherits; the team
             // policy preset still comes first, because it deliberately assigns
@@ -6259,7 +6259,7 @@ impl SubagentCoordinator {
         model: Option<String>,
         effort: Option<String>,
     ) -> Result<SubagentSnapshot> {
-        ensure_provider_can_spawn(&self.root_launch, provider).await?;
+        ensure_provider_can_spawn(&self.root_launch, provider, model.as_deref()).await?;
         let task_name = canonical_task_name(task_name)?;
         let existing = {
             let table = self.table.lock().await;
@@ -6406,7 +6406,7 @@ impl SubagentCoordinator {
         model: Option<String>,
         effort: Option<String>,
     ) -> Result<PeerRotation> {
-        ensure_provider_can_spawn(&self.root_launch, provider).await?;
+        ensure_provider_can_spawn(&self.root_launch, provider, model.as_deref()).await?;
         let task_name = canonical_sidecar_task_name(task_name)?;
         let launch = self.sidecar_launch(&task_name, provider, model, effort)?;
         let existing = {
@@ -8634,9 +8634,6 @@ impl SubagentCoordinator {
             .configuration
             .context("session has no recorded configuration")?;
         let selected = provider.unwrap_or(current.provider);
-        if selected != current.provider {
-            ensure_provider_can_spawn(&self.root_launch, selected).await?;
-        }
         let model = model.map(|model| model.trim().to_string());
         ensure!(
             model.as_deref().is_none_or(|model| !model.is_empty()),
@@ -8666,6 +8663,10 @@ impl SubagentCoordinator {
         } else {
             model.clone().or_else(|| current.model.clone())
         };
+        if selected != current.provider {
+            ensure_provider_can_spawn(&self.root_launch, selected, expected_model.as_deref())
+                .await?;
+        }
         ensure!(
             !selected.uses_native_harness() || expected_model.is_some(),
             "{} requires a model; pass model=<id>",
@@ -9894,13 +9895,7 @@ fn select_scout_route<'a>(
     routes: &'a [crate::ModelRoute],
     capabilities: &[crate::ProviderCapability],
 ) -> Option<&'a crate::ModelRoute> {
-    routes.iter().find(|route| {
-        capabilities.iter().any(|capability| {
-            capability.provider == route.provider
-                && capability.can_spawn
-                && route.permitted(capabilities)
-        })
-    })
+    routes.iter().find(|route| route.permitted(capabilities))
 }
 
 /// Provider-neutral schemas exposed to every supported execution lane.
@@ -10186,6 +10181,7 @@ pub(crate) fn validate_subagent_overrides(
 pub(crate) async fn ensure_provider_can_spawn(
     launch: &LaunchSession,
     provider: CodingProvider,
+    model: Option<&str>,
 ) -> Result<()> {
     // Login and quota can change after launch. Admission must use the same
     // refreshed authority as get_provider_capabilities, not the startup snapshot.
@@ -10206,7 +10202,7 @@ pub(crate) async fn ensure_provider_can_spawn(
             )
         })?;
     anyhow::ensure!(
-        capability.can_spawn,
+        crate::provider_usage::provider_model_can_spawn(capability, model),
         "{} cannot spawn on this host: {}",
         provider.label(),
         capability

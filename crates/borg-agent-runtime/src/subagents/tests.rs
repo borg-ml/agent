@@ -3768,6 +3768,110 @@ async fn subagent_admission_rejects_an_exhausted_subscription() {
 }
 
 #[tokio::test]
+async fn free_opencode_go_model_spawns_when_subscription_quota_is_exhausted() {
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
+    store.create_session(root).await.unwrap();
+    let mut root_launch = launch();
+    root_launch.cwd = directory.path().to_path_buf();
+    root_launch
+        .capabilities
+        .provider_capabilities
+        .push(crate::ProviderCapability {
+            provider: CodingProvider::OpenCode,
+            installed: true,
+            version: Some("test".to_string()),
+            authenticated: true,
+            auth_detail: Some("test OpenCode Go credentials".to_string()),
+            auth_methods: vec![crate::ProviderAuthMethod::Subscription],
+            can_spawn: true,
+            usage: Some(crate::ProviderUsage {
+                availability: crate::ProviderUsageAvailability::Exhausted,
+                windows: vec![crate::ProviderUsageWindow {
+                    label: "Weekly".to_string(),
+                    used_percent: 100,
+                    resets_at: None,
+                    global: true,
+                }],
+                detail: Some("OpenCode Go subscription usage is exhausted".to_string()),
+                plan: None,
+            }),
+            billing: Some(crate::BillingLane::Subscription),
+            accounts: Vec::new(),
+            account_strategy: None,
+        });
+    let mut unauthenticated = root_launch.clone();
+    let capability = unauthenticated
+        .capabilities
+        .provider_capabilities
+        .iter_mut()
+        .find(|capability| capability.provider == CodingProvider::OpenCode)
+        .unwrap();
+    capability.authenticated = false;
+    capability.auth_methods.clear();
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        root_launch,
+        2,
+        Arc::new(crate::LocalAgentTurnExecutor::default()),
+        store,
+    )
+    .unwrap();
+
+    let free = coordinator
+        .subagent_launch(
+            root,
+            &SpawnSubagent {
+                desktop: false,
+                task_name: "free_go_worker".into(),
+                message: "Complete this bounded task.".into(),
+                provider: Some(CodingProvider::OpenCode),
+                model: Some("opencode-go/hungerg-free".into()),
+                effort: None,
+                fast: None,
+                ultrafast: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(free.provider, CodingProvider::OpenCode);
+    assert_eq!(free.model.as_deref(), Some("opencode-go/hungerg-free"));
+
+    let paid_error = coordinator
+        .subagent_launch(
+            root,
+            &SpawnSubagent {
+                desktop: false,
+                task_name: "paid_go_worker".into(),
+                message: "Complete this bounded task.".into(),
+                provider: Some(CodingProvider::OpenCode),
+                model: Some("opencode-go/deepseek-v4.1-flash".into()),
+                effort: None,
+                fast: None,
+                ultrafast: None,
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(paid_error.contains("usage is exhausted"), "{paid_error}");
+
+    let auth_error = ensure_provider_can_spawn(
+        &unauthenticated,
+        CodingProvider::OpenCode,
+        Some("opencode-go/hungerg-free"),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(auth_error.contains("cannot spawn"), "{auth_error}");
+    scratch.discard().await;
+}
+
+#[tokio::test]
 async fn persistent_peer_consultation_reuses_the_sidecar_and_returns_to_the_primary() {
     let directory = tempdir().unwrap();
     let root = Uuid::new_v4();
