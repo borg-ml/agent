@@ -259,6 +259,17 @@ impl ManagedCluster {
     /// chmodded, so the cluster is built one level below the staging directory
     /// and only that level is renamed into place.
     async fn initialize(&self, initdb: &Path) -> Result<()> {
+        // PostgreSQL refuses to initialise a cluster as root. Say so before
+        // spawning initdb, which otherwise reports only its own hint after
+        // Borg has already created the directory for it.
+        #[cfg(unix)]
+        if unsafe { libc::geteuid() } == 0 {
+            bail!(
+                "Borg cannot create its session database as root: PostgreSQL's initdb refuses \
+                 to run as root. Run Borg as a normal user; the first run opens Settings › \
+                 Providers, so no login is needed to get started."
+            );
+        }
         let Some(parent) = self.data_dir.parent() else {
             bail!("{} has no parent directory", self.data_dir.display());
         };

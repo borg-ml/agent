@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.22.3)
 
+- Starting Borg as root no longer fails with a bare `initdb: hint: Please log in ...` after the
+  session directory is created. Borg says up front that its PostgreSQL cluster cannot be
+  initialised as root and asks for a normal user; that first run opens Settings › Providers,
+  where a provider can be connected without logging in beforehand.
+
 - Gemini tool calls no longer fail with HTTP 400 `Unknown name "examples"` when a tool
   schema contains JSON Schema `examples`; Borg strips that annotation before sending
   function declarations.
