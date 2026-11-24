@@ -445,11 +445,11 @@ async fn supervisor_wakes_for_enqueue_and_scheduled_deadline() {
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
 
-    struct Handler(tokio::sync::mpsc::UnboundedSender<Uuid>);
+    struct Handler(tokio::sync::mpsc::UnboundedSender<(Uuid, chrono::DateTime<Utc>)>);
     #[async_trait::async_trait]
     impl AutonomyJobHandler for Handler {
         async fn execute(&self, job: AutonomyJob) -> anyhow::Result<serde_json::Value> {
-            self.0.send(job.job_id).unwrap();
+            self.0.send((job.job_id, Utc::now())).unwrap();
             Ok(serde_json::Value::Null)
         }
     }
@@ -474,26 +474,28 @@ async fn supervisor_wakes_for_enqueue_and_scheduled_deadline() {
     request.session_id = Some(owner);
     request.due_at = Utc::now() + chrono::Duration::milliseconds(700);
     let scheduled = dispatcher_store.enqueue(request).await.unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_millis(200), executed.recv())
-            .await
-            .is_err()
-    );
-    assert_eq!(
+    // Enqueue can return after the deadline under load. Compare execution to
+    // the persisted deadline instead of timing a quiet window after return.
+    let (executed_id, executed_at) =
         tokio::time::timeout(Duration::from_secs(3), executed.recv())
             .await
-            .unwrap(),
-        Some(scheduled.job_id)
+            .expect("scheduled job did not execute")
+            .expect("supervisor stopped before executing scheduled job");
+    assert_eq!(executed_id, scheduled.job_id);
+    assert!(
+        executed_at >= scheduled.due_at - chrono::Duration::milliseconds(10),
+        "scheduled job executed at {executed_at}, before {}",
+        scheduled.due_at
     );
     let mut request = job("immediate-wake", 1);
     request.session_id = Some(owner);
     let immediate = dispatcher_store.enqueue(request).await.unwrap();
-    assert_eq!(
+    let (executed_id, _) =
         tokio::time::timeout(Duration::from_secs(3), executed.recv())
             .await
-            .unwrap(),
-        Some(immediate.job_id)
-    );
+            .unwrap()
+            .unwrap();
+    assert_eq!(executed_id, immediate.job_id);
     cancel.cancel();
     task.await.unwrap();
     scratch.discard().await;
