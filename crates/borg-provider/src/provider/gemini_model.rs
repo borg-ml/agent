@@ -840,7 +840,10 @@ mod tests {
         let parameters = &body["tools"][0]["functionDeclarations"][0]["parameters"];
         assert!(parameters["properties"]["model"].get("examples").is_none());
         assert_eq!(parameters["properties"]["model"]["type"], "STRING");
-        assert_eq!(parameters["properties"]["model"]["description"], "Model override");
+        assert_eq!(
+            parameters["properties"]["model"]["description"],
+            "Model override"
+        );
         assert_eq!(parameters["required"], json!(["model"]));
     }
 
