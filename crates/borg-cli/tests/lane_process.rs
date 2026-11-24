@@ -688,10 +688,12 @@ fn stall_detection_counts_every_process_of_the_job() {
         spec.stall_timeout_ms = Some(1_500);
         lane.submit(&spec)
     };
-    // The leader waits; its child burns CPU for 3 s without output.
+    // The leader waits; its child burns one CPU-second without output. A
+    // wall-clock loop can consume too little CPU to count as progress when
+    // the test host is loaded.
     let busy = run(
         "busy-child",
-        "bash -c 'while [ $SECONDS -lt 3 ]; do :; done' & wait",
+        r#"bash -c 'trap "exit 0" XCPU; ulimit -t 1; while :; do :; done' 2>/dev/null & wait"#,
     );
     // Output alone is progress too.
     let chatty = run("chatty", "for i in $(seq 10); do echo $i; sleep 0.3; done");
