@@ -226,7 +226,7 @@ impl SelfServiceContext {
             "path": path,
             "exists": exists,
             "settings": serde_json::to_value(settings)?,
-            "hot_reload": ["commands.aliases", "keybindings", "scout", "search"],
+            "hot_reload": ["commands.aliases", "keybindings", "scout", "search", "team.worker_concurrency"],
             "next_turn_reload": ["extensions", "mcp", "providers"],
             "restart_required": [
                 "capabilities", "team", "approvals", "updates", "prompt", "models"
@@ -368,12 +368,12 @@ impl SelfServiceContext {
             "scope": scope,
             "path": path,
             "updated_sections": updated_sections,
-            "hot_reloaded": ["commands.aliases", "keybindings", "scout"],
+            "hot_reloaded": ["commands.aliases", "keybindings", "scout", "team.worker_concurrency"],
             "next_turn_reloaded": ["extensions", "mcp"],
             "restart_required": [
                 "capabilities", "team", "approvals", "updates", "prompt", "models"
             ],
-            "note": "Aliases and keybindings reload in the running TUI; scout settings apply on the next scout call. Blu and base MCP catalogs swap at the next turn boundary; capability/team/approval/update/prompt/models changes require a new session."
+            "note": "Aliases and keybindings reload in the running TUI; scout settings apply on the next scout call; team.worker_concurrency applies to the next subagent spawn or resume. Blu and base MCP catalogs swap at the next turn boundary; capability/team/approval/update/prompt/models changes require a new session."
         }))
     }
 
@@ -1976,6 +1976,16 @@ fn validate_relative_path(path: &Path, label: &str) -> Result<()> {
         "invalid {label}"
     );
     Ok(())
+}
+
+/// The user's live `[team] worker_concurrency`, read on every admission so a
+/// change applies to running teams without a restart. None when unset or unreadable.
+#[cfg(not(test))]
+pub(crate) fn live_worker_concurrency() -> Option<usize> {
+    let source = fs::read_to_string(default_settings_path()?).ok()?;
+    let root: toml::Value = toml::from_str(&source).ok()?;
+    let limit = root.get("team")?.get("worker_concurrency")?.as_integer()?;
+    usize::try_from(limit).ok()
 }
 
 fn default_settings_path() -> Option<PathBuf> {

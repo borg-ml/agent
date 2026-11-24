@@ -5,6 +5,10 @@ Git comparison.
 
 ## Unreleased (since 0.22.3)
 
+- `[team] worker_concurrency` now applies live: running teams re-read it on every
+  subagent spawn and resume, so raising the cap no longer requires restarting a
+  long-lived session that kept its launch-time limit.
+
 - Windows builds compile again: the storage free-space probe is Unix-only, and
   `borg storage` reports free space as unknown on Windows instead of failing to build.
 

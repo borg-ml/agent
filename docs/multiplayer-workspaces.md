@@ -239,8 +239,9 @@ The smoke passes only when both provider turns complete, the root observes the
 Claude-attributed team message, and the root produces a joint final response.
 
 Borg admits up to 16 live child agents by default for both manual and
-autonomous teams. Users can lower that ceiling with
-`[team].worker_concurrency` without enabling an autonomous preset. Total
+autonomous teams. Users can change that ceiling with
+`[team].worker_concurrency` without enabling an autonomous preset; running
+teams read it on every spawn and resume, so a change needs no restart. Total
 assignment, report, escalation, and specialist limits are separate policy
 settings; concurrency is not a hidden lifetime work budget.
 

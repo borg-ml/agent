@@ -4617,6 +4617,16 @@ const STORE_LOSS_RESUME_DELAY: Duration = Duration::from_secs(5);
 const RESUME_AFTER_RESTART: &str = "Borg restarted while you were working on your assigned task, which cut off your last turn. Continue the task from where you left off; your conversation and workspace are intact.";
 
 impl SubagentTable {
+    /// The configured worker concurrency wins over the launch-time value, so
+    /// raising or lowering it takes effect for long-lived teams immediately.
+    fn max_children(&self) -> usize {
+        #[cfg(not(test))]
+        if let Some(limit) = crate::self_service::live_worker_concurrency() {
+            return limit;
+        }
+        self.max_children
+    }
+
     fn reserve(&mut self, task_name: &str, launch: &LaunchSession) -> Result<SubagentSnapshot> {
         self.reserve_as(self.root_session_id, task_name, launch)
     }
@@ -4643,8 +4653,9 @@ impl SubagentTable {
             .values()
             .filter(|entry| entry.snapshot.status.consumes_concurrency_slot() && !entry.dormant)
             .count();
-        if active >= self.max_children {
-            bail!("subagent concurrency limit reached ({})", self.max_children);
+        let max_children = self.max_children();
+        if active >= max_children {
+            bail!("subagent concurrency limit reached ({max_children})");
         }
         let now = Utc::now();
         let snapshot = SubagentSnapshot {
@@ -6939,7 +6950,7 @@ impl SubagentCoordinator {
                         entry.snapshot.status.consumes_concurrency_slot() && !entry.dormant
                     })
                     .count();
-                let max_children = table.max_children;
+                let max_children = table.max_children();
                 let entry = table
                     .entries
                     .get_mut(&session_id)
