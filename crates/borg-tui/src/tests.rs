@@ -15389,12 +15389,12 @@ fn singleton_reasoning_stays_solo_beside_a_styled_expandable_wait_group() {
     let header = rendered
         .0
         .iter()
-        .find(|line| line.to_string().contains("Wait for agents (2)"))
+        .find(|line| line.to_string().contains("Finished waiting for agents (2)"))
         .unwrap();
     let label = header
         .spans
         .iter()
-        .find(|span| span.content.contains("Wait for agents"))
+        .find(|span| span.content.contains("Finished waiting for agents"))
         .unwrap();
     assert_eq!(label.style.fg, Some(SUBAGENT_PURPLE));
     assert!(label.style.add_modifier.contains(Modifier::BOLD));
@@ -15403,19 +15403,26 @@ fn singleton_reasoning_stays_solo_beside_a_styled_expandable_wait_group() {
     assert!(
         folded
             .iter()
-            .any(|line| line.to_string().contains("▸ Wait for agents (2)"))
+            .any(|line| line.to_string().contains("▸ Finished waiting for agents (2)"))
     );
     assert!(
         !folded
             .iter()
-            .any(|line| line.to_string().contains("Finished waiting for agents"))
+            .any(|line| line.to_string().contains("◆ Finished waiting for agents"))
     );
     assert!(transcript.toggle_action_run_expansion(1));
+    let expanded = transcript.lines(100);
     assert!(
-        transcript
-            .lines(100)
+        expanded
             .iter()
-            .any(|line| line.to_string().contains("Finished waiting for agents"))
+            .any(|line| line.to_string().contains("▾ Finished waiting for agents (2)"))
+    );
+    assert_eq!(
+        expanded
+            .iter()
+            .filter(|line| line.to_string().contains("◆ Finished waiting for agents"))
+            .count(),
+        2
     );
 }
 
