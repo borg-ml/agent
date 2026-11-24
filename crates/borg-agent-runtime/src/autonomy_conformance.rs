@@ -476,11 +476,10 @@ async fn supervisor_wakes_for_enqueue_and_scheduled_deadline() {
     let scheduled = dispatcher_store.enqueue(request).await.unwrap();
     // Enqueue can return after the deadline under load. Compare execution to
     // the persisted deadline instead of timing a quiet window after return.
-    let (executed_id, executed_at) =
-        tokio::time::timeout(Duration::from_secs(3), executed.recv())
-            .await
-            .expect("scheduled job did not execute")
-            .expect("supervisor stopped before executing scheduled job");
+    let (executed_id, executed_at) = tokio::time::timeout(Duration::from_secs(3), executed.recv())
+        .await
+        .expect("scheduled job did not execute")
+        .expect("supervisor stopped before executing scheduled job");
     assert_eq!(executed_id, scheduled.job_id);
     assert!(
         executed_at >= scheduled.due_at - chrono::Duration::milliseconds(10),
@@ -490,11 +489,10 @@ async fn supervisor_wakes_for_enqueue_and_scheduled_deadline() {
     let mut request = job("immediate-wake", 1);
     request.session_id = Some(owner);
     let immediate = dispatcher_store.enqueue(request).await.unwrap();
-    let (executed_id, _) =
-        tokio::time::timeout(Duration::from_secs(3), executed.recv())
-            .await
-            .unwrap()
-            .unwrap();
+    let (executed_id, _) = tokio::time::timeout(Duration::from_secs(3), executed.recv())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(executed_id, immediate.job_id);
     cancel.cancel();
     task.await.unwrap();
