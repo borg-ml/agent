@@ -457,6 +457,14 @@ async fn kinds(
 
 /// Free bytes available to an unprivileged writer on the filesystem holding
 /// `path`, or `None` when the path is not local.
+#[cfg(not(unix))]
+pub fn filesystem_free_bytes(_path: &std::path::Path) -> Option<u64> {
+    None
+}
+
+/// Free bytes available to an unprivileged writer on the filesystem holding
+/// `path`, or `None` when the path is not local.
+#[cfg(unix)]
 pub fn filesystem_free_bytes(path: &std::path::Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;

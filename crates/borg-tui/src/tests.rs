@@ -15400,11 +15400,10 @@ fn singleton_reasoning_stays_solo_beside_a_styled_expandable_wait_group() {
     assert!(label.style.add_modifier.contains(Modifier::BOLD));
     assert!(!transcript.toggle_action_run_expansion(1));
     let folded = transcript.lines(100);
-    assert!(
-        folded
-            .iter()
-            .any(|line| line.to_string().contains("▸ Finished waiting for agents (2)"))
-    );
+    assert!(folded.iter().any(|line| {
+        line.to_string()
+            .contains("▸ Finished waiting for agents (2)")
+    }));
     assert!(
         !folded
             .iter()
@@ -15412,11 +15411,10 @@ fn singleton_reasoning_stays_solo_beside_a_styled_expandable_wait_group() {
     );
     assert!(transcript.toggle_action_run_expansion(1));
     let expanded = transcript.lines(100);
-    assert!(
-        expanded
-            .iter()
-            .any(|line| line.to_string().contains("▾ Finished waiting for agents (2)"))
-    );
+    assert!(expanded.iter().any(|line| {
+        line.to_string()
+            .contains("▾ Finished waiting for agents (2)")
+    }));
     assert_eq!(
         expanded
             .iter()

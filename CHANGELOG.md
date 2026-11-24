@@ -5,6 +5,9 @@ Git comparison.
 
 ## Unreleased (since 0.22.3)
 
+- Windows builds compile again: the storage free-space probe is Unix-only, and
+  `borg storage` reports free space as unknown on Windows instead of failing to build.
+
 - Starting Borg as root no longer fails with a bare `initdb: hint: Please log in ...` after the
   session directory is created. Borg says up front that its PostgreSQL cluster cannot be
   initialised as root and asks for a normal user; that first run opens Settings › Providers,

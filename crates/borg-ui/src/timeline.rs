@@ -1103,7 +1103,7 @@ mod tests {
             },
         ));
         assert_eq!(projector.entries[0].title, "Generate read");
-        assert_eq!(projector.entries[1].title, "Wait for provider");
+        assert_eq!(projector.entries[1].title, "Generate run tests");
 
         projector.push(&SessionEvent::new(
             session_id,
