@@ -3303,13 +3303,16 @@ async fn director_configures_live_child_speed_and_reuses_its_new_lane_after_wake
         .await
         .unwrap();
     let target = child.task_name.as_str();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    // The release gate runs this suite sequentially against one Postgres; a
+    // child's journal delivery can take longer than five seconds late in that
+    // run. Sleep between polls so this wait does not add scheduler pressure.
+    tokio::time::timeout(Duration::from_secs(30), async {
         while coordinator.get(child.session_id).await.unwrap().status != SubagentStatus::Ready {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .unwrap();
+    .expect("child did not become Ready");
 
     let unauthorized = coordinator
         .call_tool_as(
@@ -3402,13 +3405,13 @@ async fn director_configures_live_child_speed_and_reuses_its_new_lane_after_wake
         .unwrap();
 
     coordinator.stop(target).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         while coordinator.get(child.session_id).await.unwrap().status != SubagentStatus::Stopped {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .unwrap();
+    .expect("child did not become Stopped");
     coordinator.stop_and_wait(child.session_id).await.unwrap();
     let before_dormant_config = coordinator.get(child.session_id).await.unwrap();
     let mut config_activity = coordinator.subscribe();
