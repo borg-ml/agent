@@ -5,6 +5,10 @@ Git comparison.
 
 ## Unreleased (since 0.22.3)
 
+- Local model context settings no longer cap hosted OpenAI-compatible routes.
+  `[local].ctx_size` now applies only to the built-in local server, so OpenCode
+  Go and configured gateways keep their own advertised context windows instead
+  of inheriting the local model's limit.
 - Images reach OpenCode Go vision models again. The Go route lists a model's input
   modalities as MIME types (`image/png`, `image/jpeg`, ...) while OpenRouter writes
   `image`; Borg matched only the bare word, so `deepseek-v4.1-flash` looked text-only and

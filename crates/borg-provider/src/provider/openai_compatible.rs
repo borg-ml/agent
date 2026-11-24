@@ -720,7 +720,7 @@ request: {shape}"
             // to be declared. Without it `context_window_tokens` stays `None`
             // and auto-compaction never engages, which strands long local
             // sessions at the context wall instead of compacting them.
-            apply_generic_context_window(&mut usage);
+            apply_generic_context_window(&mut usage, gateway);
             if let Some(context_window_tokens) = gateway
                 .and_then(|gateway| gateway.context_window_tokens)
                 .filter(|tokens| *tokens > 0)
@@ -911,7 +911,7 @@ request: {shape}"
         };
 
         let mut usage = extract_chat_completions_usage(&raw, elapsed_millis_u64(started_at), None);
-        apply_generic_context_window(&mut usage);
+        apply_generic_context_window(&mut usage, None);
         Ok(ProviderCallResult {
             value,
             raw_response: raw.clone(),
@@ -1061,7 +1061,16 @@ fn generic_context_window_tokens() -> Option<u64> {
         .filter(|tokens| *tokens > 0)
 }
 
-fn apply_generic_context_window(usage: &mut crate::runtime::ProviderCallUsage) {
+fn apply_generic_context_window(
+    usage: &mut crate::runtime::ProviderCallUsage,
+    gateway: Option<&ModelGateway>,
+) {
+    // `[local]` is exported process-wide for the built-in local server. A
+    // gateway is a distinct route (OpenCode Go, OpenRouter, or a configured
+    // provider); inheriting the local server's window would silently cap it.
+    if gateway.is_some() {
+        return;
+    }
     // Local servers report no model metadata, so the context window must be
     // declared by Borg or by the server lifecycle. Without it auto-compaction
     // never engages at the context wall.
@@ -2635,6 +2644,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn local_context_window_does_not_leak_to_gateway_routes() {
+        let _window = TestEnvGuard::set("BORG_OPENAI_COMPATIBLE_CONTEXT_WINDOW_TOKENS", "32768");
+        let mut local = ProviderCallUsage::default();
+        apply_generic_context_window(&mut local, None);
+        assert_eq!(local.context_window_tokens, Some(32_768));
+
+        let gateway = ModelGateway::new("http://gateway.invalid/v1", "token");
+        let mut hosted = ProviderCallUsage::default();
+        apply_generic_context_window(&mut hosted, Some(&gateway));
+        assert_eq!(hosted.context_window_tokens, None);
     }
 
     #[test]
