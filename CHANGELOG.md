@@ -5,6 +5,13 @@ Git comparison.
 
 ## Unreleased (since 0.22.3)
 
+- The working-directory path in the footer and on the launch screen now uses
+  the same white, bold underline hover treatment as other clickable status
+  controls. `/cd` shows five recent session directories by default, and
+  **Settings → Appearance → Recent directories** configures the count from
+  0 to 20 (`layout.recent_directory_limit`).
+- Updated `cookie` to 0.18.3 (RUSTSEC-2026-0594: private-cookie nonces could
+  repeat after `fork`), unblocking the release dependency audit.
 - OpenCode Go free models remain available when the paid subscription allowance is exhausted.
   Provider admission now checks the selected model, so workers such as `opencode-go/hungerg-free`
   can spawn while paid Go models stay blocked; scouts, fallback routes and helper titles use the

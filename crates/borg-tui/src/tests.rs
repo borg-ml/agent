@@ -2031,6 +2031,7 @@ fn hover_redraw_gate_ignores_motion_inside_one_target() {
         context_status_hovered: false,
         fast_status_hovered: false,
         permission_status_hovered: false,
+        cwd_path_hovered: false,
         back_to_director_hovered: false,
         scrollbar_hovered: false,
         jump_to_bottom_hovered: false,
@@ -2059,7 +2060,11 @@ fn hover_redraw_gate_ignores_motion_inside_one_target() {
         hovered_watch_row: Some(0),
         ..idle.clone()
     };
-    for hovered in [watch_hover, watch_row_hover] {
+    let path_hover = HoverState {
+        cwd_path_hovered: true,
+        ..idle.clone()
+    };
+    for hovered in [watch_hover, watch_row_hover, path_hover] {
         assert!(hover_state_changed(idle.clone(), hovered.clone()));
         assert!(hover_state_changed(hovered.clone(), idle.clone()));
         assert!(!hover_state_changed(hovered.clone(), hovered));
@@ -7157,7 +7162,9 @@ fn footer_metadata_highlights_only_imminent_compaction() {
     let line = footer_metadata_line(
         "compaction imminent (20% left)",
         "~/borg-cli",
+        "~/borg-cli",
         true,
+        false,
         usize::MAX,
     );
 
@@ -7169,10 +7176,64 @@ fn footer_metadata_highlights_only_imminent_compaction() {
     let cwd_only = footer_metadata_line(
         "compaction imminent (20% left)",
         "~/a/very-long-directory",
+        "~/a/very-long-directory",
         true,
+        false,
         8,
     );
     assert_eq!(cwd_only.spans[0].style.fg, Some(Color::Gray));
+}
+
+#[test]
+fn footer_path_hover_highlights_only_the_directory() {
+    let line = footer_metadata_line(
+        "94% context left",
+        "~/borg-cli",
+        "~/borg-cli · git:main",
+        false,
+        true,
+        usize::MAX,
+    );
+    let path = line
+        .spans
+        .iter()
+        .find(|span| span.content == "~/borg-cli")
+        .expect("path span");
+    assert_eq!(path.style.fg, Some(Color::White));
+    assert!(path.style.add_modifier.contains(Modifier::BOLD));
+    assert!(path.style.add_modifier.contains(Modifier::UNDERLINED));
+    let git = line
+        .spans
+        .iter()
+        .find(|span| span.content.contains("git:main"))
+        .expect("Git suffix");
+    assert_eq!(git.style.fg, Some(Color::Gray));
+    assert!(!git.style.add_modifier.contains(Modifier::UNDERLINED));
+
+    let resting = footer_metadata_line(
+        "",
+        "~/borg-cli",
+        "~/borg-cli · git:main",
+        false,
+        false,
+        usize::MAX,
+    );
+    let path = resting
+        .spans
+        .iter()
+        .find(|span| span.content == "~/borg-cli")
+        .expect("resting path span");
+    assert_eq!(path.style.fg, Some(Color::Gray));
+    assert!(!path.style.add_modifier.contains(Modifier::UNDERLINED));
+
+    let abbreviated = footer_metadata_line("", "w · borg", "w · borg", false, true, usize::MAX);
+    let path = abbreviated
+        .spans
+        .iter()
+        .find(|span| span.content == "w · borg")
+        .expect("the whole fish-style path is one hover target");
+    assert_eq!(path.style.fg, Some(Color::White));
+    assert!(path.style.add_modifier.contains(Modifier::UNDERLINED));
 }
 
 #[test]
@@ -7227,15 +7288,24 @@ fn status_row_buttons_leave_the_status_line_in_front_of_them() {
 
 #[test]
 fn footer_todo_metadata_keeps_the_todo_segment_interactive() {
-    let line = footer_todo_metadata_line("2 to-dos", "~/borg-cli · git:main", false, usize::MAX);
+    let line = footer_todo_metadata_line(
+        "2 to-dos",
+        "~/borg-cli",
+        "~/borg-cli · git:main",
+        false,
+        usize::MAX,
+    );
 
     assert_eq!(line.spans[0].content, "2 to-dos");
     assert_eq!(line.spans[0].style.fg, Some(TODO_ORANGE));
     assert_eq!(line.spans[1].content, STATUS_SEPARATOR);
-    assert_eq!(line.spans[2].content, "~/borg-cli · git:main ");
+    assert_eq!(line.spans[2].content, "~/borg-cli");
     assert_eq!(line.spans[2].style.fg, Some(Color::Gray));
+    assert_eq!(line.spans[3].content, " · git:main ");
+    assert_eq!(line.spans[3].style.fg, Some(Color::Gray));
 
-    let hovered = footer_todo_metadata_line("2 to-dos", "~/borg-cli", true, usize::MAX);
+    let hovered =
+        footer_todo_metadata_line("2 to-dos", "~/borg-cli", "~/borg-cli", true, usize::MAX);
     assert_eq!(hovered.spans[0].style.fg, Some(Color::White));
     assert!(hovered.spans[0].style.add_modifier.contains(Modifier::BOLD));
     assert!(
@@ -7254,6 +7324,8 @@ fn footer_billing_leads_the_metadata_and_uses_the_billing_color() {
         None,
         None,
         "~/borg-cli",
+        "~/borg-cli",
+        false,
         false,
         false,
         false,
@@ -7274,6 +7346,8 @@ fn footer_billing_leads_the_metadata_and_uses_the_billing_color() {
         None,
         None,
         "~/borg-cli",
+        "~/borg-cli",
+        false,
         false,
         false,
         false,
@@ -7282,7 +7356,12 @@ fn footer_billing_leads_the_metadata_and_uses_the_billing_color() {
     );
     assert_eq!(billing_only.spans[0].content, "api");
     assert_eq!(billing_only.spans[0].style.fg, Some(Color::LightMagenta));
-    assert!(billing_only.spans[1].content.contains("~/borg-cli"));
+    assert!(
+        billing_only
+            .spans
+            .iter()
+            .any(|span| span.content.contains("~/borg-cli"))
+    );
 }
 
 #[test]
@@ -7293,9 +7372,11 @@ fn footer_watch_token_sits_between_shells_and_todos() {
         Some("2 watchers"),
         Some("1 to-do"),
         "~/borg-cli",
+        "~/borg-cli",
         false,
         false,
         true,
+        false,
         false,
         usize::MAX,
     );
@@ -7351,6 +7432,8 @@ fn footer_shell_metadata_uses_the_blue_background_action_identity() {
         None,
         Some("2 to-dos"),
         "~/borg-cli",
+        "~/borg-cli",
+        false,
         false,
         false,
         false,
@@ -7370,8 +7453,10 @@ fn footer_shell_metadata_uses_the_blue_background_action_identity() {
         None,
         None,
         "~/borg-cli",
+        "~/borg-cli",
         false,
         true,
+        false,
         false,
         false,
         usize::MAX,

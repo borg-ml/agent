@@ -104,6 +104,7 @@ it. Changes apply at once and are persisted to `editor.toml`.
 | Horizontal margin | Settings → Appearance | `layout.horizontal_margin = 0..40` |
 | Composer maximum height | Settings → Appearance | `layout.composer_max_height = 3..30` |
 | Status footer | Settings → Appearance | `layout.show_footer = true` or `false` |
+| Recent directories | Settings → Appearance | `layout.recent_directory_limit = 0..20` (default 5) |
 | Dictation model and accelerator | Settings → System → Dictation | `presentation.dictation_model`, `presentation.dictation_accelerator` |
 | Interface language | `/ui-language` | `presentation.ui_language = "auto"`, `"en"`, `"zh-Hans"`, `"es"`, or `"ru"` |
 | Active-turn messages | `/followups` | `interaction.active_messages = "steer"` or `"queue"` |

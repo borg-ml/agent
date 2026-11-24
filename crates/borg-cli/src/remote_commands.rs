@@ -6847,6 +6847,11 @@ async fn run_local_agent_session(
                                 dispatch_editor_preferences_save(&editor_preferences_tx, &editor_preferences);
                                 terminal.as_mut().expect("terminal").set_layout_preferences(&editor_preferences.layout);
                             }
+                            UiAction::SetRecentDirectoryLimit(value) => {
+                                editor_preferences.layout.recent_directory_limit = value;
+                                dispatch_editor_preferences_save(&editor_preferences_tx, &editor_preferences);
+                                terminal.as_mut().expect("terminal").set_layout_preferences(&editor_preferences.layout);
+                            }
                             UiAction::SetKeyHints(enabled) => {
                                 editor_preferences.interaction.key_hints = enabled;
                                 dispatch_editor_preferences_save(&editor_preferences_tx, &editor_preferences);
@@ -8328,9 +8333,10 @@ async fn run_local_agent_session(
                                     } else {
                                         let lookup_store = Arc::clone(&durable_store);
                                         let lookup_cwd = cwd.clone();
+                                        let recent_directory_limit = editor_preferences.layout.recent_directory_limit as usize;
                                         resume_lookup_task = Some(tokio::spawn(async move {
                                             ResumeLookupResult::Directories(
-                                                directory_options(lookup_store.as_ref(), &lookup_cwd)
+                                                directory_options(lookup_store.as_ref(), &lookup_cwd, recent_directory_limit)
                                                     .await
                                                     .map_err(|error| format!("{error:#}")),
                                             )
@@ -10130,13 +10136,13 @@ fn sort_sessions_by_activity(summaries: &mut [borg_remote::SessionSummary]) {
 async fn directory_options(
     store: &dyn SessionStore,
     current_dir: &Path,
+    recent_directory_limit: usize,
 ) -> Result<Vec<DirectoryOption>> {
-    const RECENT_DIRECTORY_LIMIT: usize = 8;
     let mut summaries = store.list_sessions(10_000).await?;
     sort_sessions_by_activity(&mut summaries);
     let mut recent: Vec<PathBuf> = Vec::new();
     for summary in &summaries {
-        if recent.len() == RECENT_DIRECTORY_LIMIT {
+        if recent.len() >= recent_directory_limit {
             break;
         }
         let Some(configuration) = summary.state.configuration.as_ref() else {

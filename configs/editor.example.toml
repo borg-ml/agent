@@ -50,6 +50,7 @@ action_descriptors = true
 horizontal_margin = 0
 composer_max_height = 8
 show_footer = true
+recent_directory_limit = 5
 
 [transcript]
 user_label = "user"

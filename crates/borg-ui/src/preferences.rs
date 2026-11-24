@@ -13,6 +13,8 @@ const DEFAULT_REFRESH_RATE_FPS: u16 = 60;
 /// Streaming text is the one frame rate a low setting is visible in as lag,
 /// so it carries its own preference instead of borrowing the idle rate.
 const DEFAULT_STREAMING_REFRESH_RATE_FPS: u16 = 120;
+pub const DEFAULT_RECENT_DIRECTORY_LIMIT: u16 = 5;
+pub const MAX_RECENT_DIRECTORY_LIMIT: u16 = 20;
 const MIN_REFRESH_RATE_FPS: u16 = 15;
 const MAX_REFRESH_RATE_FPS: u16 = 240;
 const MAX_TRANSCRIPT_LABEL_CHARS: usize = 32;
@@ -46,6 +48,7 @@ pub struct LayoutPreferences {
     pub horizontal_margin: u16,
     pub composer_max_height: u16,
     pub show_footer: bool,
+    pub recent_directory_limit: u16,
 }
 
 impl Default for LayoutPreferences {
@@ -54,6 +57,7 @@ impl Default for LayoutPreferences {
             horizontal_margin: 0,
             composer_max_height: 8,
             show_footer: true,
+            recent_directory_limit: DEFAULT_RECENT_DIRECTORY_LIMIT,
         }
     }
 }
@@ -419,6 +423,10 @@ impl EditorPreferences {
             (3..=30).contains(&self.layout.composer_max_height),
             "composer maximum height must be between 3 and 30 rows"
         );
+        anyhow::ensure!(
+            self.layout.recent_directory_limit <= MAX_RECENT_DIRECTORY_LIMIT,
+            "recent directory limit must be at most {MAX_RECENT_DIRECTORY_LIMIT}"
+        );
         Ok(())
     }
 }
@@ -724,6 +732,7 @@ keep = true
                 horizontal_margin: 5,
                 composer_max_height: 14,
                 show_footer: false,
+                recent_directory_limit: 9,
             },
             models: ModelPreferences {
                 pinned: vec!["claude-opus-5-5@max".to_string()],
@@ -737,6 +746,7 @@ keep = true
         assert!(source.contains("assistant_label = \"cLaNkEr\""));
         assert!(source.contains("assistant_message_color = \"#e6edf3\""));
         assert!(source.contains("icons = \"nerd_font\""));
+        assert!(source.contains("recent_directory_limit = 9"));
     }
 
     #[test]
@@ -809,6 +819,10 @@ keep = true
         preferences.presentation.refresh_rate_fps = 165;
         preferences.transcript.user_message_color = "pink".to_string();
         assert!(preferences.validate().is_err());
+
+        preferences.transcript.user_message_color = "#ffffff".to_string();
+        preferences.layout.recent_directory_limit = MAX_RECENT_DIRECTORY_LIMIT + 1;
+        assert!(preferences.validate().is_err());
     }
 
     #[test]
@@ -829,6 +843,10 @@ keep = true
         assert_eq!(preferences.interaction.lid_sleep_setup, LidSleepSetup::Ask);
         assert_eq!(preferences.presentation.refresh_rate_fps, 60);
         assert_eq!(preferences.layout.horizontal_margin, 0);
+        assert_eq!(
+            preferences.layout.recent_directory_limit,
+            DEFAULT_RECENT_DIRECTORY_LIMIT
+        );
     }
 
     #[test]

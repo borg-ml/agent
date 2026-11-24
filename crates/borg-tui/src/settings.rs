@@ -149,6 +149,7 @@ pub(crate) enum SettingId {
     HorizontalMargin,
     ComposerHeight,
     Footer,
+    RecentDirectories,
     Dictation,
     Effort,
     Speed,
@@ -641,6 +642,13 @@ pub(crate) fn setting_rows(values: &SettingsValues) -> Vec<SettingRow> {
             "Status footer",
             "Show the bottom status line and working directory.",
             toggle(values.layout.show_footer),
+        ),
+        row(
+            Id::RecentDirectories,
+            Section::Appearance,
+            "Recent directories",
+            "How many recent session directories to show in the /cd picker (0–20).",
+            SettingControl::Text(values.layout.recent_directory_limit.to_string()),
         ),
         row(
             Id::Dictation,
@@ -1290,16 +1298,13 @@ impl SettingsScreen {
                     model.label(),
                 )));
             }
-            SettingId::HorizontalMargin | SettingId::ComposerHeight => {
-                let max = if id == SettingId::HorizontalMargin {
-                    40
-                } else {
-                    30
-                };
-                let min = if id == SettingId::HorizontalMargin {
-                    0
-                } else {
-                    3
+            SettingId::HorizontalMargin
+            | SettingId::ComposerHeight
+            | SettingId::RecentDirectories => {
+                let (min, max) = match id {
+                    SettingId::HorizontalMargin => (0, 40),
+                    SettingId::ComposerHeight => (3, 30),
+                    _ => (0, borg_ui::preferences::MAX_RECENT_DIRECTORY_LIMIT),
                 };
                 let Ok(number) = value.parse::<u16>() else {
                     self.error = Some(format!("Enter a number from {min} to {max}."));
@@ -1312,11 +1317,12 @@ impl SettingsScreen {
                     return SettingsEffect::None;
                 }
                 self.error = None;
-                return SettingsEffect::Apply(Box::new(if id == SettingId::HorizontalMargin {
-                    UiAction::SetHorizontalMargin(number)
-                } else {
-                    UiAction::SetComposerMaxHeight(number)
-                }));
+                let action = match id {
+                    SettingId::HorizontalMargin => UiAction::SetHorizontalMargin(number),
+                    SettingId::ComposerHeight => UiAction::SetComposerMaxHeight(number),
+                    _ => UiAction::SetRecentDirectoryLimit(number),
+                };
+                return SettingsEffect::Apply(Box::new(action));
             }
             SettingId::UserLabel | SettingId::AssistantLabel => {
                 if value.is_empty() {
@@ -2479,6 +2485,67 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("larger window"))
         );
+    }
+
+    #[test]
+    fn recent_directory_limit_defaults_to_five_and_validates_edits() {
+        let values = values();
+        let rows = setting_rows(&values);
+        let row = rows
+            .iter()
+            .find(|row| row.id == SettingId::RecentDirectories)
+            .expect("recent directories setting");
+        assert!(matches!(&row.control, SettingControl::Text(value) if value == "5"));
+
+        let mut screen = SettingsScreen::default();
+        screen.set_section(
+            SettingsSection::ALL
+                .iter()
+                .position(|section| *section == SettingsSection::Appearance)
+                .unwrap(),
+        );
+        let rows = screen.rows(&values);
+        screen.selected = screen
+            .visible(&rows)
+            .iter()
+            .position(|index| rows[*index].id == SettingId::RecentDirectories)
+            .unwrap();
+        assert!(matches!(
+            screen.handle_key(KeyEvent::from(KeyCode::Enter), &rows),
+            SettingsEffect::None
+        ));
+        screen.handle_key(KeyEvent::from(KeyCode::Backspace), &rows);
+        for character in ['1', '2'] {
+            screen.handle_key(
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                &rows,
+            );
+        }
+        assert!(matches!(
+            screen.handle_key(KeyEvent::from(KeyCode::Enter), &rows),
+            SettingsEffect::Apply(action) if matches!(action.as_ref(), UiAction::SetRecentDirectoryLimit(12))
+        ));
+
+        screen.handle_key(KeyEvent::from(KeyCode::Enter), &rows);
+        screen.handle_key(KeyEvent::from(KeyCode::Backspace), &rows);
+        screen.handle_key(KeyEvent::from(KeyCode::Backspace), &rows);
+        for character in ['2', '1'] {
+            screen.handle_key(
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                &rows,
+            );
+        }
+        assert!(matches!(
+            screen.handle_key(KeyEvent::from(KeyCode::Enter), &rows),
+            SettingsEffect::None
+        ));
+        assert!(
+            screen
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("0 to 20"))
+        );
+        assert!(screen.editing.is_some());
     }
 
     /// A choice the screen draws but cannot apply is a dead control: the

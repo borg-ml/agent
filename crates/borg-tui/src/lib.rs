@@ -1067,6 +1067,7 @@ pub enum UiAction {
     SetHorizontalMargin(u16),
     SetComposerMaxHeight(u16),
     SetShowFooter(bool),
+    SetRecentDirectoryLimit(u16),
     SetEffort(String),
     SetPermissionMode(PermissionMode),
     SetResponseLanguage(ResponseLanguage),
@@ -1835,6 +1836,7 @@ pub struct BorgTerminal {
     git_status_area: Option<Rect>,
     git_status_hovered: bool,
     cwd_path_area: Option<Rect>,
+    cwd_path_hovered: bool,
     git_pull_area: Option<Rect>,
     git_commit_area: Option<Rect>,
     git_commit_hovered: bool,
@@ -1914,6 +1916,7 @@ pub struct BorgTerminal {
     horizontal_margin: u16,
     composer_max_height: u16,
     show_footer: bool,
+    recent_directory_limit: u16,
     window_focused: bool,
     key_hints: KeyHints,
     key_hints_enabled: bool,
@@ -2079,6 +2082,7 @@ struct HoverState {
     context_status_hovered: bool,
     fast_status_hovered: bool,
     permission_status_hovered: bool,
+    cwd_path_hovered: bool,
     back_to_director_hovered: bool,
     scrollbar_hovered: bool,
     jump_to_bottom_hovered: bool,
@@ -2116,6 +2120,7 @@ impl BorgTerminal {
             context_status_hovered: self.context_status_hovered,
             fast_status_hovered: self.fast_status_hovered,
             permission_status_hovered: self.permission_status_hovered,
+            cwd_path_hovered: self.cwd_path_hovered,
             back_to_director_hovered: self.back_to_director_hovered,
             scrollbar_hovered: self.scrollbar_hovered,
             jump_to_bottom_hovered: self.jump_to_bottom_hovered,
@@ -3389,6 +3394,7 @@ impl BorgTerminal {
             git_status_area: None,
             git_status_hovered: false,
             cwd_path_area: None,
+            cwd_path_hovered: false,
             git_pull_area: None,
             git_commit_area: None,
             git_commit_hovered: false,
@@ -3457,6 +3463,7 @@ impl BorgTerminal {
             horizontal_margin: HORIZONTAL_MARGIN,
             composer_max_height: 8,
             show_footer: true,
+            recent_directory_limit: borg_ui::preferences::DEFAULT_RECENT_DIRECTORY_LIMIT,
             window_focused: true,
             key_hints: KeyHints::default(),
             key_hints_enabled: true,
@@ -3627,6 +3634,7 @@ impl BorgTerminal {
         self.git_status_area = None;
         self.git_status_hovered = false;
         self.cwd_path_area = None;
+        self.cwd_path_hovered = false;
         self.git_pull_area = None;
         self.git_commit_area = None;
         self.git_commit_hovered = false;
@@ -6214,6 +6222,7 @@ impl BorgTerminal {
         self.context_status_hovered = false;
         self.fast_status_hovered = false;
         self.permission_status_hovered = false;
+        self.cwd_path_hovered = false;
         self.git_status_hovered = false;
         self.git_commit_hovered = false;
         self.git_pull_hovered = false;
@@ -7112,6 +7121,7 @@ impl BorgTerminal {
                 horizontal_margin: self.horizontal_margin,
                 composer_max_height: self.composer_max_height,
                 show_footer: self.show_footer,
+                recent_directory_limit: self.recent_directory_limit,
             },
         }
     }
@@ -7766,6 +7776,7 @@ impl BorgTerminal {
         self.horizontal_margin = preferences.horizontal_margin;
         self.composer_max_height = preferences.composer_max_height;
         self.show_footer = preferences.show_footer;
+        self.recent_directory_limit = preferences.recent_directory_limit;
         self.invalidate_transcript_render_cache();
     }
 
@@ -8220,6 +8231,9 @@ impl BorgTerminal {
                     .is_some_and(|area| area.contains(pointer));
                 self.permission_status_hovered = self
                     .permission_status_area
+                    .is_some_and(|area| area.contains(pointer));
+                self.cwd_path_hovered = self
+                    .cwd_path_area
                     .is_some_and(|area| area.contains(pointer));
                 self.git_status_hovered = self
                     .git_status_area
@@ -11664,9 +11678,19 @@ impl BorgTerminal {
                 + STATUS_SEPARATOR.width();
             if is_launch_screen && !cwd_status.trim().is_empty() {
                 status_spans.push(Span::styled(
-                    format!("{STATUS_SEPARATOR}{}", cwd_status.trim()),
+                    STATUS_SEPARATOR,
                     Style::default().fg(Color::DarkGray),
                 ));
+                status_spans.push(Span::styled(
+                    cwd_path.clone(),
+                    interactive_status_style(self.cwd_path_hovered, Color::DarkGray),
+                ));
+                if let Some(git_status) = &footer_git_status {
+                    status_spans.push(Span::styled(
+                        format!("{STATUS_SEPARATOR}{}", git_status.compact_label()),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
             }
 
             let status_line = Line::from(truncate_status_spans(
@@ -12231,15 +12255,24 @@ impl BorgTerminal {
                             shell_status.as_deref(),
                             watch_status.as_deref(),
                             todo_status.as_deref(),
+                            &cwd_path,
                             &cwd_status,
                             self.billing_status_hovered,
                             self.shell_status_hovered,
                             self.watch_status_hovered,
                             self.todo_status_hovered,
+                            self.cwd_path_hovered,
                             metadata_width as usize,
                         )
                     } else {
-                        footer_metadata_line("", &cwd_status, false, metadata_width as usize)
+                        footer_metadata_line(
+                            "",
+                            &cwd_path,
+                            &cwd_status,
+                            false,
+                            self.cwd_path_hovered,
+                            metadata_width as usize,
+                        )
                     };
                     let metadata_rect = Rect {
                         x: footer_area.right().saturating_sub(metadata_width),
@@ -18248,8 +18281,10 @@ fn footer_metadata_text(context_status: &str, cwd_status: &str, max_width: usize
 
 fn footer_metadata_line(
     context_status: &str,
+    cwd_path: &str,
     cwd_status: &str,
     context_imminent: bool,
+    cwd_hovered: bool,
     max_width: usize,
 ) -> Line<'static> {
     let metadata = footer_metadata_text(context_status, cwd_status, max_width);
@@ -18258,19 +18293,42 @@ fn footer_metadata_line(
     } else {
         Color::Gray
     };
+    let cwd_only = !cwd_status.trim().is_empty() && metadata == format!("{} ", cwd_status.trim());
+    if cwd_only {
+        return Line::from(footer_path_spans(&metadata, cwd_path, cwd_hovered));
+    }
     let Some((context, cwd)) = metadata.split_once(STATUS_SEPARATOR) else {
-        let cwd_only =
-            !cwd_status.trim().is_empty() && metadata == format!("{} ", cwd_status.trim());
-        return Line::from(Span::styled(
-            metadata,
-            Style::default().fg(if cwd_only { Color::Gray } else { context_color }),
-        ));
+        return Line::from(Span::styled(metadata, Style::default().fg(context_color)));
     };
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled(context.to_string(), Style::default().fg(context_color)),
         Span::styled(STATUS_SEPARATOR, Style::default().fg(Color::Gray)),
-        Span::styled(cwd.to_string(), Style::default().fg(Color::Gray)),
-    ])
+    ];
+    spans.extend(footer_path_spans(cwd, cwd_path, cwd_hovered));
+    Line::from(spans)
+}
+
+fn footer_path_spans(text: &str, cwd_path: &str, hovered: bool) -> Vec<Span<'static>> {
+    let resting = Style::default().fg(Color::Gray);
+    let Some(offset) = (!cwd_path.is_empty())
+        .then(|| text.find(cwd_path))
+        .flatten()
+    else {
+        return vec![Span::styled(text.to_string(), resting)];
+    };
+    let mut spans = Vec::new();
+    if offset > 0 {
+        spans.push(Span::styled(text[..offset].to_string(), resting));
+    }
+    spans.push(Span::styled(
+        cwd_path.to_string(),
+        interactive_status_style(hovered, Color::Gray),
+    ));
+    let suffix = &text[offset + cwd_path.len()..];
+    if !suffix.is_empty() {
+        spans.push(Span::styled(suffix.to_string(), resting));
+    }
+    spans
 }
 
 fn footer_status_text(
@@ -18296,26 +18354,22 @@ fn footer_left_region_width(total_width: u16, right_width: u16) -> u16 {
 #[cfg(test)]
 fn footer_todo_metadata_line(
     todo_status: &str,
+    cwd_path: &str,
     cwd_status: &str,
     hovered: bool,
     max_width: usize,
 ) -> Line<'static> {
     let metadata = footer_metadata_text(todo_status, cwd_status, max_width);
-    let todo_style = Style::default()
-        .fg(if hovered { Color::White } else { TODO_ORANGE })
-        .add_modifier(if hovered {
-            Modifier::BOLD | Modifier::UNDERLINED
-        } else {
-            Modifier::empty()
-        });
+    let todo_style = interactive_status_style(hovered, TODO_ORANGE);
     let Some((todo, cwd)) = metadata.split_once(STATUS_SEPARATOR) else {
-        return Line::from(Span::styled(metadata, todo_style));
+        return Line::from(footer_path_spans(&metadata, cwd_path, false));
     };
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled(todo.to_string(), todo_style),
         Span::styled(STATUS_SEPARATOR, Style::default().fg(Color::Gray)),
-        Span::styled(cwd.to_string(), Style::default().fg(Color::Gray)),
-    ])
+    ];
+    spans.extend(footer_path_spans(cwd, cwd_path, false));
+    Line::from(spans)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -18324,27 +18378,20 @@ fn footer_shell_todo_metadata_line(
     shell_status: Option<&str>,
     watch_status: Option<&str>,
     todo_status: Option<&str>,
+    cwd_path: &str,
     cwd_status: &str,
     billing_hovered: bool,
     shell_hovered: bool,
     watch_hovered: bool,
     todo_hovered: bool,
+    cwd_hovered: bool,
     max_width: usize,
 ) -> Line<'static> {
     let status = footer_status_text(billing_status, shell_status, watch_status, todo_status);
     let metadata = footer_metadata_text(&status, cwd_status, max_width);
     if !metadata.starts_with(&status) {
-        return Line::from(Span::styled(metadata, Style::default().fg(Color::Gray)));
+        return Line::from(footer_path_spans(&metadata, cwd_path, cwd_hovered));
     }
-    let interactive_style = |hovered: bool, color| {
-        Style::default()
-            .fg(if hovered { Color::White } else { color })
-            .add_modifier(if hovered {
-                Modifier::BOLD | Modifier::UNDERLINED
-            } else {
-                Modifier::empty()
-            })
-    };
     // Billing is always visible so a switch between a subscription and
     // pay-as-you-go credentials is never silent. It sits on the footer row,
     // away from the effort level, so a "max sub" plan never reads as "max"
@@ -18353,12 +18400,17 @@ fn footer_shell_todo_metadata_line(
         billing_status.map(|billing| {
             (
                 billing,
-                interactive_style(billing_hovered, billing_status_color(billing)),
+                interactive_status_style(billing_hovered, billing_status_color(billing)),
             )
         }),
-        shell_status.map(|shell| (shell, interactive_style(shell_hovered, USER_LABEL_BLUE))),
-        watch_status.map(|watch| (watch, interactive_style(watch_hovered, WATCH_PURPLE))),
-        todo_status.map(|todo| (todo, interactive_style(todo_hovered, TODO_ORANGE))),
+        shell_status.map(|shell| {
+            (
+                shell,
+                interactive_status_style(shell_hovered, USER_LABEL_BLUE),
+            )
+        }),
+        watch_status.map(|watch| (watch, interactive_status_style(watch_hovered, WATCH_PURPLE))),
+        todo_status.map(|todo| (todo, interactive_status_style(todo_hovered, TODO_ORANGE))),
     ];
     let mut spans = Vec::new();
     for (text, style) in parts.into_iter().flatten() {
@@ -18370,9 +18422,10 @@ fn footer_shell_todo_metadata_line(
         }
         spans.push(Span::styled(text.to_string(), style));
     }
-    spans.push(Span::styled(
-        metadata[status.len()..].to_string(),
-        Style::default().fg(Color::Gray),
+    spans.extend(footer_path_spans(
+        &metadata[status.len()..],
+        cwd_path,
+        cwd_hovered,
     ));
     Line::from(spans)
 }
@@ -19330,6 +19383,16 @@ fn goal_picker_options(goal: &SessionGoal) -> Vec<PickerOption> {
     options
 }
 
+fn interactive_status_style(hovered: bool, resting_color: Color) -> Style {
+    Style::default()
+        .fg(if hovered { Color::White } else { resting_color })
+        .add_modifier(if hovered {
+            Modifier::BOLD | Modifier::UNDERLINED
+        } else {
+            Modifier::empty()
+        })
+}
+
 fn push_interactive_status_segment(
     spans: &mut Vec<Span<'static>>,
     value: Option<String>,
@@ -19345,13 +19408,7 @@ fn push_interactive_status_segment(
         ));
         spans.push(Span::styled(
             value,
-            Style::default()
-                .fg(if hovered { Color::White } else { resting_color })
-                .add_modifier(if hovered {
-                    Modifier::BOLD | Modifier::UNDERLINED
-                } else {
-                    Modifier::empty()
-                }),
+            interactive_status_style(hovered, resting_color),
         ));
     }
 }

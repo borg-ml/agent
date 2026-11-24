@@ -129,6 +129,76 @@ fn tool_click_behavior_accepts_fullscreen_and_inline_modes() {
 }
 
 #[tokio::test]
+async fn directory_options_respects_the_configured_recent_limit() {
+    let directory = tempdir().expect("session directory");
+    let current = directory.path().join("current");
+    fs::create_dir(&current).unwrap();
+    let mut recent_paths = Vec::new();
+    for index in 0..7 {
+        let path = directory.path().join(format!("recent-{index}"));
+        fs::create_dir(&path).unwrap();
+        recent_paths.push(path);
+    }
+    let missing = directory.path().join("missing");
+    let (_scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
+    for cwd in
+        recent_paths
+            .iter()
+            .cloned()
+            .chain([current.clone(), missing, recent_paths[0].clone()])
+    {
+        let session_id = Uuid::new_v4();
+        store.create_session(session_id).await.unwrap();
+        for event in [
+            SessionEvent::new(session_id, 1, SessionEventKind::SessionStarted),
+            SessionEvent::new(
+                session_id,
+                2,
+                SessionEventKind::SessionConfigured {
+                    cwd,
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: false,
+                    ultrafast: false,
+                    response_language: ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::FullAccess,
+                    speed_support: Default::default(),
+                },
+            ),
+            SessionEvent::new(
+                session_id,
+                3,
+                SessionEventKind::Message {
+                    message_id: Uuid::new_v4(),
+                    actor: EventActor::User,
+                    text: "real resumable work".to_string(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                },
+            ),
+        ] {
+            store.append(event).await.unwrap();
+        }
+    }
+
+    let options = directory_options(&store, &current, 5).await.unwrap();
+    let recent: Vec<_> = options
+        .iter()
+        .filter(|option| option.recent)
+        .map(|option| option.path.clone())
+        .collect();
+    assert_eq!(recent.len(), 5);
+    assert_eq!(recent.iter().cloned().collect::<HashSet<_>>().len(), 5);
+    assert!(recent.iter().all(|path| recent_paths.contains(path)));
+    assert!(!recent.contains(&current));
+
+    let hidden = directory_options(&store, &current, 0).await.unwrap();
+    assert!(hidden.iter().all(|option| !option.recent));
+}
+
+#[tokio::test]
 async fn goal_dispatch_does_not_wait_for_a_full_command_queue() {
     let session_id = Uuid::new_v4();
     let (sender, mut receiver) = mpsc::channel(1);
