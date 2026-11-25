@@ -259,17 +259,6 @@ impl ManagedCluster {
     /// chmodded, so the cluster is built one level below the staging directory
     /// and only that level is renamed into place.
     async fn initialize(&self, initdb: &Path) -> Result<()> {
-        // PostgreSQL refuses to initialise a cluster as root. Say so before
-        // spawning initdb, which otherwise reports only its own hint after
-        // Borg has already created the directory for it.
-        #[cfg(unix)]
-        if unsafe { libc::geteuid() } == 0 {
-            bail!(
-                "Borg cannot create its session database as root: PostgreSQL's initdb refuses \
-                 to run as root. Run Borg as a normal user; the first run opens Settings › \
-                 Providers, so no login is needed to get started."
-            );
-        }
         let Some(parent) = self.data_dir.parent() else {
             bail!("{} has no parent directory", self.data_dir.display());
         };
@@ -299,7 +288,7 @@ impl ManagedCluster {
         // loopback and a unix socket inside Borg's own home directory, and it
         // is owned by the user running Borg. A password would be stored beside
         // the socket it protects, which protects nothing.
-        let output = Command::new(initdb)
+        let output = server_command(initdb)?
             // A cancelled caller must not leave initdb running against a
             // directory nobody is waiting for. Safe because it can only ever
             // interrupt the staging directory, which the guard then removes.
@@ -342,7 +331,7 @@ impl ManagedCluster {
 
     /// Whether this cluster is currently accepting connections.
     async fn is_running(&self, pg_ctl: &Path) -> Result<bool> {
-        let output = Command::new(pg_ctl)
+        let output = server_command(pg_ctl)?
             .kill_on_drop(true)
             .arg("-D")
             .arg(&self.data_dir)
@@ -407,7 +396,7 @@ impl ManagedCluster {
     async fn start_under_unit(&self, pg_ctl: &Path) -> Result<()> {
         let postgres = locate_binary("postgres")?;
         let failure = match systemd::spawn(&systemd::Launch {
-            postgres: &postgres,
+            postgres: &server_argv(&postgres)?,
             data_dir: &self.data_dir,
             socket_dir: &self.socket_dir,
             log_path: &self.log_path,
@@ -540,7 +529,7 @@ impl ManagedCluster {
         let output_start = output.metadata().map_or(0, |metadata| metadata.len());
         #[cfg(windows)]
         stop_children_inheriting_std_handles();
-        let mut command = Command::new(pg_ctl);
+        let mut command = server_command(pg_ctl)?;
         // Its own hidden console, so closing or interrupting this Borg's
         // terminal does not stop a postmaster other Borg processes share.
         #[cfg(windows)]
@@ -648,7 +637,7 @@ impl ManagedCluster {
             data_dir = %self.data_dir.display(),
             "the Borg session cluster is running but not serving connections; restarting it"
         );
-        let output = Command::new(pg_ctl)
+        let output = server_command(pg_ctl)?
             .kill_on_drop(true)
             .arg("-D")
             .arg(&self.data_dir)
@@ -1064,6 +1053,54 @@ fn locate_binary(name: &str) -> Result<PathBuf> {
          BORG_SESSIONS_URL=postgres://user@host/db",
         install_hint()
     )
+}
+
+/// A command for a PostgreSQL server binary (`initdb`, `pg_ctl`, `postgres`).
+fn server_command(program: &Path) -> Result<Command> {
+    let argv = server_argv(program)?;
+    let mut command = Command::new(&argv[0]);
+    command.args(&argv[1..]);
+    Ok(command)
+}
+
+/// The argv that runs a PostgreSQL server binary as this user.
+///
+/// The server binaries refuse to run as root. On Linux, root runs them in a
+/// user namespace where they are `nobody`; that user maps back to root, so the
+/// cluster's files stay root's and stay under root's Borg home, which `nobody`
+/// itself could not even enter.
+fn server_argv(program: &Path) -> Result<Vec<std::ffi::OsString>> {
+    #[cfg(unix)]
+    if unsafe { libc::geteuid() } == 0 {
+        #[cfg(target_os = "linux")]
+        {
+            let Some(unshare) = search_path("unshare").or_else(|| {
+                let fallback = PathBuf::from("/usr/bin/unshare");
+                is_executable(&fallback).then_some(fallback)
+            }) else {
+                bail!(
+                    "PostgreSQL refuses to run as root, and Borg runs it for root through \
+                     util-linux `unshare`, which was not found. Install util-linux or run Borg \
+                     as a normal user."
+                );
+            };
+            return Ok(vec![
+                unshare.into(),
+                "--user".into(),
+                "--map-user=nobody".into(),
+                "--map-group=nobody".into(),
+                "--".into(),
+                program.into(),
+            ]);
+        }
+        #[cfg(not(target_os = "linux"))]
+        bail!(
+            "Borg cannot run its session database as root on this platform: PostgreSQL \
+             refuses to run as root. Run Borg as a normal user, or point it at a server you \
+             already run with BORG_SESSIONS_URL=postgres://user@host/db"
+        );
+    }
+    Ok(vec![program.into()])
 }
 
 fn search_path(name: &str) -> Option<PathBuf> {

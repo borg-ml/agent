@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.22.5)
 
+- Borg now runs as root on Linux instead of refusing with "Borg cannot create its session
+  database as root". PostgreSQL's server tools refuse root, so Borg runs `initdb`, `pg_ctl` and
+  `postgres` through util-linux `unshare` as `nobody` in a user namespace that maps back to root;
+  the cluster stays in root's Borg home and owned by root.
+
 ## 0.22.5 (2026-11-25)
 
 - Borg has no telemetry. The opt-in active-install heartbeat (`[usage_count]`,

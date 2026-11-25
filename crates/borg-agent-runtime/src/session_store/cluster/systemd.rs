@@ -30,7 +30,8 @@ use std::path::PathBuf;
 /// its inputs and is testable without systemd on the machine.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(super) struct Launch<'a> {
-    pub postgres: &'a Path,
+    /// The argv that runs `postgres`, which may wrap it for root.
+    pub postgres: &'a [OsString],
     pub data_dir: &'a Path,
     pub socket_dir: &'a Path,
     pub log_path: &'a Path,
@@ -134,7 +135,7 @@ pub(super) fn run_args(launch: &Launch<'_>, unit: &str) -> Vec<OsString> {
     // `postgres`, not `pg_ctl start`: under a unit the postmaster has to be
     // the foreground main process, and daemonising would hand systemd a main
     // process that exits immediately.
-    args.push(launch.postgres.into());
+    args.extend(launch.postgres.iter().cloned());
     args.push("-D".into());
     args.push(launch.data_dir.into());
     args.push("-p".into());
@@ -346,7 +347,7 @@ mod tests {
     fn the_unit_runs_postgres_in_the_foreground_and_keeps_the_existing_log() {
         let rendered: Vec<String> = run_args(
             &Launch {
-                postgres: Path::new("/usr/bin/postgres"),
+                postgres: &["/usr/bin/postgres".into()],
                 data_dir: Path::new("/borg/pgdata"),
                 socket_dir: Path::new("/borg"),
                 log_path: Path::new("/borg/logs/postgres.log"),
