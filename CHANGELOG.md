@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.22.3)
+## Unreleased (since 0.22.4)
+
+## 0.22.4 (2026-11-24)
 
 - `[team] worker_concurrency` now applies live: running teams re-read it on every
   subagent spawn and resume, so raising the cap no longer requires restarting a
