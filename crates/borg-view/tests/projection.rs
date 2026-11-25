@@ -554,7 +554,7 @@ fn running_child_blocked_in_wait_agent_shows_waiting() {
                 event: Some(Box::new(SessionEvent::new(child, sequence, child_kind))),
             },
         ));
-        view.snapshot().meta.children[0].status.clone()
+        view.snapshot().meta.children[0].status
     };
     let started = forward(
         1,

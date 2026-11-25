@@ -447,6 +447,7 @@ pub async fn read_claude_account_rate_limits(
 ) -> Result<ClaudeAccountRateLimits> {
     #[cfg(not(feature = "claude"))]
     {
+        let _ = (config_dir, fresh);
         bail!("Claude account limits require the Claude subscription adapter")
     }
     #[cfg(feature = "claude")]
