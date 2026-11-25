@@ -6,13 +6,13 @@ use base64::Engine;
 use serde_json::json;
 use uuid::Uuid;
 
-const MAX_IMAGE_BYTES: u64 = 6 * 1024 * 1024 / 4 * 3;
+/// What each delivered image is fitted under: base64 of one model image.
+const MAX_IMAGE_BYTES: usize = 6 * 1024 * 1024 / 4 * 3;
+/// The largest source file read for fitting.
+const MAX_SOURCE_BYTES: u64 = 50 * 1024 * 1024;
 
 pub(crate) async fn run(files: Vec<PathBuf>, session: Option<Uuid>) -> Result<()> {
-    ensure!(
-        !files.is_empty() && files.len() <= 4,
-        "provide one to four images"
-    );
+    ensure!(!files.is_empty(), "provide at least one image");
     ensure!(
         session.is_some() || std::env::var_os("BORG_ATTACHMENT_SPOOL").is_some(),
         "this shell has no image channel; use --session UUID for a running local session"
@@ -30,21 +30,35 @@ pub(crate) async fn run(files: Vec<PathBuf>, session: Option<Uuid>) -> Result<()
         );
         let mut bytes = Vec::new();
         std::fs::File::open(&path)?
-            .take(MAX_IMAGE_BYTES + 1)
+            .take(MAX_SOURCE_BYTES + 1)
             .read_to_end(&mut bytes)?;
         ensure!(
-            bytes.len() as u64 <= MAX_IMAGE_BYTES,
-            "image exceeds 4.5 MiB: {}",
+            bytes.len() as u64 <= MAX_SOURCE_BYTES,
+            "image exceeds 50 MiB: {}",
             path.display()
         );
-        let media_type = if bytes.starts_with(&[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) {
-            "image/png"
-        } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
-            "image/jpeg"
-        } else {
-            anyhow::bail!("expected PNG or JPEG content: {}", path.display());
+        let sniff = |bytes: &[u8]| {
+            if bytes.starts_with(&[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) {
+                Some("image/png")
+            } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+                Some("image/jpeg")
+            } else {
+                None
+            }
         };
+        ensure!(
+            sniff(&bytes).is_some(),
+            "expected PNG or JPEG content: {}",
+            path.display()
+        );
         if session.is_none() {
+            // A session prompt fits its own images; the tool-result channel
+            // takes them as delivered, so they are fitted here.
+            if bytes.len() > MAX_IMAGE_BYTES {
+                bytes = borg_remote::fit_image(&bytes, MAX_IMAGE_BYTES)
+                    .with_context(|| format!("image cannot be fitted: {}", path.display()))?;
+            }
+            let media_type = sniff(&bytes).context("a fitted image must be PNG or JPEG")?;
             attachments.push(json!({"media_type": media_type, "data_base64": base64::engine::general_purpose::STANDARD.encode(bytes)}));
         }
         paths.push(path);
@@ -100,9 +114,9 @@ mod tests {
             .write(true)
             .open(&path)
             .unwrap()
-            .set_len(MAX_IMAGE_BYTES + 1)
+            .set_len(MAX_SOURCE_BYTES + 1)
             .unwrap();
         let error = run(vec![path], Some(Uuid::new_v4())).await.unwrap_err();
-        assert!(error.to_string().contains("exceeds 4.5 MiB"));
+        assert!(error.to_string().contains("exceeds 50 MiB"));
     }
 }

@@ -50,10 +50,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use attachments::{AttachmentStore, PasteOutcome};
 use borg_remote::{
-    ApprovalDecision, CodingProvider, EventActor, GoalAction, GoalStatus, MAX_PROMPT_IMAGES,
-    MessageStatus, PermissionMode, PlanItem, PlanItemStatus, PromptDelivery, ResponseLanguage,
-    SessionEvent, SessionEventKind, SessionGoal, SessionPayloadKind, SessionPayloadRef,
-    SessionState, SessionStatus, SubagentActivityKind, SubagentSnapshot, SubagentStatus,
+    ApprovalDecision, CodingProvider, EventActor, GoalAction, GoalStatus, MessageStatus,
+    PermissionMode, PlanItem, PlanItemStatus, PromptDelivery, ResponseLanguage, SessionEvent,
+    SessionEventKind, SessionGoal, SessionPayloadKind, SessionPayloadRef, SessionState,
+    SessionStatus, SubagentActivityKind, SubagentSnapshot, SubagentStatus,
     ToolPresentationCategory, WatchSummary, command_edit_presentation, compact_text,
     is_command_tool, is_diff_language, is_edit_tool, is_mcp_resource_probe,
     project_tool_presentation, tool_action_is_instant, tool_can_start_background_process,
@@ -6494,9 +6494,6 @@ impl BorgTerminal {
                     .attachments
                     .last()
                     .map(|attachment| format!("Attached {}", attachment.label));
-                if let Some(notice) = prompt_image_limit_notice(self.composer.attachments.len()) {
-                    self.notice = Some(notice);
-                }
                 // Attachments arrive outside input handling; keep the
                 // durable draft in step so a crash cannot lose them.
                 self.persist_composer_draft();
@@ -13263,10 +13260,6 @@ impl BorgTerminal {
             if text.trim().is_empty() && attachments.is_empty() {
                 return Ok(UiAction::None);
             }
-            if let Some(notice) = prompt_image_limit_notice(attachments.len()) {
-                self.notice = Some(notice);
-                return Ok(UiAction::None);
-            }
             let delivery = if self.keymap.matches(KeyAction::Queue, &key) {
                 PromptDelivery::Queue
             } else {
@@ -13289,10 +13282,6 @@ impl BorgTerminal {
         if self.keymap.matches(KeyAction::Queue, &key)
             && slash_matches(self.slash_query()).is_empty()
         {
-            if let Some(notice) = prompt_image_limit_notice(self.composer.attachments.len()) {
-                self.notice = Some(notice);
-                return Ok(UiAction::None);
-            }
             let (text, attachments) = self.composer.take();
             if text.trim().is_empty() && attachments.is_empty() {
                 return Ok(UiAction::None);
@@ -13386,10 +13375,6 @@ impl BorgTerminal {
                 self.composer.clear();
                 self.notice = Some("Broadcasting to every instance on this machine".to_string());
                 return Ok(UiAction::BroadcastInstances { text: message });
-            }
-            if let Some(notice) = prompt_image_limit_notice(self.composer.attachments.len()) {
-                self.notice = Some(notice);
-                return Ok(UiAction::None);
             }
             let (text, attachments) = self.composer.take();
             if text.trim().is_empty() && attachments.is_empty() {
@@ -14912,17 +14897,6 @@ fn composer_edit_kind(event: &Event) -> EditKind {
         KeyCode::Backspace | KeyCode::Delete if plain => EditKind::Deleting,
         _ => EditKind::Discrete,
     }
-}
-
-/// Refuse a send the providers would reject, before the composer is taken,
-/// so the draft stays editable instead of failing after admission.
-fn prompt_image_limit_notice(attachments: usize) -> Option<String> {
-    (attachments > MAX_PROMPT_IMAGES).then(|| {
-        format!(
-            "A message can carry at most {MAX_PROMPT_IMAGES} images ({attachments} attached); \
-             remove some and send them in a follow-up"
-        )
-    })
 }
 
 fn team_roster_target_at(

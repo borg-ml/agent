@@ -9,7 +9,7 @@ use image::{DynamicImage, ImageFormat, RgbaImage};
 use uuid::Uuid;
 
 const MAX_ATTACHMENT_BYTES: u64 = 50 * 1024 * 1024;
-const MAX_INLINE_IMAGE_BYTES: usize = 25 * 1024 * 1024;
+const MAX_INLINE_IMAGE_BYTES: usize = 50 * 1024 * 1024;
 
 pub(super) fn preview(
     path: &Path,

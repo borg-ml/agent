@@ -1388,10 +1388,10 @@ impl AgentToolDispatcher {
     /// Copy `paths` into the session's attachment store and post them as an
     /// assistant message, which the transcript renders as images.
     async fn show_image(&self, args: ShowImageArgs) -> Result<Value> {
-        const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+        const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
         ensure!(
-            (1..=4).contains(&args.paths.len()),
-            "show_image takes one to four image paths"
+            !args.paths.is_empty(),
+            "show_image takes at least one image path"
         );
         let root = self
             .attachment_root
@@ -1415,13 +1415,19 @@ impl AgentToolDispatcher {
                 .await
                 .with_context(|| format!("image not found: {}", source.display()))?;
             ensure!(
-                metadata.is_file() && metadata.len() <= MAX_IMAGE_BYTES,
-                "{} is not a regular file of at most 20 MiB",
+                metadata.is_file() && metadata.len() <= MAX_MESSAGE_ATTACHMENT_SOURCE_BYTES,
+                "{} is not a regular file of at most 50 MiB",
                 source.display()
             );
-            let bytes = tokio::fs::read(&source)
+            let mut bytes = tokio::fs::read(&source)
                 .await
                 .with_context(|| format!("read {}", source.display()))?;
+            if bytes.len() > MAX_IMAGE_BYTES {
+                let original = std::mem::take(&mut bytes);
+                bytes = tokio::task::spawn_blocking(move || fit_image(&original, MAX_IMAGE_BYTES))
+                    .await?
+                    .with_context(|| format!("{} is too large to show", source.display()))?;
+            }
             let extension = image_extension(&bytes).with_context(|| {
                 format!("{} is not a PNG, JPEG, GIF or WebP image", source.display())
             })?;
@@ -10798,7 +10804,6 @@ pub fn agent_tool_specs_for_surface(
                         "type": "array",
                         "items": { "type": "string" },
                         "minItems": 1,
-                        "maxItems": 4,
                         "description": "Image files, absolute or relative to the current directory."
                     },
                     "caption": { "type": "string", "description": "Text shown with the images." }
@@ -13175,9 +13180,9 @@ fn lsp_position_schema() -> Value {
     })
 }
 
-/// Matches what the local image channel already accepts, so a forwarded image
-/// and a directly attached one are refused for the same reasons.
-pub const MAX_MESSAGE_ATTACHMENTS: usize = 4;
+/// A forwarded message becomes the recipient's prompt, so it carries as many
+/// images as one prompt does.
+pub const MAX_MESSAGE_ATTACHMENTS: usize = crate::MAX_PROMPT_IMAGES;
 /// The most a delivered image may weigh: what base64-encodes into 6 MiB, the
 /// ceiling of one relay frame and one model tool result. It bounds the bytes
 /// that travel, not the file a sender names: a larger image is fitted under it
@@ -13217,13 +13222,13 @@ fn attachment_blob_path(journal_root: &Path, attachment: &MessageAttachment) -> 
     ))
 }
 
-/// An image that exceeds the delivery budget, re-encoded to fit it.
+/// An image that exceeds `budget` bytes, re-encoded to fit it.
 ///
 /// The original dimensions and a PNG are kept when they fit; otherwise the
 /// image is flattened to JPEG, and only if quality alone cannot reach the
 /// budget is it scaled down, keeping the aspect ratio. Only an image that
 /// cannot be decoded, or that no size reaches the budget, is refused.
-fn fit_message_attachment(bytes: &[u8]) -> Result<Vec<u8>> {
+pub fn fit_image(bytes: &[u8], budget: usize) -> Result<Vec<u8>> {
     use image::{DynamicImage, ImageDecoder, ImageFormat, imageops::FilterType};
     use std::io::Cursor;
 
@@ -13234,7 +13239,6 @@ fn fit_message_attachment(bytes: &[u8]) -> Result<Vec<u8>> {
     let orientation = decoder.orientation()?;
     let mut image = DynamicImage::from_decoder(decoder).context("image cannot be decoded")?;
     image.apply_orientation(orientation);
-    let budget = MAX_MESSAGE_ATTACHMENT_BYTES as usize;
     let mut png = Vec::new();
     if image
         .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
@@ -13279,7 +13283,7 @@ fn fit_message_attachment(bytes: &[u8]) -> Result<Vec<u8>> {
             }
         }
     }
-    bail!("image cannot be reduced to {MAX_MESSAGE_ATTACHMENT_BYTES} bytes")
+    bail!("image cannot be reduced to {budget} bytes")
 }
 
 /// Read the sender's files once and keep the bytes.
@@ -13345,9 +13349,11 @@ async fn capture_message_attachments(
             .map(|name| name.to_string_lossy().into_owned());
         if bytes.len() as u64 > MAX_MESSAGE_ATTACHMENT_BYTES {
             let original = std::mem::take(&mut bytes);
-            bytes = tokio::task::spawn_blocking(move || fit_message_attachment(&original))
-                .await?
-                .with_context(|| format!("attachment {} is too large to send", path.display()))?;
+            bytes = tokio::task::spawn_blocking(move || {
+                fit_image(&original, MAX_MESSAGE_ATTACHMENT_BYTES as usize)
+            })
+            .await?
+            .with_context(|| format!("attachment {} is too large to send", path.display()))?;
             media_type = message_attachment_media_type(&bytes)
                 .context("a fitted image must be PNG or JPEG")?;
             name = path.file_stem().map(|stem| {
@@ -13596,7 +13602,7 @@ fn message_tool(name: &str, description: &str) -> Value {
                 "attachments": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Up to 4 local PNG/JPEG paths to forward as images. Bytes are captured and verified at send time; an image over 4.5 MiB is re-encoded (JPEG, scaled only if needed) so it is delivered rather than refused, and the recipient sees pixels, never your path. A recipient on another enrolled machine gets them through the host relay, which verifies them before admission; if the relay cannot carry them, get_message_status reports the delivery failed rather than sending the text alone."
+                    "description": "Local PNG/JPEG paths to forward as images (any number; more than 100 are sent as consecutive messages). Bytes are captured and verified at send time; an image over 4.5 MiB is re-encoded (JPEG, scaled only if needed) so it is delivered rather than refused, and the recipient sees pixels, never your path. A recipient on another enrolled machine gets them through the host relay, which verifies them before admission; if the relay cannot carry them, get_message_status reports the delivery failed rather than sending the text alone."
                 }
             },
             "required": ["target", "message"],

@@ -2477,10 +2477,10 @@ pub enum EventActor {
     System,
 }
 
-/// Most images one user message may carry. Native providers reject more, so
-/// every frontend checks this before taking the composer: a refused send must
-/// leave the draft where the user can fix it, not fail after admission.
-pub const MAX_PROMPT_IMAGES: usize = 4;
+/// Most images one user message carries: Anthropic's per-request limit, the
+/// strictest of the native providers. A send with more is split into
+/// consecutive messages before admission, so no frontend ever refuses one.
+pub const MAX_PROMPT_IMAGES: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]

@@ -39,16 +39,18 @@ const JOURNAL_OUTPUT_TOKENS: usize = 16_384;
 pub(crate) const ATTACHMENT_SPOOL_ENV: &str = "BORG_ATTACHMENT_SPOOL";
 /// Safety bound only; the per-result image policy lives in
 /// `native_harness::split_tool_result_attachments`.
-const MAX_SPOOLED_ATTACHMENTS_PER_DRAIN: usize = 16;
+const MAX_SPOOLED_ATTACHMENTS_PER_DRAIN: usize = 20;
 /// Generous next to the harness' 6 MiB base64 limit, so a slightly oversized
 /// envelope is reported by the harness rather than vanishing here.
 const MAX_SPOOLED_ATTACHMENT_BYTES: u64 = 12 * 1024 * 1024;
 /// Per-drain ceiling across all images together, so many merely-legal files
 /// cannot add up to an unbounded read.
 const MAX_SPOOL_DRAIN_TOTAL_BYTES: u64 = 24 * 1024 * 1024;
-/// Ceiling for a raw image file, chosen so its base64 lands exactly on the
-/// harness' 6 MiB limit: one clear error here beats a silent drop later.
+/// What a raw image file is fitted under, so its base64 lands within the
+/// harness' 6 MiB limit.
 const MAX_SPOOLED_IMAGE_BYTES: u64 = 6 * 1024 * 1024 / 4 * 3;
+/// The largest raw image file read for fitting.
+const MAX_SPOOLED_IMAGE_SOURCE_BYTES: u64 = 50 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ProcessManager {
@@ -956,7 +958,7 @@ fn read_spooled_attachment(
     let ceiling = if envelope {
         MAX_SPOOLED_ATTACHMENT_BYTES
     } else {
-        MAX_SPOOLED_IMAGE_BYTES
+        MAX_SPOOLED_IMAGE_SOURCE_BYTES
     };
     ensure!(metadata.len() <= ceiling, "image exceeds {ceiling} bytes");
     let remaining = MAX_SPOOL_DRAIN_TOTAL_BYTES.saturating_sub(total);
@@ -966,8 +968,13 @@ fn read_spooled_attachment(
     );
 
     // Bounded even if the file grew, or was swapped, between the check above
-    // and this open: `take` is what actually limits the read.
-    let limit = metadata.len().min(remaining);
+    // and this open: `take` is what actually limits the read. A raw image is
+    // fitted after reading, so only an envelope counts against the total here.
+    let limit = if envelope {
+        metadata.len().min(remaining)
+    } else {
+        metadata.len()
+    };
     let mut bytes = Vec::with_capacity(limit as usize);
     // Fully qualified: `read_to_end` would otherwise resolve to tokio's async
     // extension trait, which is in scope here.
@@ -985,8 +992,13 @@ fn read_spooled_attachment(
     // The name is decoration. What the file actually contains decides the
     // media type, so a `.png` that is really a JPEG is sent correctly instead
     // of failing to decode at the provider.
-    let media_type = image_media_type(&bytes).context("not a PNG, JPEG, GIF, or WebP image")?;
+    let mut media_type = image_media_type(&bytes).context("not a PNG, JPEG, GIF, or WebP image")?;
     image::load_from_memory(&bytes).context("image cannot be decoded")?;
+    let budget = MAX_SPOOLED_IMAGE_BYTES.min(remaining / 4 * 3) as usize;
+    if bytes.len() > budget {
+        bytes = crate::subagents::fit_image(&bytes, budget)?;
+        media_type = image_media_type(&bytes).context("a fitted image must be PNG or JPEG")?;
+    }
     Ok(ModelInputAttachment {
         media_type: media_type.to_string(),
         data_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
@@ -3238,25 +3250,30 @@ mod tests {
         );
     }
 
-    /// Raw files get the tighter ceiling, because base64 inflates by a third
-    /// and the harness refuses anything over 6 MiB encoded. Catching it here
-    /// gives one clear reason instead of a silent drop further along.
+    /// Base64 inflates by a third and the harness takes at most 6 MiB
+    /// encoded, so a larger raw file is fitted under that rather than refused.
     #[test]
-    fn an_oversized_image_file_is_refused_before_it_is_encoded() {
+    fn an_oversized_image_file_is_fitted_instead_of_refused() {
         let spool = tempfile::tempdir().expect("spool");
-        let mut oversized = b"\x89PNG\r\n\x1a\n".to_vec();
-        oversized.resize((MAX_SPOOLED_IMAGE_BYTES + 1) as usize, 0);
-        std::fs::write(spool.path().join("0001.png"), &oversized).expect("write");
+        // Noise does not compress, so this PNG is well over the ceiling.
+        let mut state = 1u32;
+        let noise = image::RgbImage::from_fn(1600, 1400, |_, _| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let [r, g, b, _] = state.to_le_bytes();
+            image::Rgb([r, g, b])
+        });
+        let mut png = Vec::new();
+        noise
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("png");
+        assert!(png.len() as u64 > MAX_SPOOLED_IMAGE_BYTES);
+        std::fs::write(spool.path().join("0001.png"), &png).expect("write");
 
         let (attachments, errors) = drain_attachment_spool(spool.path());
 
-        assert!(attachments.is_empty());
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("exceeds"), "{errors:?}");
-        assert!(
-            MAX_SPOOLED_IMAGE_BYTES.div_ceil(3) * 4 <= 6 * 1024 * 1024,
-            "the raw ceiling must keep base64 within the harness limit"
-        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(attachments.len(), 1);
+        assert!(attachments[0].data_base64.len() <= 6 * 1024 * 1024);
     }
 
     /// Envelopes and raw files share one spool, and a publish in progress is

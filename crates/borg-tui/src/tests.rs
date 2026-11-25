@@ -22666,46 +22666,6 @@ async fn composer_undo_redo_steps_by_word_and_restores_a_cleared_draft() {
 
 #[tokio::test]
 #[ignore = "requires a PTY; run under script with a sized terminal"]
-async fn too_many_images_keep_the_durable_draft_instead_of_sending() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut terminal = composer_test_terminal(&directory);
-    type_into(&mut terminal, "look ");
-    for index in 0..=MAX_PROMPT_IMAGES {
-        terminal
-            .composer
-            .insert_attachment(PathBuf::from(format!("/tmp/{index}.png")));
-    }
-    let before = terminal.composer.draft();
-    for code in [KeyCode::Enter, KeyCode::Tab] {
-        let action = terminal
-            .handle_event(composer_input(code, KeyModifiers::NONE))
-            .unwrap();
-        assert!(matches!(action, UiAction::None));
-        assert_eq!(terminal.composer.draft(), before);
-        assert!(
-            terminal
-                .notice
-                .as_deref()
-                .is_some_and(|notice| notice.contains("at most 4 images"))
-        );
-    }
-    // The refused draft, images included, is on disk for a restart. Dropping
-    // the store joins its writer, so the reopened store reads the last save.
-    let session_id = terminal.session_id;
-    drop(std::mem::replace(
-        &mut terminal.composer_draft_store,
-        ComposerDraftStore::for_session(directory.path(), Uuid::new_v4()),
-    ));
-    let stored = ComposerDraftStore::for_session(directory.path(), session_id)
-        .load()
-        .unwrap();
-    assert_eq!(stored.attachments.len(), MAX_PROMPT_IMAGES + 1);
-    assert!(stored.text.starts_with("look [Image 1]"));
-    terminal.shutdown().await;
-}
-
-#[tokio::test]
-#[ignore = "requires a PTY; run under script with a sized terminal"]
 async fn a_prompt_failing_before_any_output_returns_to_the_composer() {
     let directory = tempfile::tempdir().unwrap();
     let mut terminal = composer_test_terminal(&directory);

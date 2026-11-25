@@ -8688,7 +8688,6 @@ async fn historical_prompt_images(
             break;
         }
         let mut selected = Vec::new();
-        let mut selected_bytes = 0_u64;
         for path in attachments
             .iter()
             .take(crate::native_harness::MAX_NATIVE_USER_IMAGES)
@@ -8711,33 +8710,44 @@ async fn historical_prompt_images(
             ) {
                 continue;
             }
-            let Ok(metadata) = tokio::fs::metadata(&path).await else {
-                continue;
-            };
-            if !metadata.is_file()
-                || image_bytes
-                    .saturating_add(selected_bytes)
-                    .saturating_add(metadata.len())
-                    > crate::native_harness::MAX_NATIVE_USER_IMAGE_BYTES
+            if !tokio::fs::metadata(&path)
+                .await
+                .is_ok_and(|metadata| metadata.is_file())
             {
                 continue;
             }
-            selected_bytes = selected_bytes.saturating_add(metadata.len());
             selected.push(path);
         }
         if selected.is_empty() {
             continue;
         }
-        match crate::native_harness::native_user_message(cwd, "", &selected).await {
-            Ok(borg_provider::provider::ModelMessage::User { attachments, .. }) => {
-                image_bytes = image_bytes.saturating_add(selected_bytes);
-                images.insert(message_id, attachments);
-            }
-            Ok(_) => unreachable!("native user image encoding must produce a user message"),
-            Err(error) => {
-                tracing::warn!(%message_id, %error, "historical image unavailable during replay");
+        // One at a time, so an unreadable image costs only itself.
+        let mut encoded = Vec::new();
+        for path in &selected {
+            match crate::native_harness::native_user_message(cwd, "", std::slice::from_ref(path))
+                .await
+            {
+                Ok(borg_provider::provider::ModelMessage::User { attachments, .. }) => {
+                    encoded.extend(attachments);
+                }
+                Ok(_) => unreachable!("native user image encoding must produce a user message"),
+                Err(error) => {
+                    tracing::warn!(%message_id, %error, "historical image unavailable during replay");
+                }
             }
         }
+        let bytes = encoded
+            .iter()
+            .map(|image| image.data_base64.len() as u64 / 4 * 3)
+            .sum::<u64>();
+        if encoded.is_empty()
+            || image_bytes.saturating_add(bytes)
+                > crate::native_harness::MAX_NATIVE_USER_IMAGE_BYTES
+        {
+            continue;
+        }
+        image_bytes += bytes;
+        images.insert(message_id, encoded);
     }
     images
 }

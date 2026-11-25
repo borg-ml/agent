@@ -588,10 +588,10 @@ async fn failed_claude_turn_keeps_recent_images_in_its_interruption_record() {
             assert!(content.contains("completed actions must not be repeated"));
             assert!(content.contains("inspect originals"));
             assert!(content.contains("compare latest"));
-            assert!(content.contains("[1 historical image not replayed]"));
-            assert_eq!(attachments.len(), 4);
-            assert_eq!(attachments[0].filename.as_deref(), Some("image-1.png"));
-            assert_eq!(attachments[3].filename.as_deref(), Some("image-4.png"));
+            assert!(!content.contains("not replayed"));
+            assert_eq!(attachments.len(), 5);
+            assert_eq!(attachments[0].filename.as_deref(), Some("image-0.png"));
+            assert_eq!(attachments[4].filename.as_deref(), Some("image-4.png"));
         }
         other => panic!("expected interrupted user record, got {other:?}"),
     }
@@ -5963,7 +5963,7 @@ fn queued_team_notifications_batch_without_borrowing_priority_or_losing_members(
     );
     assert_eq!(
         merged.attachments.len(),
-        crate::MAX_PROMPT_IMAGES,
+        TEAM_BATCH_MAX_MEMBERS.min(crate::MAX_PROMPT_IMAGES),
         "every member's attachments survive the merge"
     );
     for index in 0..TEAM_BATCH_MAX_MEMBERS {

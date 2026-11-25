@@ -458,7 +458,7 @@ child reports to `/root`. It does not start an idle recipient. Use
 `send_message` with `wake: true`, or `followup_task`, to request a new turn.
 
 `send_message` and `followup_task` accept `attachments`, an array of sender-local
-PNG/JPEG paths (at most four, each at most 4.5 MiB). Borg captures the image bytes
+PNG/JPEG paths (up to 100; one over 4.5 MiB is re-encoded to fit). Borg captures the image bytes
 when sending and journals content-addressed references; replay does not depend on
 the original sender path.
 

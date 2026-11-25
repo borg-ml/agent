@@ -11,6 +11,14 @@ Git comparison.
   privacy stance and lists the only network destinations, and now describes the
   in-app workflow instead of CLI commands.
 
+- Images are no longer refused for their number or size. A message carries up
+  to 100 images (was 4), and the composer no longer blocks a send with more;
+  beyond what one request can carry, the rest stay listed by path for the model
+  to open. Oversized images are re-encoded to fit (paste and source files up to
+  50 MiB) instead of failing, in prompts, `show_image`, `borg image`,
+  `send_message`/`followup_task` attachments and tool results, which now carry
+  20 images each.
+
 - An active goal no longer spins forever when the agent only answers in text.
   After three goal continuations in a row that call no tool (for example, a
   worker told to stop replying "I'm stopped" every 20 seconds), Borg marks the

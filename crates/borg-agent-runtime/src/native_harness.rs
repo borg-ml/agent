@@ -41,7 +41,9 @@ const MAX_TOOL_RESULT_BYTES: usize = 1024 * 1024;
 /// the text and attaches them to the tool message; MCP `image` content blocks
 /// are lifted into the same channel.
 pub(crate) const TOOL_RESULT_ATTACHMENTS_KEY: &str = "borg_attachments";
-const MAX_TOOL_RESULT_ATTACHMENTS: usize = 4;
+/// Images one tool result carries; more are left for the model to fetch in
+/// another call, so a single result cannot crowd the request's image limit.
+const MAX_TOOL_RESULT_ATTACHMENTS: usize = 20;
 const MAX_TOOL_RESULT_ATTACHMENT_BASE64_BYTES: usize = 6 * 1024 * 1024;
 /// Vision tokens per image are a function of pixels, not bytes; a flat
 /// estimate keeps a screenshot from being counted as a megabyte of text.
@@ -6103,15 +6105,19 @@ fn split_attachments_in(
             ));
         } else if attachment.data_base64.is_empty() {
             dropped.push(format!("#{index}: empty image data"));
+        } else if attachments.len() - before == MAX_TOOL_RESULT_ATTACHMENTS {
+            dropped.push(format!(
+                "#{index}: more than {MAX_TOOL_RESULT_ATTACHMENTS} images per result; request it in another call"
+            ));
         } else if attachment.data_base64.len() > MAX_TOOL_RESULT_ATTACHMENT_BASE64_BYTES {
-            dropped.push(format!(
-                "#{index}: image exceeds {} bytes",
-                MAX_TOOL_RESULT_ATTACHMENT_BASE64_BYTES
-            ));
-        } else if attachments.len() == MAX_TOOL_RESULT_ATTACHMENTS {
-            dropped.push(format!(
-                "#{index}: more than {MAX_TOOL_RESULT_ATTACHMENTS} images per result"
-            ));
+            match fit_tool_result_image(&attachment.data_base64) {
+                Ok((media_type, data_base64)) => attachments.push(ModelInputAttachment {
+                    media_type,
+                    data_base64,
+                    ..attachment
+                }),
+                Err(error) => dropped.push(format!("#{index}: {error}")),
+            }
         } else {
             attachments.push(attachment);
         }
@@ -6124,6 +6130,19 @@ fn split_attachments_in(
         object.insert("dropped_attachments".to_string(), json!(dropped));
     }
     true
+}
+
+/// An oversized result image re-encoded under the per-image limit.
+fn fit_tool_result_image(data_base64: &str) -> Result<(String, String)> {
+    let engine = base64::engine::general_purpose::STANDARD;
+    let bytes = engine
+        .decode(data_base64)
+        .context("image data is not base64")?;
+    let fitted =
+        crate::subagents::fit_image(&bytes, MAX_TOOL_RESULT_ATTACHMENT_BASE64_BYTES / 4 * 3)?;
+    let media_type = crate::native_process::image_media_type(&fitted)
+        .context("a fitted image must be PNG or JPEG")?;
+    Ok((media_type.to_string(), engine.encode(fitted)))
 }
 
 /// Watcher entries (`[{..., "result": {"output": {...}}}]`, directly or in an
@@ -6220,8 +6239,17 @@ pub(crate) fn bounded_text(mut output: String, max_bytes: usize) -> String {
 }
 
 pub(crate) const MAX_NATIVE_USER_IMAGES: usize = crate::MAX_PROMPT_IMAGES;
-pub(crate) const MAX_NATIVE_USER_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
+/// Combined image bytes one user message carries: base64 keeps it under
+/// Anthropic's 32 MB request ceiling with room for the conversation.
+pub(crate) const MAX_NATIVE_USER_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+/// Anthropic refuses an image whose base64 exceeds 5 MB.
+const MAX_NATIVE_IMAGE_BYTES: usize = 5 * 1024 * 1024 / 4 * 3;
+/// The largest source file read for fitting.
+const MAX_NATIVE_IMAGE_SOURCE_BYTES: u64 = 50 * 1024 * 1024;
 
+/// The prompt with its images as pixels. An image larger than its share of
+/// the byte budget is re-encoded to fit rather than refused, and images past
+/// the per-request count stay listed by path for the model to open itself.
 pub(crate) async fn native_user_message(
     cwd: &Path,
     prompt: &str,
@@ -6230,38 +6258,33 @@ pub(crate) async fn native_user_message(
     if attachments.is_empty() {
         return Ok(ModelMessage::user(prompt));
     }
-    anyhow::ensure!(
-        attachments.len() <= MAX_NATIVE_USER_IMAGES,
-        "native providers accept at most four images per message"
-    );
-    let mut encoded = Vec::with_capacity(attachments.len());
-    let mut total_bytes = 0_u64;
-    for path in attachments {
+    let inline = &attachments[..attachments.len().min(MAX_NATIVE_USER_IMAGES)];
+    let budget = MAX_NATIVE_IMAGE_BYTES.min(MAX_NATIVE_USER_IMAGE_BYTES as usize / inline.len());
+    let mut encoded = Vec::with_capacity(inline.len());
+    for path in inline {
         let metadata = tokio::fs::metadata(path)
             .await
             .with_context(|| format!("inspect attachment {}", path.display()))?;
         anyhow::ensure!(metadata.is_file(), "attachment must be a regular file");
-        let previous_bytes = total_bytes;
-        total_bytes = total_bytes.saturating_add(metadata.len());
-        anyhow::ensure!(
-            total_bytes <= MAX_NATIVE_USER_IMAGE_BYTES,
-            "native message images exceed the 25 MiB combined limit"
-        );
-        let remaining_bytes = MAX_NATIVE_USER_IMAGE_BYTES - previous_bytes;
-        let mut reader = tokio::fs::File::open(path)
+        let mut bytes = Vec::new();
+        tokio::fs::File::open(path)
             .await
             .with_context(|| format!("open attachment {}", path.display()))?
-            .take(remaining_bytes + 1);
-        let mut bytes = Vec::new();
-        reader
+            .take(MAX_NATIVE_IMAGE_SOURCE_BYTES + 1)
             .read_to_end(&mut bytes)
             .await
             .with_context(|| format!("read attachment {}", path.display()))?;
         anyhow::ensure!(
-            bytes.len() as u64 <= remaining_bytes,
-            "native message images exceed the 25 MiB combined limit"
+            bytes.len() as u64 <= MAX_NATIVE_IMAGE_SOURCE_BYTES,
+            "attachment exceeds 50 MiB: {}",
+            path.display()
         );
-        total_bytes = previous_bytes + bytes.len() as u64;
+        if bytes.len() > budget {
+            bytes =
+                tokio::task::spawn_blocking(move || crate::subagents::fit_image(&bytes, budget))
+                    .await?
+                    .with_context(|| format!("image cannot be fitted: {}", path.display()))?;
+        }
         // The name is decoration. What the bytes contain decides the media
         // type, so a `.png` that is really a JPEG is sent correctly instead
         // of being announced as a PNG and rejected outright: OpenAI answers a
@@ -6278,10 +6301,15 @@ pub(crate) async fn native_user_message(
             filename: Some(path.strip_prefix(cwd).unwrap_or(path).display().to_string()),
         });
     }
-    Ok(ModelMessage::user_with_attachments(
-        native_user_message_content(prompt, attachments),
-        encoded,
-    ))
+    let mut content = native_user_message_content(prompt, attachments);
+    let listed = attachments.len() - inline.len();
+    if listed > 0 {
+        content.push_str(&format!(
+            "\n\nOnly the first {} images are inlined (one request carries no more); view the last {listed} listed above with `borg image PATH`.",
+            inline.len()
+        ));
+    }
+    Ok(ModelMessage::user_with_attachments(content, encoded))
 }
 
 pub(crate) fn native_user_message_content(prompt: &str, attachments: &[PathBuf]) -> String {
@@ -10163,6 +10191,35 @@ mod tests {
         ));
     }
 
+    /// A send is never refused for its images: more than one request carries
+    /// stay listed by path for the model to open itself.
+    #[tokio::test]
+    async fn a_prompt_with_more_images_than_a_request_carries_is_not_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut png = Vec::new();
+        image::RgbImage::new(2, 2)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let paths = (0..MAX_NATIVE_USER_IMAGES + 3)
+            .map(|index| {
+                let path = dir.path().join(format!("{index}.png"));
+                std::fs::write(&path, &png).unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        let ModelMessage::User {
+            content,
+            attachments,
+        } = native_user_message(dir.path(), "look", &paths)
+            .await
+            .unwrap()
+        else {
+            panic!("expected a user message");
+        };
+        assert_eq!(attachments.len(), MAX_NATIVE_USER_IMAGES);
+        assert!(content.contains("view the last 3"), "{content}");
+    }
+
     #[test]
     fn tool_result_images_are_split_into_attachments_with_bounds() {
         let (text, none) = split_tool_result_attachments("plain text".to_string());
@@ -10193,7 +10250,7 @@ mod tests {
         assert_eq!(dropped.len(), 3, "{dropped:?}");
 
         let many = json!({
-            TOOL_RESULT_ATTACHMENTS_KEY: (0..6).map(|_| image("image/png", "AAAA")).collect::<Vec<_>>()
+            TOOL_RESULT_ATTACHMENTS_KEY: (0..MAX_TOOL_RESULT_ATTACHMENTS + 2).map(|_| image("image/png", "AAAA")).collect::<Vec<_>>()
         })
         .to_string();
         let (_, attachments) = split_tool_result_attachments(many);
