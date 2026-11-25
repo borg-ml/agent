@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.22.4)
+## Unreleased (since 0.22.5)
+
+## 0.22.5 (2026-11-25)
 
 - Borg has no telemetry. The opt-in active-install heartbeat (`[usage_count]`,
   `BORG_DISABLE_USAGE_COUNT`) and the unused `telemetry` capability are removed;
