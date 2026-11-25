@@ -19,18 +19,10 @@ irm https://borg.ml/install.ps1 | iex
 
 ## 快速开始
 
-```sh
-borg login codex      # 或：claude、opencode、openrouter……
-borg                  # 在当前目录启动会话
-borg resume           # 恢复最近的会话
-borg doctor           # 检查存储与提供商状态
-```
-
-不带参数运行 `borg login` 会列出所有提供商及其连接状态；在会话中，`/login`
-切换连接，`/model` 切换模型。`borg login claude` 通过浏览器登录 Borg 自己的
-账户（`~/.borg/claude`），与 Claude Code 的登录相互独立。API 密钥保存在
-`~/.borg/credentials.json`。完整的提供商列表见
-[英文 README](../../README.md#connecting-providers)。
+在项目目录中运行 `borg` 并输入请求，其余操作都在会话内完成：`/help` 列出
+所有控制项，**设置 › 提供商**（或 `/login`）连接提供商，`/model` 切换模型，
+`/resume` 恢复之前的会话。Borg 的 Claude 登录独立于 Claude Code。完整的提供商
+列表见[英文 README](../../README.md#providers)。
 
 ## 语言设置
 
@@ -55,19 +47,18 @@ UTF-16 组合文本范围。
 
 ## 配置
 
-运行 `borg config init` 生成带注释的 `agent.toml`，`borg config path` 显示其
-位置。示例文件位于仓库的 [`configs/`](../../configs/) 目录。
+在会话中打开 **设置** 或 `/customize` 修改配置。配置文件是
+`~/.config/borg/` 下的 TOML，带注释的示例位于仓库的
+[`configs/`](../../configs/) 目录。
 
 - `agent.toml`：提供商、能力、MCP、别名、按键和团队设置。
 - `editor.toml`：界面语言、终端显示和交互偏好。
 
-## 最小化的使用计数
+## 隐私
 
-默认关闭。在 `agent.toml` 中设置 `usage_count.enabled = true` 后，发行版每天
-最多发送一次不含内容的活跃安装心跳。随机标识每 31 天更换，不能跨周期追踪；
-不会发送版本、系统、模型、会话、提示、路径或设备信息。环境变量
-`BORG_DISABLE_USAGE_COUNT=1` 始终关闭它。详细英文契约见
-[`docs/usage-count.md`](../usage-count.md)。
+Borg 没有任何遥测：没有分析、使用计数、心跳或崩溃上报。它绝不会把你的提示、
+代码、路径或会话数据发送到你未选择的地方。Borg 只连接你配置的模型提供商和
+搜索服务、你启用的 Borg Remote、用于检查更新的 GitHub，以及公开的模型元数据。
 
 完整英文参考文档位于 [`docs/`](../)。中文入口优先覆盖安装、语言、会话生命
 周期和常用配置；协议与扩展 ABI 仍以英文原文为规范。

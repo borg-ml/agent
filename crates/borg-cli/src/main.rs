@@ -28,7 +28,6 @@ mod terminal_ui {
     pub(crate) use borg_tui::*;
 }
 mod updater;
-mod usage_count;
 #[cfg(unix)]
 mod worktree_commands;
 

@@ -1085,7 +1085,6 @@ pub struct SessionCapabilities {
     pub presence: bool,
     pub cloud_sync: bool,
     pub web_relay: bool,
-    pub telemetry: bool,
     /// Keep interrupted subscription work queued and retry it after provider
     /// usage limits have had time to clear.
     #[serde(default = "default_true")]
@@ -1174,7 +1173,6 @@ impl Default for SessionCapabilities {
             presence: true,
             cloud_sync: true,
             web_relay: true,
-            telemetry: false,
             auto_resume_usage_limits: true,
             watcher_yield: true,
             resume_paused_goal_on_message: false,
@@ -1395,7 +1393,6 @@ pub enum SessionCapability {
     Presence,
     CloudSync,
     WebRelay,
-    Telemetry,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -1457,7 +1454,6 @@ impl SessionCapabilities {
                 self.web_relay,
                 (!self.cloud_sync).then_some("requires cloud_sync"),
             ),
-            (SessionCapability::Telemetry, self.telemetry, None),
         ];
         let mut active = Vec::new();
         let mut inactive = Vec::new();
@@ -3211,17 +3207,15 @@ mod tests {
             presence: true,
             autonomous_team: true,
             web_relay: true,
-            telemetry: true,
             ..Default::default()
         };
 
-        let effective = capabilities.apply_dependency_intersection();
+        capabilities.apply_dependency_intersection();
 
         assert!(!capabilities.shared_work);
         assert!(!capabilities.presence);
         assert!(!capabilities.autonomous_team);
         assert!(!capabilities.web_relay);
-        assert!(effective.active.contains(&SessionCapability::Telemetry));
     }
 
     #[test]

@@ -572,7 +572,6 @@ pub(crate) async fn run_remote_command(command: RemoteCommand) -> Result<()> {
         }
         RemoteCommand::Host { config } => {
             let agent_config = AgentConfig::load(None)?;
-            crate::usage_count::spawn_background(agent_config.usage_count);
             crate::updater::spawn_background(agent_config.updates);
             let config_path = config.unwrap_or_else(default_host_config_path);
             println!("Borg Remote host connected from {}", config_path.display());
@@ -683,11 +682,6 @@ pub(crate) async fn run_remote_command(command: RemoteCommand) -> Result<()> {
 
 /// What this machine exposes remotely, on stderr so stdout stays JSON.
 fn print_remote_features(config_path: &Path) {
-    let usage_count = AgentConfig::load(None).is_ok_and(|config| config.usage_count.enabled);
-    eprintln!(
-        "Anonymous usage count: {}",
-        if usage_count { "on" } else { "off" }
-    );
     let config = match borg_remote::read_host_config(config_path) {
         Ok(config) => config,
         Err(_) if !config_path.exists() => {
@@ -1378,7 +1372,6 @@ pub(crate) async fn run_local_agent(mut args: LocalAgentCliArgs) -> Result<()> {
     let agent_config = AgentConfig::load(args.config.as_deref())?;
     // Provider environment is applied inside each owned session, after resume
     // configuration is resolved and before the server/executor starts.
-    crate::usage_count::spawn_background(agent_config.usage_count.clone());
     crate::updater::spawn_background(agent_config.updates.clone());
     let ephemeral_sessions = args.ephemeral.then(tempfile::tempdir).transpose()?;
     let crash_context = Arc::new(TuiCrashContext::default());

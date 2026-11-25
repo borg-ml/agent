@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.22.4)
 
+- Borg has no telemetry. The opt-in active-install heartbeat (`[usage_count]`,
+  `BORG_DISABLE_USAGE_COUNT`) and the unused `telemetry` capability are removed;
+  existing configs that still set them keep loading. The README states the
+  privacy stance and lists the only network destinations, and now describes the
+  in-app workflow instead of CLI commands.
+
 - A subagent blocked in `wait_agent` or `await_watchers` now shows as waiting in its
   parent's agent roster and team summary, matching its own status bar, instead of
   working.

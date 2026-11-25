@@ -2284,7 +2284,6 @@ fn cap(config: &CapabilityConfig, name: &str) -> bool {
         "presence" => config.presence,
         "cloud_sync" => config.cloud_sync,
         "web_relay" => config.web_relay,
-        "telemetry" => config.telemetry,
         _ => false,
     }
 }
@@ -2299,7 +2298,6 @@ fn known_capability(name: &str) -> bool {
             | "presence"
             | "cloud_sync"
             | "web_relay"
-            | "telemetry"
     )
 }
 

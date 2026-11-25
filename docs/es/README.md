@@ -20,19 +20,12 @@ irm https://borg.ml/install.ps1 | iex
 
 ## Primeros pasos
 
-```sh
-borg login codex      # o: claude, opencode, openrouter...
-borg                  # inicia una sesión en el directorio actual
-borg resume           # retoma la última sesión
-borg doctor           # comprueba el almacenamiento y los proveedores
-```
-
-`borg login` sin argumentos muestra todos los proveedores y si están
-conectados; dentro de una sesión, `/login` cambia de conexión y `/model` de
-modelo. `borg login claude` inicia sesión en el navegador con un acceso propio
-de Borg (`~/.borg/claude`), separado del de Claude Code. Las claves de API se
-guardan en `~/.borg/credentials.json`. La tabla completa de proveedores está en
-el [README en inglés](../../README.md#connecting-providers).
+Ejecuta `borg` en el directorio de un proyecto y escribe una solicitud. Todo lo
+demás ocurre dentro de la sesión: `/help` muestra los controles, **Ajustes ›
+Proveedores** (o `/login`) conecta proveedores, `/model` cambia de modelo y
+`/resume` retoma una sesión anterior. El acceso de Claude es propio de Borg,
+separado del de Claude Code. La lista completa de proveedores está en el
+[README en inglés](../../README.md#providers).
 
 ## Idioma de la interfaz
 
@@ -64,15 +57,12 @@ La documentación normativa completa está disponible en inglés:
 
 - [ciclo de vida de sesiones](../session-lifecycle.md)
 - [personalización del agente](../customization.md)
-- [recuento privado de instalaciones activas](../usage-count.md)
 - [README completo](../../README.md)
 
-## Recuento mínimo de uso
+## Privacidad
 
-Desactivado por defecto. Si lo activas con `usage_count.enabled = true`, las
-versiones publicadas envían como máximo una señal de instalación activa al
-día. El identificador aleatorio cambia cada 31 días y no permite seguir una
-instalación entre períodos. No se envían versiones, sistema operativo, modelos,
-sesiones, mensajes, rutas ni datos del dispositivo.
-
-`BORG_DISABLE_USAGE_COUNT=1` siempre lo desactiva.
+Borg no tiene telemetría: ni analíticas, ni recuentos de uso, ni señales de
+actividad, ni informes de fallos. Nunca envía tus mensajes, código, rutas ni
+datos de sesión a ningún sitio que no hayas elegido. Solo se conecta a los
+proveedores y buscadores que configuras, a Borg Remote si lo activas, a GitHub
+para buscar actualizaciones y a metadatos públicos de modelos.

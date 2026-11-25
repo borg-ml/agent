@@ -21,7 +21,6 @@ pub(crate) struct AgentConfig {
     pub(crate) mcp: McpConfig,
     pub(crate) approvals: ApprovalConfig,
     pub(crate) updates: UpdateConfig,
-    pub(crate) usage_count: UsageCountConfig,
     pub(crate) compaction: CompactionConfig,
     pub(crate) warming: WarmingConfig,
     pub(crate) shell: ShellConfig,
@@ -329,7 +328,6 @@ pub(crate) struct CapabilityConfig {
     pub(crate) presence: bool,
     pub(crate) cloud_sync: bool,
     pub(crate) web_relay: bool,
-    pub(crate) telemetry: bool,
     pub(crate) auto_resume_usage_limits: bool,
     pub(crate) watcher_yield: bool,
     /// Resume a goal that a stop or a block left parked when the human sends
@@ -357,7 +355,6 @@ impl Default for CapabilityConfig {
             presence: true,
             cloud_sync: true,
             web_relay: true,
-            telemetry: false,
             auto_resume_usage_limits: true,
             watcher_yield: true,
             resume_paused_goal_on_message: false,
@@ -380,7 +377,6 @@ impl From<&CapabilityConfig> for borg_remote::SessionCapabilities {
             presence: value.presence,
             cloud_sync: value.cloud_sync,
             web_relay: value.web_relay,
-            telemetry: value.telemetry,
             auto_resume_usage_limits: value.auto_resume_usage_limits,
             watcher_yield: value.watcher_yield,
             resume_paused_goal_on_message: value.resume_paused_goal_on_message,
@@ -485,13 +481,6 @@ pub(crate) struct ShellConfig {
     /// configured shell is honored even when its dialect is not POSIX, so
     /// `fish` works for a user who wants their own shell.
     pub(crate) command: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-pub(crate) struct UsageCountConfig {
-    /// Send a content-free, monthly rotating active-install heartbeat.
-    pub(crate) enabled: bool,
 }
 
 impl Default for UpdateConfig {
@@ -2236,12 +2225,11 @@ reasoning_format = "deepseek"
     }
 
     #[test]
-    fn capabilities_default_to_full_runtime_with_private_telemetry() {
+    fn capabilities_default_to_full_runtime() {
         let config: AgentConfig = toml::from_str("").unwrap();
         assert!(config.capabilities.multiplayer);
         assert!(config.capabilities.subagents);
         assert!(config.capabilities.autonomous_team);
-        assert!(!config.capabilities.telemetry);
         assert!(!config.extensions.allow_project_mcp);
         assert_eq!(config.extensions.default_access, ExtensionAccess::Trusted);
         assert_eq!(config.extensions.project_access, ExtensionAccess::Sandboxed);

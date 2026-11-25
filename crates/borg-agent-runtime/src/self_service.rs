@@ -2288,7 +2288,6 @@ fn validate_settings_shape(root: &toml::Value) -> Result<()> {
                 "presence",
                 "cloud_sync",
                 "web_relay",
-                "telemetry",
                 "auto_resume_usage_limits",
                 "watcher_yield",
                 "resume_paused_goal_on_message",
