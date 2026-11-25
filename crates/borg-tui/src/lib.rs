@@ -11883,35 +11883,14 @@ impl BorgTerminal {
             if self.goal_status_hovered
                 && let Some(goal) = active_goal.as_ref()
             {
-                let tooltip_width = (goal.objective.width() as u16)
-                    .saturating_add(4)
-                    .clamp(24, status_area.width.min(80));
-                let tooltip_lines =
-                    wrap_display(&goal.objective, tooltip_width.saturating_sub(4) as usize);
-                let tooltip_height = (tooltip_lines.len() as u16)
-                    .saturating_add(2)
-                    .min(status_area.y.saturating_sub(area.y).max(1));
-                let tooltip = Rect {
-                    x: next_goal_status_area
-                        .map(|goal_area| goal_area.x)
-                        .unwrap_or(status_area.x)
-                        .min(area.right().saturating_sub(tooltip_width)),
-                    y: status_area.y.saturating_sub(tooltip_height),
-                    width: tooltip_width,
-                    height: tooltip_height,
-                };
-                overlays.clear(frame, tooltip);
-                frame.render_widget(
-                    Paragraph::new(goal.objective.as_str())
-                        .wrap(ratatui::widgets::Wrap { trim: true })
-                        .style(Style::default().fg(Color::White).bg(COMMAND_PANEL_BG))
-                        .block(
-                            Block::default()
-                                .borders(Borders::ALL)
-                                .border_style(Style::default().fg(TODO_ORANGE))
-                                .title(goal_tooltip_title(goal)),
-                        ),
-                    tooltip,
+                overlays.text_tooltip(
+                    frame,
+                    area,
+                    next_goal_status_area.unwrap_or(status_area),
+                    Alignment::Left,
+                    &goal_tooltip_title(goal),
+                    TODO_ORANGE,
+                    &goal.objective,
                 );
             }
             if (self.git_status_hovered || self.git_commit_hovered || self.git_pull_hovered)
@@ -11924,69 +11903,52 @@ impl BorgTerminal {
                 }
                 && let Some(git_status) = footer_git_status.as_ref()
             {
-                let pushing = self.git_push.is_running(&active_cwd, GitRemoteAction::Push);
-                let committing = self.git_commit.is_committing(&active_cwd);
-                let pulling = self.git_push.is_running(&active_cwd, GitRemoteAction::Pull);
-                let tooltip_title = if self.git_commit_hovered {
-                    " git commit "
-                } else if self.git_pull_hovered {
-                    " git pull "
-                } else {
-                    " git push "
-                };
-                let text = if self.git_commit_hovered {
-                    if committing {
-                        format!("Committing on {}…", git_status.branch)
+                let branch = &git_status.branch;
+                let (title, text) = if self.git_commit_hovered {
+                    if self.git_commit.is_committing(&active_cwd) {
+                        (" Commit ", format!("Committing on {branch}…"))
                     } else {
-                        format!(
-                            "Commit all changes on {} — message by {} — then push — click",
-                            git_status.branch,
-                            self.commit_message_model.label()
+                        (
+                            " Commit · click to commit and push ",
+                            format!(
+                                "Commits every change on {branch} with a message drafted by {}, then pushes.",
+                                self.commit_message_model.label()
+                            ),
                         )
                     }
                 } else if self.git_pull_hovered {
-                    if pulling {
-                        format!("Pulling {} from upstream…", git_status.branch)
+                    if self.git_push.is_running(&active_cwd, GitRemoteAction::Pull) {
+                        (" Pull ", format!("Pulling {branch} from upstream…"))
                     } else {
-                        format!(
-                            "Pull ↓{} into {} — click",
-                            git_status.behind, git_status.branch
+                        (
+                            " Pull · click to pull ",
+                            format!(
+                                "{} upstream {} not yet on {branch}.",
+                                git_status.behind,
+                                if git_status.behind == 1 { "commit" } else { "commits" }
+                            ),
                         )
                     }
-                } else if pushing {
-                    format!("Pushing {} to {}…", git_status.branch, "upstream")
+                } else if self.git_push.is_running(&active_cwd, GitRemoteAction::Push) {
+                    (" Push ", format!("Pushing {branch} to upstream…"))
                 } else {
-                    format!(
-                        "Push ↑{} to {} — click",
-                        git_status.ahead, git_status.branch
+                    (
+                        " Push · click to push ",
+                        format!(
+                            "{} {} on {branch} not yet upstream.",
+                            git_status.ahead,
+                            if git_status.ahead == 1 { "commit" } else { "commits" }
+                        ),
                     )
                 };
-                let tooltip_width = (text.width() as u16)
-                    .saturating_add(4)
-                    .clamp(24, area.width.min(80));
-                let tooltip_height = 3u16.min(git_area.y.saturating_sub(area.y).max(1));
-                let tooltip = Rect {
-                    x: git_area
-                        .right()
-                        .saturating_sub(tooltip_width)
-                        .max(area.x)
-                        .min(area.right().saturating_sub(tooltip_width)),
-                    y: git_area.y.saturating_sub(tooltip_height),
-                    width: tooltip_width,
-                    height: tooltip_height,
-                };
-                overlays.clear(frame, tooltip);
-                frame.render_widget(
-                    Paragraph::new(text)
-                        .wrap(ratatui::widgets::Wrap { trim: true })
-                        .style(Style::default().fg(Color::White).bg(COMMAND_PANEL_BG))
-                        .block(
-                            Block::default()
-                                .borders(Borders::ALL)
-                                .border_style(Style::default().fg(Color::Cyan))
-                                .title(tooltip_title),
-                        ),
-                    tooltip,
+                overlays.text_tooltip(
+                    frame,
+                    area,
+                    git_area,
+                    Alignment::Right,
+                    title,
+                    Color::Gray,
+                    &text,
                 );
             }
             if (self.shell_menu_open || self.hovered_shell_row.is_some()) && !shell_rows.is_empty()
@@ -12165,47 +12127,20 @@ impl BorgTerminal {
             }
             if self.context_status_hovered
                 && !context_tooltip.is_empty()
-                && next_context_status_area.is_some()
+                && let Some(context_area) = next_context_status_area
             {
-                let tooltip_width = (context_tooltip.width() as u16)
-                    .saturating_add(4)
-                    .clamp(24, 72);
-                let tooltip_lines = wrap_display(
+                overlays.text_tooltip(
+                    frame,
+                    area,
+                    context_area,
+                    Alignment::Left,
+                    " Context window ",
+                    if context_imminent {
+                        Color::Yellow
+                    } else {
+                        Color::Gray
+                    },
                     &context_tooltip,
-                    tooltip_width.saturating_sub(4).max(1) as usize,
-                );
-                let tooltip_height = (tooltip_lines.len() as u16)
-                    .saturating_add(2)
-                    .min(status_area.y.saturating_sub(area.y).max(1));
-                let tooltip = Rect {
-                    x: next_context_status_area
-                        .map(|context_area| context_area.x)
-                        .unwrap_or(status_area.x)
-                        .min(area.right().saturating_sub(tooltip_width)),
-                    y: status_area.y.saturating_sub(tooltip_height),
-                    width: tooltip_width,
-                    height: tooltip_height,
-                };
-                overlays.clear(frame, tooltip);
-                frame.render_widget(
-                    Paragraph::new(
-                        tooltip_lines
-                            .into_iter()
-                            .map(Line::from)
-                            .collect::<Vec<_>>(),
-                    )
-                    .style(Style::default().fg(Color::White).bg(COMMAND_PANEL_BG))
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(if context_imminent {
-                                Color::Yellow
-                            } else {
-                                Color::Gray
-                            }))
-                            .title(" Context window "),
-                    ),
-                    tooltip,
                 );
             }
             self.git_status_area = None;
@@ -12275,6 +12210,18 @@ impl BorgTerminal {
                         x: footer_area.right().saturating_sub(metadata_width),
                         width: metadata_width,
                         ..footer_area
+                    };
+                    let metadata_line = match footer_git_status.as_ref() {
+                        Some(status) => highlight_footer_git(
+                            metadata_line,
+                            status,
+                            [
+                                self.git_commit_hovered,
+                                self.git_status_hovered,
+                                self.git_pull_hovered,
+                            ],
+                        ),
+                        None => metadata_line,
                     };
                     frame.render_widget(
                         Paragraph::new(metadata_line)
@@ -18282,6 +18229,57 @@ fn footer_metadata_line(
     Line::from(spans)
 }
 
+/// Split the footer's git label into its clickable tokens, so the branch
+/// (commit), `↑` (push) and `↓` (pull) underline on hover like every other
+/// footer control. `hovered` is in that order.
+fn highlight_footer_git(
+    line: Line<'static>,
+    status: &GitWorktreeStatus,
+    hovered: [bool; 3],
+) -> Line<'static> {
+    let label = status.compact_label();
+    let mut spans = line.spans;
+    let Some(index) = spans.iter().rposition(|span| span.content.contains(&label)) else {
+        return Line::from(spans);
+    };
+    let span = spans.remove(index);
+    let (before, after) = span
+        .content
+        .rsplit_once(&label)
+        .map(|(before, after)| (before.to_string(), after.to_string()))
+        .unwrap_or_default();
+    let resting = span.style;
+    let tokens = [
+        Some(format!(
+            "{}{}",
+            status.branch,
+            if status.dirty { "*" } else { "" }
+        )),
+        (status.ahead > 0).then(|| format!("↑{}", status.ahead)),
+        (status.behind > 0).then(|| format!("↓{}", status.behind)),
+    ];
+    let mut replacement = vec![Span::styled(before, resting)];
+    for (position, (token, hovered)) in tokens.into_iter().zip(hovered).enumerate() {
+        let Some(token) = token else { continue };
+        if position > 0 {
+            replacement.push(Span::styled(STATUS_SEPARATOR, resting));
+        }
+        let clickable = position > 0 || status.dirty;
+        let color = resting.fg.unwrap_or(Color::Gray);
+        replacement.push(Span::styled(
+            token,
+            if clickable {
+                interactive_status_style(hovered, color)
+            } else {
+                resting
+            },
+        ));
+    }
+    replacement.push(Span::styled(after, resting));
+    spans.splice(index..index, replacement);
+    Line::from(spans)
+}
+
 fn footer_path_spans(text: &str, cwd_path: &str, hovered: bool) -> Vec<Span<'static>> {
     let resting = Style::default().fg(Color::Gray);
     let Some(offset) = (!cwd_path.is_empty())
@@ -19205,6 +19203,51 @@ impl OverlayLayer {
             self.regions.push(area);
             frame.render_widget(Clear, area);
         }
+    }
+    /// A bordered text tooltip directly above `anchor`, wrapped to fit, the
+    /// one shape every hover tooltip of a footer or status item takes.
+    #[allow(clippy::too_many_arguments)]
+    fn text_tooltip(
+        &mut self,
+        frame: &mut ratatui::Frame<'_>,
+        area: Rect,
+        anchor: Rect,
+        alignment: Alignment,
+        title: &str,
+        border: Color,
+        text: &str,
+    ) {
+        let width = (text.width() as u16)
+            .saturating_add(4)
+            .clamp(24, area.width.min(80));
+        let lines = wrap_display(text, width.saturating_sub(4).max(1) as usize);
+        let height = (lines.len() as u16)
+            .saturating_add(2)
+            .min(anchor.y.saturating_sub(area.y).max(1));
+        let x = if alignment == Alignment::Right {
+            anchor.right().saturating_sub(width)
+        } else {
+            anchor.x
+        };
+        let tooltip = Rect {
+            x: x.max(area.x).min(area.right().saturating_sub(width)),
+            y: anchor.y.saturating_sub(height),
+            width,
+            height,
+        };
+        self.clear(frame, tooltip);
+        frame.render_widget(
+            Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
+                .style(Style::default().fg(Color::White).bg(COMMAND_PANEL_BG))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .padding(Padding::horizontal(1))
+                        .border_style(Style::default().fg(border))
+                        .title(title.to_string()),
+                ),
+            tooltip,
+        );
     }
 }
 

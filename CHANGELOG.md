@@ -11,6 +11,10 @@ Git comparison.
   privacy stance and lists the only network destinations, and now describes the
   in-app workflow instead of CLI commands.
 
+- The footer's git branch, `↑` and `↓` now highlight and underline on hover like
+  the other footer controls. Git, goal and context tooltips share one layout:
+  they wrap instead of clipping, and git titles say what a click does.
+
 - Images are no longer refused for their number or size. A message carries up
   to 100 images (was 4), and the composer no longer blocks a send with more;
   beyond what one request can carry, the rest stay listed by path for the model
