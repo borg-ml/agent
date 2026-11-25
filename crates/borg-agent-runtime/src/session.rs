@@ -3045,6 +3045,10 @@ async fn run_agent_session_store_kernel_inner(
         .is_some_and(|goal| goal.status.is_active())
         .then(Instant::now);
     let mut goal_turn_failures = ConsecutiveGoalTurnFailures::default();
+    // Goal continuations in a row that called no tool. A model that believes
+    // it must stop but may not end the goal answers each one with text alone,
+    // and nothing else ever stops the loop.
+    let mut idle_goal_turns = 0u8;
     let mut pending = recover_prompts_on_resume(&recovery.queue_events);
     // Admissions the dead run already made durable. Only these may be
     // skipped: a resumed prompt has one, at its original timestamp, and
@@ -6024,6 +6028,7 @@ async fn run_agent_session_store_kernel_inner(
         let mut role_notice_pending = false;
         let mut network_recovery_pending = network_retry_message_id.is_some();
         let mut turn_had_side_effects = false;
+        let mut turn_called_tools = false;
         let mut retryable_provider_errors = Vec::new();
         let mut turn_reported_error = false;
         let mut batch_pending_after_interrupt = false;
@@ -6216,6 +6221,7 @@ async fn run_agent_session_store_kernel_inner(
                         }
                         turn_reported_error |= matches!(&kind, SessionEventKind::Error { .. });
                         turn_had_side_effects |= provider_event_has_side_effect(&kind);
+                        turn_called_tools |= matches!(kind, SessionEventKind::ToolStarted { .. });
                         if watchdog.phase() == TurnPhase::AwaitingProvider {
                             watchdog.set_phase(TurnPhase::Active);
                             record(
@@ -6316,6 +6322,22 @@ async fn run_agent_session_store_kernel_inner(
                             retry_not_before = None;
                             if !interrupted {
                                 goal_turn_failures.reset();
+                                if !is_goal_continuation(&prompt) || turn_called_tools {
+                                    idle_goal_turns = 0;
+                                } else {
+                                    idle_goal_turns = idle_goal_turns.saturating_add(1);
+                                    if idle_goal_turns >= 3 {
+                                        idle_goal_turns = 0;
+                                        block_active_goal(
+                                            &mut journal,
+                                            &events,
+                                            session_id,
+                                            &mut goal,
+                                            &mut goal_active_since,
+                                        )
+                                        .await?;
+                                    }
+                                }
                             }
                             subscription_context_reusable =
                                 subscription_context_reusable_after_turn(
@@ -8166,6 +8188,7 @@ async fn run_agent_session_store_kernel_inner(
                     }
                     turn_reported_error |= matches!(&kind, SessionEventKind::Error { .. });
                     turn_had_side_effects |= provider_event_has_side_effect(&kind);
+                    turn_called_tools |= matches!(kind, SessionEventKind::ToolStarted { .. });
                     if watchdog.phase() == TurnPhase::AwaitingProvider {
                         watchdog.set_phase(TurnPhase::Active);
                         record(
@@ -15759,6 +15782,12 @@ async fn record_goal(
     .await
 }
 
+const GOAL_CONTINUATION_LEAD: &str = "Continue working toward the active session goal.";
+
+fn is_goal_continuation(prompt: &QueuedPrompt) -> bool {
+    prompt.actor == EventActor::System && prompt.text.starts_with(GOAL_CONTINUATION_LEAD)
+}
+
 fn continuation_prompt(goal: &SessionGoal, watcher_yield: bool) -> String {
     let budget = goal
         .token_budget
@@ -15778,7 +15807,7 @@ fn continuation_prompt(goal: &SessionGoal, watcher_yield: bool) -> String {
         ""
     };
     format!(
-        "Continue working toward the active session goal.\n\n\
+        "{GOAL_CONTINUATION_LEAD}\n\n\
 {}\n\n\
 This goal persists across turns. Keep the full objective intact, make concrete progress, and verify the actual requested end state before marking it complete.\n\
 Tokens used: {}. Token budget: {budget}. Tokens remaining: {remaining}.\n\

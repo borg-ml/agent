@@ -11,6 +11,11 @@ Git comparison.
   privacy stance and lists the only network destinations, and now describes the
   in-app workflow instead of CLI commands.
 
+- An active goal no longer spins forever when the agent only answers in text.
+  After three goal continuations in a row that call no tool (for example, a
+  worker told to stop replying "I'm stopped" every 20 seconds), Borg marks the
+  goal blocked and waits for input instead of starting another turn.
+
 - A subagent blocked in `wait_agent` or `await_watchers` now shows as waiting in its
   parent's agent roster and team summary, matching its own status bar, instead of
   working.

@@ -20132,6 +20132,113 @@ async fn assert_watcher_yield_blocks_automatic_turns(queue_reports: bool) {
     scratch.discard().await;
 }
 
+/// Creates a goal, then answers every turn with text alone, the way a worker
+/// told to stop replied "I'm stopped" to each continuation for hours.
+struct TextOnlyGoalExecutor {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl AgentTurnExecutor for TextOnlyGoalExecutor {
+    async fn execute(
+        &self,
+        turn: AgentTurn,
+        _events: mpsc::Sender<SessionEventKind>,
+        _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+    ) -> Result<AgentTurnResult> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            turn.agent_tools
+                .call(
+                    "create_goal",
+                    json!({"objective": "keep going until told to stop", "token_budget": null}),
+                )
+                .await
+                .expect("the goal is created");
+        }
+        Ok(AgentTurnResult {
+            provider_session_id: None,
+            final_text: "I'm stopped.".to_string(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn goal_continuations_that_call_no_tool_block_the_goal() {
+    let root = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(256);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let executor = Arc::new(TextOnlyGoalExecutor {
+        calls: Arc::clone(&calls),
+    });
+    let actor = tokio::spawn({
+        let journal_path = root.path().join("session.lock");
+        let cwd = root.path().to_path_buf();
+        let store = Arc::clone(&store);
+        async move {
+            run_session_actor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: Uuid::new_v4(),
+                    cwd,
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    ultrafast: None,
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::FullAccess,
+                    name: None,
+                    initial_prompt: Some("start".to_string()),
+                    capabilities: crate::SessionCapabilities::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+                store,
+            )
+            .await
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(event) = event_rx.recv().await {
+            if let SessionEventKind::GoalUpdated { goal } = &event.kind
+                && goal.status == GoalStatus::Blocked
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the goal is blocked");
+    // Nothing more runs once the goal is blocked.
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        while event_rx.recv().await.is_some() {}
+    })
+    .await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        4,
+        "the request turn and three idle continuations, then no more"
+    );
+
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(5), actor).await;
+    scratch.discard().await;
+}
+
 /// A paused goal is still the director of its team. When an agent reports,
 /// the root must wake to merge or re-evaluate that work rather than settle the
 /// report silently until someone resumes the goal by hand.
