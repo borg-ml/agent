@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.22.5)
+## Unreleased (since 0.22.6)
+
+## 0.22.6 (2026-11-25)
 
 - Signing in to Claude, ChatGPT or Gemini from a terminal with no browser no
   longer needs port forwarding. The TUI shows a full-screen sign-in view with a
