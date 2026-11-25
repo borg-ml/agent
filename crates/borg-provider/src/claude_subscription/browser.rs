@@ -17,18 +17,30 @@ const MAX_HEADER_BYTES: usize = 8 * 1024;
 /// Owns the listener and pending PKCE login. Dropping it (or its completion
 /// future) closes callback collection; no callback task is detached.
 pub struct BrowserLogin {
-    listener: TcpListener,
+    /// `None` for a paste-only login, whose browser is on another device.
+    listener: Option<TcpListener>,
     pending: PendingLogin,
     authority: AuthAuthority,
     authorize_url: String,
     deadline: Instant,
 }
 
-pub async fn begin_browser_login(authority: AuthAuthority) -> Result<BrowserLogin> {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .context("bind Claude login callback")?;
-    let pending = PendingLogin::loopback(listener.local_addr()?.port())?;
+/// `paste_only` serves a host whose browser is elsewhere: Claude then shows
+/// the code on its own page for the user to paste back, instead of
+/// redirecting to a loopback port the browser cannot reach.
+pub async fn begin_browser_login(
+    authority: AuthAuthority,
+    paste_only: bool,
+) -> Result<BrowserLogin> {
+    let (listener, pending) = if paste_only {
+        (None, PendingLogin::new()?)
+    } else {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .context("bind Claude login callback")?;
+        let pending = PendingLogin::loopback(listener.local_addr()?.port())?;
+        (Some(listener), pending)
+    };
     let deadline = Instant::now() + LOGIN_TIMEOUT;
     let authorize_url = pending.authorize_url()?;
     Ok(BrowserLogin {
@@ -46,9 +58,21 @@ impl BrowserLogin {
         &self.authorize_url
     }
 
-    /// Explicit new login may select a different account. Session/account guards
-    /// remain the controller's responsibility; exchange/save belong to auth.
-    pub async fn complete(self) -> Result<()> {
+    /// Whether the page shows a code to paste rather than redirecting here.
+    pub fn pastes_code(&self) -> bool {
+        self.listener.is_none()
+    }
+
+    /// Completes from the loopback callback or from `pasted` text: the
+    /// `code#state` Claude's page shows, or the address the browser landed
+    /// on. Text that does not belong to this login calls `rejected` and the
+    /// login keeps waiting. Explicit new login may select a different
+    /// account; exchange/save belong to auth.
+    pub async fn complete(
+        self,
+        mut pasted: tokio::sync::mpsc::UnboundedReceiver<String>,
+        mut rejected: impl FnMut(),
+    ) -> Result<()> {
         let Self {
             listener,
             pending,
@@ -56,10 +80,48 @@ impl BrowserLogin {
             deadline,
             ..
         } = self;
-        let (code, state) = wait_for_callback(&listener, &pending, deadline).await?;
+        let (code, state) = timeout_at(deadline, async {
+            let callback = async {
+                match &listener {
+                    Some(listener) => wait_for_callback(listener, &pending, deadline).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::pin!(callback);
+            loop {
+                tokio::select! {
+                    result = &mut callback => return result,
+                    Some(text) = pasted.recv() => match parse_pasted(&text, &pending) {
+                        Some(found) => return Ok(found),
+                        None => rejected(),
+                    },
+                }
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Claude browser login expired; restart login"))??;
         drop(listener);
         pending.complete(code, state, authority, None).await
     }
+}
+
+/// The code and state in pasted text, when its state is this login's.
+fn parse_pasted(text: &str, pending: &PendingLogin) -> Option<(String, String)> {
+    let text = text.trim();
+    let (code, state) = match reqwest::Url::parse(text) {
+        Ok(url) => {
+            let pairs: std::collections::HashMap<_, _> = url.query_pairs().collect();
+            (
+                pairs.get("code")?.to_string(),
+                pairs.get("state")?.to_string(),
+            )
+        }
+        Err(_) => {
+            let (code, state) = text.split_once('#')?;
+            (code.to_string(), state.to_string())
+        }
+    };
+    (!code.is_empty() && pending.matches_state(&state)).then_some((code, state))
 }
 
 async fn wait_for_callback(
@@ -211,6 +273,25 @@ mod tests {
             .unwrap()
             .unwrap();
         response
+    }
+
+    // A paste from another sign-in must not complete this one; the page's
+    // code#state and the address the browser landed on both do.
+    #[test]
+    fn pasted_code_needs_this_logins_state() {
+        let pending = PendingLogin::new().unwrap();
+        let state = state(&pending);
+        assert!(parse_pasted("code#wrong", &pending).is_none());
+        assert!(parse_pasted("code-without-state", &pending).is_none());
+        assert_eq!(
+            parse_pasted(&format!(" abc#{state}\n"), &pending),
+            Some(("abc".to_string(), state.clone()))
+        );
+        let address = format!("http://localhost:4242/callback?code=a%2Fb&state={state}");
+        assert_eq!(
+            parse_pasted(&address, &pending),
+            Some(("a/b".to_string(), state))
+        );
     }
 
     // CSRF cannot consume PKCE or reach exchange. Exercise the actual listener,

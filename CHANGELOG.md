@@ -5,6 +5,15 @@ Git comparison.
 
 ## Unreleased (since 0.22.5)
 
+- Signing in to Claude, ChatGPT or Gemini from a terminal with no browser no
+  longer needs port forwarding. The TUI shows a full-screen sign-in view with a
+  QR code to scan on a phone, the link (Ctrl+Y copies it, over SSH too),
+  ChatGPT's device code, and a field to paste the result back: over SSH or on a
+  headless host Claude's page shows a code to paste, and for Claude and Gemini
+  the address the browser lands on after approval can be pasted instead.
+  `borg login` prints the same QR code and reads the pasted code from the
+  terminal. Over SSH the TUI no longer tries to open a browser on the host.
+
 - Borg now runs as root on Linux instead of refusing with "Borg cannot create its session
   database as root". PostgreSQL's server tools refuse root, so Borg runs `initdb`, `pg_ctl` and
   `postgres` through util-linux `unshare` as `nobody` in a user namespace that maps back to root;

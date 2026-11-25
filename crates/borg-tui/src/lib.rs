@@ -12,12 +12,14 @@ use borg_view::semantics::{assistant_message_is_retired_action_leak, parse_watch
 mod attachments;
 mod cache_diagnostics;
 mod clipboard;
+pub use sign_in::qr_lines as sign_in_qr;
 mod composer_draft;
 mod composer_undo;
 mod key_hints;
 mod markdown;
 mod rendering;
 mod settings;
+mod sign_in;
 mod terminal_input;
 #[cfg(test)]
 use borg_view::projection_helpers::effective_subagent_status;
@@ -1161,6 +1163,11 @@ pub enum UiAction {
     },
     ToggleDictation,
     TerminalIo(TerminalIoRequest),
+    /// Bring back the full-screen view of the sign-in that is running.
+    ShowSignIn,
+    /// Text pasted into the sign-in view: a code, or the address a browser
+    /// on another device landed on.
+    SubmitSignInCode(String),
     LoadPayloads(Vec<SessionPayloadRef>),
     Interrupt {
         target: Option<Uuid>,
@@ -6914,7 +6921,12 @@ impl BorgTerminal {
             lane,
             crate::settings::SignIn {
                 status: "Starting sign-in…".to_string(),
-                url: None,
+                accepts_code: matches!(
+                    lane,
+                    borg_provider::subscriptions::Lane::Claude
+                        | borg_provider::subscriptions::Lane::Gemini
+                ),
+                ..Default::default()
             },
         ));
         if self.settings.is_none() {
@@ -6922,9 +6934,9 @@ impl BorgTerminal {
         }
     }
 
-    /// The running sign-in reported a line. The first sign-in link is opened
-    /// in the browser and kept in the transcript, where it can be copied on a
-    /// machine without one.
+    /// The running sign-in reported a line. The first sign-in link opens the
+    /// full-screen sign-in view, is kept in the transcript, and opens in the
+    /// browser unless the terminal is remote, where the browser is elsewhere.
     pub fn subscription_sign_in_output(&mut self, line: &str) -> Option<TerminalIoRequest> {
         let line = line.trim();
         let (lane, sign_in) = self.subscription_sign_in.as_mut()?;
@@ -6940,10 +6952,74 @@ impl BorgTerminal {
             .find(|word| word.starts_with("https://"))?
             .trim_end_matches(['.', ',', ')'])
             .to_string();
+        sign_in.user_code = line
+            .split_once("enter code ")
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .map(str::to_string);
         sign_in.url = Some(url.clone());
+        sign_in.hidden = false;
         let title = format!("{} sign-in", lane.label());
         self.show_info(title, line.to_string());
-        Some(TerminalIoRequest::open_link(url))
+        (!clipboard::is_remote_terminal()).then(|| TerminalIoRequest::open_link(url))
+    }
+
+    fn sign_in_view_open(&self) -> bool {
+        self.settings.is_some()
+            && self
+                .subscription_sign_in
+                .as_ref()
+                .is_some_and(|(_, sign_in)| sign_in.url.is_some() && !sign_in.hidden)
+    }
+
+    fn handle_sign_in_event(&mut self, event: Event) -> UiAction {
+        let Some((_, sign_in)) = self.subscription_sign_in.as_mut() else {
+            return UiAction::None;
+        };
+        let url = sign_in.url.clone().unwrap_or_default();
+        match event {
+            Event::Key(key) if key.kind == KeyEventKind::Release => UiAction::None,
+            Event::Key(key) => {
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                match key.code {
+                    KeyCode::Esc => {
+                        sign_in.hidden = true;
+                        UiAction::None
+                    }
+                    KeyCode::Char('c') if ctrl => {
+                        sign_in.hidden = true;
+                        UiAction::None
+                    }
+                    KeyCode::Char('o') if ctrl => {
+                        UiAction::TerminalIo(TerminalIoRequest::open_link(url))
+                    }
+                    KeyCode::Char('y') if ctrl => {
+                        UiAction::TerminalIo(TerminalIoRequest::copy(url, "✓ Sign-in link copied"))
+                    }
+                    KeyCode::Char('u') if ctrl => {
+                        sign_in.pasted.clear();
+                        UiAction::None
+                    }
+                    KeyCode::Char(c) if sign_in.accepts_code && !ctrl => {
+                        sign_in.pasted.push(c);
+                        UiAction::None
+                    }
+                    KeyCode::Backspace => {
+                        sign_in.pasted.pop();
+                        UiAction::None
+                    }
+                    KeyCode::Enter if !sign_in.pasted.trim().is_empty() => {
+                        sign_in.status = "Checking the pasted code…".to_string();
+                        UiAction::SubmitSignInCode(std::mem::take(&mut sign_in.pasted))
+                    }
+                    _ => UiAction::None,
+                }
+            }
+            Event::Paste(text) if sign_in.accepts_code => {
+                sign_in.pasted.push_str(text.trim());
+                UiAction::None
+            }
+            _ => UiAction::None,
+        }
     }
 
     /// The sign-in ended; `notice` says how.
@@ -7124,6 +7200,9 @@ impl BorgTerminal {
     }
 
     fn handle_settings_event(&mut self, event: Event) -> Result<UiAction> {
+        if self.sign_in_view_open() {
+            return Ok(self.handle_sign_in_event(event));
+        }
         let values = self.settings_values();
         let Some(screen) = self.settings.as_mut() else {
             return Ok(UiAction::None);
@@ -7162,6 +7241,12 @@ impl BorgTerminal {
             }
             SettingsEffect::Close => {
                 self.settings = None;
+                UiAction::None
+            }
+            SettingsEffect::Apply(action) if matches!(*action, UiAction::ShowSignIn) => {
+                if let Some((_, sign_in)) = self.subscription_sign_in.as_mut() {
+                    sign_in.hidden = false;
+                }
                 UiAction::None
             }
             SettingsEffect::Apply(action) => *action,
@@ -7206,9 +7291,16 @@ impl BorgTerminal {
         }
         let screen = self.settings.as_mut().expect("settings screen is open");
         let rows = screen.rows(&values);
+        let sign_in = self
+            .subscription_sign_in
+            .as_ref()
+            .filter(|(_, sign_in)| sign_in.url.is_some() && !sign_in.hidden);
         let drawn = self
             .terminal
-            .draw(|frame| screen.render(frame, &rows, notice.as_deref(), icon))
+            .draw(|frame| match sign_in {
+                Some((lane, sign_in)) => sign_in::render(frame, lane.label(), sign_in),
+                None => screen.render(frame, &rows, notice.as_deref(), icon),
+            })
             .map(|_| ());
         let end = execute!(output, crossterm::terminal::EndSynchronizedUpdate);
         drawn?;

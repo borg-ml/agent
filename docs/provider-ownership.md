@@ -34,6 +34,14 @@ after successful sign-in;
 abandoning login does not replace the working selection. Existing saved API
 credentials are retained, not selected as a subscription fallback.
 
+A frontend that can take pasted text (the TUI and `borg login`) starts a
+paste-only login over SSH or on a Linux host without a display: the authorize
+link redirects to Claude's code page, and the user pastes its `code#state`
+back. Otherwise the loopback callback is used, and pasting the address the
+browser landed on completes it too. Either path checks the login's state
+before the code is exchanged. Gemini's Antigravity client accepts only its
+loopback redirect, so on another device the user pastes that address.
+
 Login occurs on the executing host. Remote credentials are not copied through
 Borg Remote. Refresh and replay remain bound to the selected account; opaque
 continuations cannot be reused under a different account. Missing entitlement

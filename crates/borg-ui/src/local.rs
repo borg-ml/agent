@@ -209,7 +209,7 @@ impl LocalSessionWorker {
                                                 title: title.clone(),
                                                 body: body.clone(),
                                             });
-                                            let login = login_provider_with_output(provider, |line| {
+                                            let login = login_provider_with_output(provider, None, |line| {
                                                 if body.len() > 16_000 {
                                                     let boundary = body.floor_char_boundary(body.len() - 12_000);
                                                     body.drain(..boundary);

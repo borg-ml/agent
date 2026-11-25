@@ -38,7 +38,7 @@ fn native_copy(_text: &str) -> Result<Option<ClipboardLease>, String> {
     Err("native clipboard is unavailable on Android/Termux".to_string())
 }
 
-fn is_remote_terminal() -> bool {
+pub(crate) fn is_remote_terminal() -> bool {
     std::env::var_os("SSH_TTY").is_some() || std::env::var_os("SSH_CONNECTION").is_some()
 }
 

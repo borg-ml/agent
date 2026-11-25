@@ -5774,7 +5774,8 @@ async fn run_local_agent_session(
                                     .ok();
                             }
                             "/login" => {
-                                login_provider(provider).await?;
+                                // The prompt reads stdin, so codes are not taken from it here.
+                                terminal_subscription_login(provider, None, false).await?;
                                 lifecycle_executor.stop_session(session_id).await?;
                                 println!("  Signed in. Retry your message.");
                             }
@@ -6413,6 +6414,13 @@ async fn run_local_agent_session(
                                     terminal.begin_subscription_sign_in(lane);
                                 }
                                 terminal_dirty = true;
+                            }
+                            // The sign-in view is the TUI's own.
+                            UiAction::ShowSignIn => {}
+                            UiAction::SubmitSignInCode(code) => {
+                                if let Some(login) = &subscription_login {
+                                    let _ = login.codes.send(code);
+                                }
                             }
                             UiAction::SetModelFallback(chain) => {
                                 let notice = match agent_config_path.as_deref() {
@@ -9274,10 +9282,7 @@ pub(crate) async fn login_command(
         let lane = provider_lane(provider)
             .with_context(|| format!("{} keeps no subscription logins", provider.label()))?;
         if lane.auth_provider().is_some() && !api_key {
-            borg_remote::login_provider_account_with_output(provider, &name, |line| {
-                println!("{line}")
-            })
-            .await?;
+            terminal_subscription_login(provider, Some(&name), true).await?;
             return Ok(());
         }
         // A key-billed plan is connected by pasting its key, so naming one
@@ -9664,8 +9669,53 @@ async fn authenticate_provider(provider: CodingProvider, api: bool) -> Result<St
     if provider == CodingProvider::Codex {
         keep_codex_api_key()?;
     }
-    login_provider(provider).await?;
+    terminal_subscription_login(provider, None, true).await?;
     select_subscription_billing(provider)
+}
+
+/// Sign in from a plain terminal. Claude, ChatGPT and Gemini print their
+/// link with a QR code for a phone; with `read_codes`, a code or address
+/// pasted back from a browser elsewhere is read from stdin. Other providers
+/// run their own CLI's login.
+async fn terminal_subscription_login(
+    provider: CodingProvider,
+    account: Option<&str>,
+    read_codes: bool,
+) -> Result<()> {
+    if !matches!(
+        provider,
+        CodingProvider::Codex | CodingProvider::Claude | CodingProvider::Gemini
+    ) {
+        return login_provider(provider).await;
+    }
+    let codes = read_codes.then(|| {
+        let (codes, pasted) = mpsc::unbounded_channel();
+        std::thread::spawn(move || {
+            for line in io::stdin().lines() {
+                let Ok(line) = line else { break };
+                if !line.trim().is_empty() && codes.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        pasted
+    });
+    let print = |line: &str| {
+        println!("{line}");
+        let qr = line
+            .split_whitespace()
+            .find(|word| word.starts_with("https://"))
+            .and_then(|url| borg_tui::sign_in_qr(url.trim_end_matches(['.', ',', ')'])));
+        for row in qr.into_iter().flatten() {
+            println!("\x1b[30;47m{row}\x1b[0m");
+        }
+    };
+    match account {
+        Some(name) => {
+            borg_remote::login_provider_account_with_output(provider, name, codes, print).await
+        }
+        None => borg_remote::login_provider_with_output(provider, codes, print).await,
+    }
 }
 
 /// Keep an API key that only Codex's own login file holds before a ChatGPT
@@ -9744,6 +9794,8 @@ struct SubscriptionLogin {
     lane: borg_provider::subscriptions::Lane,
     /// The login being added, or `None` to sign the current one in again.
     account: Option<String>,
+    /// Codes or addresses the user pastes back from a browser elsewhere.
+    codes: mpsc::UnboundedSender<String>,
     task: tokio::task::JoinHandle<Result<()>>,
 }
 
@@ -9753,6 +9805,7 @@ impl SubscriptionLogin {
         account: Option<String>,
     ) -> (Self, mpsc::UnboundedReceiver<String>) {
         let (output_tx, output) = mpsc::unbounded_channel();
+        let (codes, pasted) = mpsc::unbounded_channel();
         let provider = lane_provider(lane);
         let name = account.clone();
         let task = tokio::spawn(async move {
@@ -9761,15 +9814,22 @@ impl SubscriptionLogin {
             };
             match name {
                 Some(name) => {
-                    borg_remote::login_provider_account_with_output(provider, &name, send).await
+                    borg_remote::login_provider_account_with_output(
+                        provider,
+                        &name,
+                        Some(pasted),
+                        send,
+                    )
+                    .await
                 }
-                None => borg_remote::login_provider_with_output(provider, send).await,
+                None => borg_remote::login_provider_with_output(provider, Some(pasted), send).await,
             }
         });
         (
             Self {
                 lane,
                 account,
+                codes,
                 task,
             },
             output,

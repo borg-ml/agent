@@ -792,8 +792,29 @@ impl BrowserLogin {
         &self.authorize_url
     }
 
-    pub async fn complete(self) -> Result<SubscriptionAccount> {
-        let code = wait_for_callback(&self.listener, &self.state, self.deadline).await?;
+    /// Completes from the loopback callback or from `pasted` text: the
+    /// address a browser on another device landed on, which it cannot load.
+    /// Text that does not belong to this login calls `rejected` and the login
+    /// keeps waiting.
+    pub async fn complete(
+        self,
+        mut pasted: tokio::sync::mpsc::UnboundedReceiver<String>,
+        mut rejected: impl FnMut(),
+    ) -> Result<SubscriptionAccount> {
+        let code = {
+            let callback = wait_for_callback(&self.listener, &self.state, self.deadline);
+            tokio::pin!(callback);
+            loop {
+                tokio::select! {
+                    result = &mut callback => break result?,
+                    Some(text) = pasted.recv() => match parse_pasted(&text, &self.state) {
+                        Some(Ok(code)) => break code,
+                        Some(Err(())) => bail!("Google sign-in was not authorized; restart borg login gemini"),
+                        None => rejected(),
+                    },
+                }
+            }
+        };
         drop(self.listener);
         let Self {
             verifier,
@@ -902,6 +923,22 @@ fn parse_callback(header: &str, state: &str) -> Option<std::result::Result<Strin
         .strip_prefix("GET ")?
         .split(' ')
         .next()?;
+    parse_target(target, state)
+}
+
+/// A pasted redirect address, with or without its scheme.
+fn parse_pasted(text: &str, state: &str) -> Option<std::result::Result<String, ()>> {
+    let text = text.trim();
+    let url = if text.contains("://") {
+        reqwest::Url::parse(text)
+    } else {
+        reqwest::Url::parse(&format!("http://{text}"))
+    }
+    .ok()?;
+    parse_target(&format!("{}?{}", url.path(), url.query()?), state)
+}
+
+fn parse_target(target: &str, state: &str) -> Option<std::result::Result<String, ()>> {
     if target.split('?').next() != Some(REDIRECT_PATH) {
         return None;
     }
@@ -1016,6 +1053,24 @@ async fn response_json(response: reqwest::Response) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Over SSH the browser cannot load the loopback redirect; the address it
+    // shows is pasted instead, and only with this login's state.
+    #[test]
+    fn pasted_redirect_address_needs_this_logins_state() {
+        assert_eq!(
+            parse_pasted("localhost:51121/oauth-callback?state=s1&code=4%2F0Ab", "s1"),
+            Some(Ok("4/0Ab".to_string()))
+        );
+        assert_eq!(
+            parse_pasted(
+                "http://localhost:51121/oauth-callback?state=s2&code=x",
+                "s1"
+            ),
+            None
+        );
+        assert_eq!(parse_pasted("just-a-code", "s1"), None);
+    }
 
     /// Summary buckets drive `/usage` and multi-account balancing: Gemini's
     /// shared 5-hour and weekly pools are global (ordered 5-hour before

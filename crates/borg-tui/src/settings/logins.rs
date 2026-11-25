@@ -19,11 +19,18 @@ pub(crate) struct LaneView {
 }
 
 /// A browser or device sign-in the host is waiting on.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct SignIn {
     /// The provider's latest instruction, such as the device code to enter.
     pub(crate) status: String,
     pub(crate) url: Option<String>,
+    /// The code ChatGPT's device page asks for.
+    pub(crate) user_code: Option<String>,
+    /// Claude and Gemini finish from a code or address pasted back here.
+    pub(crate) accepts_code: bool,
+    pub(crate) pasted: String,
+    /// The full-screen view was put away; the Signing in row brings it back.
+    pub(crate) hidden: bool,
 }
 
 /// One login on a lane.
@@ -215,7 +222,7 @@ pub(crate) fn detail_rows(
                 sign_in.status
             ),
             SettingControl::Action(if sign_in.url.is_some() {
-                "Open sign-in page".to_string()
+                "Show sign-in".to_string()
             } else {
                 "Starting…".to_string()
             }),
@@ -454,10 +461,7 @@ pub(crate) fn action(
         SettingId::LaneSignIn(position) | SettingId::LaneReSignIn(position) => {
             let view = view(lanes, position)?;
             if let Some(sign_in) = &view.sign_in {
-                return sign_in
-                    .url
-                    .clone()
-                    .map(|url| UiAction::TerminalIo(TerminalIoRequest::open_link(url)));
+                return sign_in.url.is_some().then_some(UiAction::ShowSignIn);
             }
             if let Some(busy) = lanes.iter().find(|view| view.sign_in.is_some()) {
                 return Some(UiAction::Notice(format!(
@@ -640,6 +644,7 @@ mod tests {
         lanes[0].sign_in = Some(SignIn {
             status: "Open https://claude.ai/x to connect".to_string(),
             url: Some("https://claude.ai/x".to_string()),
+            ..SignIn::default()
         });
         lanes.push(LaneView {
             lane: Lane::Codex,
@@ -657,7 +662,7 @@ mod tests {
         assert!(row.description.contains("https://claude.ai/x"));
         assert!(matches!(
             action(claude, &lanes, &editor),
-            Some(UiAction::TerminalIo(_))
+            Some(UiAction::ShowSignIn)
         ));
         let codex = SettingId::LaneSignIn(lane_index(Lane::Codex));
         assert!(matches!(

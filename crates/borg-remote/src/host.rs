@@ -1394,13 +1394,9 @@ fn provider_login_command(provider: CodingProvider, mut command: Command) -> Res
     Ok(command)
 }
 
+/// Sign in a provider whose login belongs to its own CLI. Claude, ChatGPT and
+/// Gemini sign in natively through `login_provider_with_output`.
 pub async fn login_provider(provider: CodingProvider) -> Result<()> {
-    if matches!(
-        provider,
-        CodingProvider::Codex | CodingProvider::Claude | CodingProvider::Gemini
-    ) {
-        return login_provider_with_output(provider, |line| println!("{line}")).await;
-    }
     let command = if provider == CodingProvider::Muse {
         borg_provider::provider_bin::command(borg_provider::Runtime::Muse).await?
     } else {
@@ -1448,12 +1444,14 @@ async fn stream_provider_login_output(
 
 /// Run a provider's browser/device login without requiring a terminal and
 /// stream its user-facing output to a native frontend. Re-signs in the login
-/// the provider currently uses.
+/// the provider currently uses. `codes` carries text the user pastes back
+/// from a browser on another device; `None` when the frontend cannot.
 pub async fn login_provider_with_output(
     provider: CodingProvider,
+    codes: Option<mpsc::UnboundedReceiver<String>>,
     on_output: impl FnMut(&str) + Send,
 ) -> Result<()> {
-    login_subscription(provider, None, on_output).await
+    login_subscription(provider, None, codes, on_output).await
 }
 
 /// Connect an additional named subscription login and select it. Only Claude,
@@ -1462,6 +1460,7 @@ pub async fn login_provider_with_output(
 pub async fn login_provider_account_with_output(
     provider: CodingProvider,
     account: &str,
+    codes: Option<mpsc::UnboundedReceiver<String>>,
     on_output: impl FnMut(&str) + Send,
 ) -> Result<()> {
     anyhow::ensure!(
@@ -1471,14 +1470,32 @@ pub async fn login_provider_account_with_output(
         ),
         "named subscription accounts exist for Claude, ChatGPT and Gemini only"
     );
-    login_subscription(provider, Some(account), on_output).await
+    login_subscription(provider, Some(account), codes, on_output).await
+}
+
+const PASTE_ADDRESS_HINT: &str = " On another device, paste the address the browser lands on after you approve; that page does not load.";
+const PASTE_REJECTED: &str =
+    "That text is not from this sign-in. Paste the code or address from the newest link.";
+
+/// The browser that finishes a sign-in is on another device: over SSH, or on
+/// a Linux host without a graphical session.
+#[cfg(feature = "subscription-adapters")]
+fn browser_elsewhere() -> bool {
+    std::env::var_os("SSH_CONNECTION").is_some()
+        || std::env::var_os("SSH_TTY").is_some()
+        || (cfg!(target_os = "linux")
+            && std::env::var_os("DISPLAY").is_none()
+            && std::env::var_os("WAYLAND_DISPLAY").is_none())
 }
 
 async fn login_subscription(
     provider: CodingProvider,
     account: Option<&str>,
+    codes: Option<mpsc::UnboundedReceiver<String>>,
     mut on_output: impl FnMut(&str) + Send,
 ) -> Result<()> {
+    let pastes = codes.is_some();
+    let codes = codes.unwrap_or_else(|| mpsc::unbounded_channel().1);
     #[cfg(feature = "subscription-adapters")]
     if provider == CodingProvider::Claude {
         // Sign in to a Borg-owned login rather than Claude Code's: two
@@ -1500,12 +1517,34 @@ async fn login_subscription(
             .with_context(|| format!("create {}", directory.display()))?;
         let authority =
             borg_provider::claude_subscription::AuthAuthority::resolve(Some(&directory))?;
-        let login = borg_provider::claude_subscription::begin_browser_login(authority).await?;
-        on_output(&format!(
-            "Open {} to connect your Claude subscription (expires in 10 minutes).",
-            login.authorize_url()
-        ));
-        login.complete().await?;
+        let login = borg_provider::claude_subscription::begin_browser_login(
+            authority,
+            pastes && browser_elsewhere(),
+        )
+        .await?;
+        on_output(&if login.pastes_code() {
+            format!(
+                "Open {} to connect your Claude subscription, then paste the code it shows (expires in 10 minutes).",
+                login.authorize_url()
+            )
+        } else {
+            format!(
+                "Open {} to connect your Claude subscription (expires in 10 minutes).{}",
+                login.authorize_url(),
+                if pastes { PASTE_ADDRESS_HINT } else { "" }
+            )
+        });
+        let (rejected_tx, mut rejected) = mpsc::unbounded_channel();
+        let complete = login.complete(codes, move || {
+            let _ = rejected_tx.send(());
+        });
+        tokio::pin!(complete);
+        loop {
+            tokio::select! {
+                result = &mut complete => break result?,
+                Some(()) = rejected.recv() => on_output(PASTE_REJECTED),
+            }
+        }
         let connected = match account {
             Some(name) => {
                 borg_provider::subscription_accounts::register(
@@ -1580,10 +1619,21 @@ async fn login_subscription(
             borg_provider::gemini_subscription::TERMS_WARNING
         ));
         on_output(&format!(
-            "Open {} to connect your Gemini subscription with your Google account (expires in 10 minutes).",
-            login.authorize_url()
+            "Open {} to connect your Gemini subscription with your Google account (expires in 10 minutes).{}",
+            login.authorize_url(),
+            if pastes { PASTE_ADDRESS_HINT } else { "" }
         ));
-        let signed_in = login.complete().await?;
+        let (rejected_tx, mut rejected) = mpsc::unbounded_channel();
+        let complete = login.complete(codes, move || {
+            let _ = rejected_tx.send(());
+        });
+        tokio::pin!(complete);
+        let signed_in = loop {
+            tokio::select! {
+                result = &mut complete => break result?,
+                Some(()) = rejected.recv() => on_output(PASTE_REJECTED),
+            }
+        };
         let tier = signed_in
             .tier
             .map(|tier| format!(" ({tier})"))
