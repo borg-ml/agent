@@ -321,6 +321,10 @@ pub struct TranscriptCore {
     /// session is still Running, but it is waiting on others, not working.
     #[serde(default)]
     pub open_waits: HashSet<String>,
+    /// The same blocking waits, per child, from its forwarded events: a
+    /// child blocked in one is waiting, though its lifecycle says Running.
+    #[serde(default)]
+    pub child_open_waits: HashMap<Uuid, HashSet<String>>,
     pub subagent_snapshots: HashMap<Uuid, SubagentSnapshot>,
     /// Settled children dropped from `subagent_snapshots` to bound memory.
     /// Remembered by id so the team's inactive count stays the real total.
@@ -411,6 +415,7 @@ impl Default for TranscriptCore {
             live_turn_closed: false,
             waiting_on_watchers: false,
             open_waits: HashSet::new(),
+            child_open_waits: HashMap::new(),
             subagent_snapshots: HashMap::new(),
             pruned_settled_children: HashSet::new(),
             agent_names: HashMap::new(),
@@ -2792,6 +2797,7 @@ impl TranscriptCore {
                 self.reconcile_subagent_snapshot(&snapshot, true);
                 if let Some(child) = child_event {
                     self.observe_child_approval(child);
+                    self.observe_child_wait(child);
                 }
             }
             SessionEventKind::Error { message } => {
@@ -4625,17 +4631,55 @@ impl TranscriptCore {
 
     pub fn effective_subagent_snapshot(&self, child_id: Uuid) -> Option<SubagentSnapshot> {
         let child = self.subagent_snapshots.get(&child_id)?;
-        let Some(mut meta) = self
+        let mut snapshot = match self
             .child_meta_refs
             .get(&child_id)
             .and_then(|reference| reference.snapshot.clone())
-        else {
-            return Some(child.clone());
+        {
+            Some(mut meta) => {
+                // The metadata copy was cloned from an older child snapshot;
+                // it must not roll the child's last activity back.
+                meta.updated_at = meta.updated_at.max(child.updated_at);
+                meta
+            }
+            None => child.clone(),
         };
-        // The metadata copy was cloned from an older child snapshot; it must
-        // not roll the child's last activity back.
-        meta.updated_at = meta.updated_at.max(child.updated_at);
-        Some(meta)
+        if snapshot.lifecycle() == SubagentLifecycle::Running
+            && self
+                .child_open_waits
+                .get(&child_id)
+                .is_some_and(|waits| !waits.is_empty())
+        {
+            snapshot.lifecycle = Some(SubagentLifecycle::WaitingOnWatchers);
+        }
+        Some(snapshot)
+    }
+
+    fn observe_child_wait(&mut self, child: &SessionEvent) {
+        match &child.kind {
+            SessionEventKind::ToolStarted {
+                tool_call_id,
+                name,
+                input,
+                ..
+            } if is_blocking_wait(name, input) => {
+                self.child_open_waits
+                    .entry(child.session_id)
+                    .or_default()
+                    .insert(tool_call_id.clone());
+            }
+            SessionEventKind::ToolCompleted { tool_call_id, .. } => {
+                if let Some(waits) = self.child_open_waits.get_mut(&child.session_id) {
+                    waits.remove(tool_call_id);
+                }
+            }
+            SessionEventKind::TurnStarted { .. }
+            | SessionEventKind::TurnCompleted { .. }
+            | SessionEventKind::SessionStarted => {
+                self.child_open_waits.remove(&child.session_id);
+            }
+            _ => {}
+        }
     }
     pub fn subagent_summary(&self, child_id: Uuid) -> Option<crate::wire::ChildSummary> {
         let child = self.effective_subagent_snapshot(child_id)?;
@@ -5109,6 +5153,7 @@ impl TranscriptCore {
         let remove = settled.len().saturating_sub(64);
         for (_, id) in settled.into_iter().take(remove) {
             self.subagent_snapshots.remove(&id);
+            self.child_open_waits.remove(&id);
             self.pruned_settled_children.insert(id);
             self.agent_names.remove(&id);
             self.child_meta_refs.remove(&id);

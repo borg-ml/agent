@@ -506,6 +506,82 @@ fn worker_lifecycle_is_independent_of_reports_and_stale_deliveries() {
     );
 }
 
+// A child blocked in `wait_agent` is still Running, but the parent's roster
+// must say it is waiting on others rather than working.
+#[test]
+fn running_child_blocked_in_wait_agent_shows_waiting() {
+    use borg_agent_runtime::{
+        CodingProvider, SubagentActivityKind, SubagentLifecycle, SubagentSnapshot,
+        SubagentSourceCursor, SubagentStatus, SubagentUsage,
+    };
+    use borg_view::wire::Lifecycle;
+    let parent = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let now = chrono::Utc::now();
+    let mut agent = SubagentSnapshot {
+        session_id: child,
+        parent_session_id: parent,
+        task_name: "worker".into(),
+        status: SubagentStatus::Running,
+        lifecycle: Some(SubagentLifecycle::Running),
+        source: None,
+        provider: CodingProvider::Codex,
+        model: None,
+        effort: None,
+        fast: false,
+        ultrafast: false,
+        desktop: false,
+        cwd: ".".into(),
+        created_at: now,
+        updated_at: now,
+        detail: None,
+        final_text: None,
+        usage: SubagentUsage::default(),
+        interrupted_by: None,
+    };
+    let mut view = ViewReducer::new(parent, "parent".into());
+    let mut forward = |sequence: u64, child_kind: SessionEventKind| {
+        agent.source = Some(SubagentSourceCursor {
+            child_sequence: sequence,
+            revision: sequence,
+        });
+        view.apply(SessionEvent::new(
+            parent,
+            sequence,
+            SessionEventKind::SubagentActivity {
+                activity: SubagentActivityKind::Updated,
+                agent: agent.clone(),
+                event: Some(Box::new(SessionEvent::new(child, sequence, child_kind))),
+            },
+        ));
+        view.snapshot().meta.children[0].status.clone()
+    };
+    let started = forward(
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "wait-1".into(),
+            name: "wait_agent".into(),
+            input: serde_json::json!({}),
+            input_ref: None,
+            parent_tool_call_id: None,
+        },
+    );
+    assert!(matches!(started, Lifecycle::Waiting));
+    let finished = forward(
+        2,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "wait-1".into(),
+            output: "{}".into(),
+            output_ref: None,
+            is_error: false,
+            input: None,
+            input_ref: None,
+            parent_tool_call_id: None,
+        },
+    );
+    assert!(matches!(finished, Lifecycle::Running));
+}
+
 #[test]
 fn child_metadata_and_coordinator_state_share_a_child_journal_watermark() {
     use borg_agent_runtime::{

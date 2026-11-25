@@ -5,6 +5,10 @@ Git comparison.
 
 ## Unreleased (since 0.22.4)
 
+- A subagent blocked in `wait_agent` or `await_watchers` now shows as waiting in its
+  parent's agent roster and team summary, matching its own status bar, instead of
+  working.
+
 ## 0.22.4 (2026-11-24)
 
 - `[team] worker_concurrency` now applies live: running teams re-read it on every
