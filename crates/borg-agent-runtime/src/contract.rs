@@ -1402,13 +1402,47 @@ pub struct InactiveCapability {
     pub reason: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
 #[ts(export)]
 pub struct EffectiveCapabilities {
-    #[serde(default = "default_true")]
     pub director_eligible: bool,
     pub active: Vec<SessionCapability>,
     pub inactive: Vec<InactiveCapability>,
+}
+
+/// Journals written before a capability was retired (e.g. `telemetry`) must
+/// still replay, so unknown capability entries are dropped on read.
+impl<'de> Deserialize<'de> for EffectiveCapabilities {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Entry<T> {
+            Known(T),
+            Retired(serde::de::IgnoredAny),
+        }
+        #[derive(Deserialize)]
+        struct Wire {
+            #[serde(default = "default_true")]
+            director_eligible: bool,
+            active: Vec<Entry<SessionCapability>>,
+            inactive: Vec<Entry<InactiveCapability>>,
+        }
+        fn known<T>(entries: Vec<Entry<T>>) -> Vec<T> {
+            entries
+                .into_iter()
+                .filter_map(|entry| match entry {
+                    Entry::Known(value) => Some(value),
+                    Entry::Retired(_) => None,
+                })
+                .collect()
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(Self {
+            director_eligible: wire.director_eligible,
+            active: known(wire.active),
+            inactive: known(wire.inactive),
+        })
+    }
 }
 
 impl SessionCapabilities {
@@ -3124,6 +3158,18 @@ impl SessionEvent {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
+    #[test]
+    fn journaled_capabilities_replay_after_a_capability_is_retired() {
+        let effective: EffectiveCapabilities = serde_json::from_str(
+            r#"{"active":["subagents","telemetry"],"inactive":[{"capability":"telemetry","reason":"disabled"},{"capability":"web_relay","reason":"requires cloud_sync"}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(effective.active, vec![SessionCapability::Subagents]);
+        assert_eq!(effective.inactive.len(), 1);
+        assert_eq!(effective.inactive[0].capability, SessionCapability::WebRelay);
+    }
 
     #[test]
     fn workflow_runtime_profiles_are_stable_and_user_selectable() {
