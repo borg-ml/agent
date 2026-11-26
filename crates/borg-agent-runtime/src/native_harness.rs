@@ -1634,7 +1634,11 @@ impl NativeHarness {
                     },
                 });
             }
-            if result.finish_reason != "tool_calls" {
+            // Truncation was handled above, so these calls are complete. Claude
+            // can end a turn that calls a tool with `end_turn`, and several
+            // OpenAI-compatible models report `stop`; dropping the turn there
+            // discarded finished work.
+            if !matches!(result.finish_reason.as_str(), "tool_calls" | "stop") {
                 bail!(
                     "native provider returned tool calls with inconsistent finish reason `{}`",
                     result.finish_reason

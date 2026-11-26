@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.22.6)
 
+- A Claude turn that ends with a complete tool call and an `end_turn` stop
+  reason now runs the call instead of failing with "native provider returned
+  tool calls with inconsistent finish reason `stop`". Several
+  OpenAI-compatible models report `stop` the same way. Truncated tool calls are
+  still rejected.
+
 - A model, effort or speed change made while viewing a nested agent now
   shows in the TUI as soon as it is accepted. The status line read the agent
   from activity that only reaches its own parent's journal, so a grandchild
