@@ -376,7 +376,12 @@ impl EditorPreferences {
         let after = toml::Value::try_from(self)?;
         let mut current = toml::Value::try_from(Self::load_from(path)?)?;
         merge_preference_changes(&mut current, &before, &after);
-        let merged: Self = current.try_into()?;
+        let mut merged: Self = current.try_into()?;
+        // A model route is one choice. Merged field by field, another
+        // session's provider could be kept beside this session's model.
+        if self.interaction.last_model != previous.interaction.last_model {
+            merged.interaction.last_model = self.interaction.last_model.clone();
+        }
         merged.save_to(path)
     }
 
@@ -674,6 +679,48 @@ keep = true
         assert!(fs::read_to_string(&path).unwrap().contains("keep = true"));
         stale.save_changes_to(&stale, &path).unwrap();
         assert_eq!(EditorPreferences::load_from(&path).unwrap(), saved);
+    }
+
+    #[test]
+    fn concurrent_model_saves_never_mix_route_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("editor.toml");
+        let route = |provider, model: &str, effort: Option<&str>| {
+            Some(borg_remote::ModelRoute {
+                provider,
+                model: Some(model.to_string()),
+                effort: effort.map(str::to_string),
+                allow_api_billing: false,
+            })
+        };
+        let mut original = EditorPreferences::default();
+        original.interaction.last_model = route(
+            borg_remote::CodingProvider::OpenCode,
+            "opencode-go/deepseek-v4.1",
+            None,
+        );
+        original.save_to(&path).unwrap();
+        let mut claude = original.clone();
+        claude.interaction.last_model = route(
+            borg_remote::CodingProvider::Claude,
+            "claude-opus-5-5",
+            Some("high"),
+        );
+        claude.save_changes_to(&original, &path).unwrap();
+        // Another session switches models within OpenCode, so its provider
+        // field is unchanged.
+        let mut opencode = original.clone();
+        opencode.interaction.last_model = route(
+            borg_remote::CodingProvider::OpenCode,
+            "opencode-go/hungerg-free",
+            Some("medium"),
+        );
+        opencode.save_changes_to(&original, &path).unwrap();
+
+        assert_eq!(
+            EditorPreferences::load_from(&path).unwrap().interaction.last_model,
+            opencode.interaction.last_model
+        );
     }
 
     #[test]

@@ -2598,6 +2598,16 @@ async fn run_local_agent_session(
                 .interaction
                 .last_model
                 .clone()
+                // Never pair a remembered model with a provider that does not
+                // offer it; the next route or the provider default applies.
+                .filter(|route| {
+                    route.model.as_deref().is_none_or(|model| {
+                        route
+                            .provider
+                            .model_catalog()
+                            .is_none_or(|catalog| catalog.supports_model(model))
+                    })
+                })
                 .filter(route_ready)
                 .or_else(|| {
                     agent_config

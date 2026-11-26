@@ -11,6 +11,13 @@ Git comparison.
   line, and `<ul>`/`<ol>` with `<li>` become bullet or numbered lines instead of
   showing raw tags.
 
+- A new session no longer starts on one provider with another provider's
+  model (for example Claude with `opencode-go/hungerg-free`), which failed the
+  first prompt with "unknown Claude model". Two sessions saving their last
+  model at the same time could mix the provider of one with the model of the
+  other; the remembered route is now saved whole, and a remembered model its
+  provider does not offer is ignored at startup.
+
 ## 0.22.6 (2026-11-25)
 
 - Signing in to Claude, ChatGPT or Gemini from a terminal with no browser no
