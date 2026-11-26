@@ -236,7 +236,9 @@ impl SubagentCoordinator {
                 if !self.unseen(actor).await?.is_empty() {
                     settle_at = Some(tokio::time::Instant::now() + COALESCE);
                 } else {
-                    if !self.is_awaiting_reply(actor) && !self.children(actor).await.iter().any(working) {
+                    if !self.is_awaiting_reply(actor)
+                        && !self.children(actor).await.iter().any(working)
+                    {
                         // A failed admission may remove the last reservation with
                         // no worker lifecycle event. Do not wait half an hour on it.
                         until = until.min(tokio::time::Instant::now() + IDLE_GRACE);

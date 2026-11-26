@@ -12747,7 +12747,10 @@ fn self_matching_pgrep_wait_loops_are_recognised() {
 async fn one_reply_answers_one_of_several_followups() {
     let (_directory, scratch, coordinator, _root, worker) = waiting_team().await;
     for text in ["first question", "second question"] {
-        coordinator.followup_task_as(worker, "/root", text).await.unwrap();
+        coordinator
+            .followup_task_as(worker, "/root", text)
+            .await
+            .unwrap();
     }
     let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
     assert!(coordinator.take_awaiting_reply(worker, first));

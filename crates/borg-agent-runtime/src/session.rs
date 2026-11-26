@@ -4287,9 +4287,9 @@ async fn run_agent_session_store_kernel_inner(
                         // sent is acted on, not filed as a queued report.
                         let answers_followup = actor == EventActor::System
                             && !is_autonomy
-                            && subagents
-                                .as_ref()
-                                .is_some_and(|team| team.take_awaiting_reply(session_id, message_id));
+                            && subagents.as_ref().is_some_and(|team| {
+                                team.take_awaiting_reply(session_id, message_id)
+                            });
                         if actor == EventActor::System
                             && !is_autonomy
                             && (delivery == PromptDelivery::Queue
