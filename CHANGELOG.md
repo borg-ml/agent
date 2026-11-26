@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.22.6)
 
+- A model, effort or speed change made while viewing a nested agent now
+  shows in the TUI as soon as it is accepted. The status line read the agent
+  from activity that only reaches its own parent's journal, so a grandchild
+  kept showing its old model.
+
 - Escape, prompts and model changes no longer wait minutes behind a busy
   team. Every journal write rewrote the session's whole projected state, about
   100 KB for a director with many agents, once per event, so a backlog of 256

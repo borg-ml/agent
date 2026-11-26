@@ -4760,13 +4760,19 @@ impl BorgTerminal {
             outcome: borg_remote::SubagentControlOutcome::Accepted { agent },
             ..
         } = &event.kind
-            && self
+        {
+            // The accepted snapshot is the agent's configuration after the
+            // action. A grandchild's own activity reaches only its parent's
+            // journal, so without this a model change stayed invisible here.
+            self.seed_team_roster(std::slice::from_ref(agent));
+            if self
                 .sidecar_focus_request
                 .as_deref()
                 .is_some_and(|task_name| task_name == agent.task_name)
-        {
-            self.focus_child_transcript(agent.session_id);
-            self.sidecar_focus_request = None;
+            {
+                self.focus_child_transcript(agent.session_id);
+                self.sidecar_focus_request = None;
+            }
         }
         let previous_config = self.transcript.config.clone();
         let previous_director_config = self
