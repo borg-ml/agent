@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.22.6)
 
+- Markdown tables in the TUI are framed with a top and bottom border, so the
+  last row no longer looks cut off where the next paragraph begins. Inline
+  HTML that models put in table cells is laid out: `<br>` and `<p>` start a new
+  line, and `<ul>`/`<ol>` with `<li>` become bullet or numbered lines instead of
+  showing raw tags.
+
 ## 0.22.6 (2026-11-25)
 
 - Signing in to Claude, ChatGPT or Gemini from a terminal with no browser no

@@ -158,7 +158,7 @@ fn render_markdown_lines(
             }
             MarkdownEvent::Html(html) | MarkdownEvent::InlineHtml(html) => {
                 if let Some(table) = table.as_mut() {
-                    table.push_text(&html);
+                    table.push_html(&html);
                 } else if code_block.is_some() {
                     code.push_str(&html);
                 } else {
@@ -816,6 +816,8 @@ struct MarkdownTable {
     rows: Vec<Vec<String>>,
     row: Vec<String>,
     cell: String,
+    /// Open HTML lists in the cell: `None` for `<ul>`, the next number for `<ol>`.
+    lists: Vec<Option<u64>>,
 }
 
 impl MarkdownTable {
@@ -825,6 +827,7 @@ impl MarkdownTable {
             rows: Vec::new(),
             row: Vec::new(),
             cell: String::new(),
+            lists: Vec::new(),
         }
     }
 
@@ -834,10 +837,55 @@ impl MarkdownTable {
 
     fn start_cell(&mut self) {
         self.cell.clear();
+        self.lists.clear();
     }
 
     fn push_text(&mut self, text: &str) {
         self.cell.push_str(text);
+    }
+
+    /// A Markdown cell cannot hold a line break or a list, so models write
+    /// them as inline HTML. Lay those out as lines; keep other HTML literal.
+    fn push_html(&mut self, html: &str) {
+        let tag = html
+            .trim()
+            .strip_prefix('<')
+            .and_then(|tag| tag.strip_suffix('>'))
+            .unwrap_or_default();
+        let closing = tag.starts_with('/');
+        let name = tag
+            .trim_start_matches('/')
+            .split(|character: char| character.is_whitespace() || character == '/')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        match (name.as_str(), closing) {
+            ("br" | "p", _) => self.cell_line_break(),
+            ("ul", false) => self.lists.push(None),
+            ("ol", false) => self.lists.push(Some(1)),
+            ("ul" | "ol", true) => {
+                self.lists.pop();
+                self.cell_line_break();
+            }
+            ("li", false) => {
+                self.cell_line_break();
+                match self.lists.last_mut() {
+                    Some(Some(index)) => {
+                        self.cell.push_str(&format!("{index}. "));
+                        *index += 1;
+                    }
+                    _ => self.cell.push_str("• "),
+                }
+            }
+            ("li", true) => {}
+            _ => self.cell.push_str(html),
+        }
+    }
+
+    fn cell_line_break(&mut self) {
+        if !self.cell.trim().is_empty() && !self.cell.ends_with('\n') {
+            self.cell.push('\n');
+        }
     }
 
     fn finish_cell(&mut self) {
@@ -887,10 +935,10 @@ impl MarkdownTable {
             .skip(1)
             .any(|cells| cells.iter().any(|lines| lines.len() > 1));
 
-        let mut output = Vec::new();
+        let mut output = vec![table_rule_line(&column_widths, ['┌', '┬', '┐'])];
         for (row_index, cells) in rows.iter().enumerate() {
             if row_index > 1 && separate_rows {
-                output.push(table_rule_line(&column_widths));
+                output.push(table_rule_line(&column_widths, ['├', '┼', '┤']));
             }
             output.extend(table_row_lines(
                 cells,
@@ -903,9 +951,10 @@ impl MarkdownTable {
                 },
             ));
             if row_index == 0 {
-                output.push(table_rule_line(&column_widths));
+                output.push(table_rule_line(&column_widths, ['├', '┼', '┤']));
             }
         }
+        output.push(table_rule_line(&column_widths, ['└', '┴', '┘']));
         output
     }
 
@@ -915,7 +964,8 @@ impl MarkdownTable {
                 self.rows
                     .iter()
                     .filter_map(|row| row.get(column))
-                    .map(|cell| UnicodeWidthStr::width(cell.as_str()))
+                    .flat_map(|cell| cell.lines())
+                    .map(UnicodeWidthStr::width)
                     .max()
                     .unwrap_or(1)
                     .max(1)
@@ -1008,14 +1058,14 @@ fn table_row_lines(
         .collect()
 }
 
-fn table_rule_line(widths: &[usize]) -> Line<'static> {
-    let mut rule = String::from("├");
+fn table_rule_line(widths: &[usize], [left, middle, right]: [char; 3]) -> Line<'static> {
+    let mut rule = String::from(left);
     for (index, width) in widths.iter().copied().enumerate() {
         rule.push_str(&"─".repeat(width + 2));
         rule.push(if index + 1 == widths.len() {
-            '┤'
+            right
         } else {
-            '┼'
+            middle
         });
     }
     Line::from(Span::styled(rule, Style::default().fg(Color::DarkGray)))
@@ -1039,7 +1089,7 @@ fn render_stacked_table(rows: &[Vec<String>], width: usize, style: Style) -> Vec
             let prefix = format!("{header}: ");
             let prefix_width = UnicodeWidthStr::width(prefix.as_str());
             let value_width = UnicodeWidthStr::width(value.as_str());
-            if prefix_width.saturating_add(value_width) > width {
+            if prefix_width.saturating_add(value_width) > width || value.contains('\n') {
                 for header_line in wrap_table_cell(prefix.trim_end(), width) {
                     output.push(Line::from(Span::styled(
                         header_line,
@@ -1227,6 +1277,30 @@ mod tests {
             elapsed < std::time::Duration::from_millis(25),
             "oversized markdown table balancing exceeded 25 ms: {elapsed:?}"
         );
+    }
+
+    /// A model's inline HTML list in a cell becomes bullet lines, and the
+    /// table closes before the next paragraph instead of running into it.
+    #[test]
+    fn table_cells_lay_out_html_lists_inside_a_closed_frame() {
+        let markdown = "| Worker | Building |\n|---|---|\n| Core | plus: <ul><li>pens</li><li>mood<br/>sound</li></ul> |\n\nAfter.";
+        let lines = markdown_lines(markdown, 40, None)
+            .iter()
+            .map(Line::to_string)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        assert!(lines[0].starts_with('┌'), "{lines:#?}");
+        let bottom = lines.iter().position(|line| line.starts_with('└'));
+        assert_eq!(bottom, Some(lines.len() - 2), "{lines:#?}");
+        assert!(lines.iter().all(|line| !line.contains('<')), "{lines:#?}");
+        for cell in ["plus:", "• pens", "• mood", "sound"] {
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains(&format!("│ {cell} "))),
+                "{cell}: {lines:#?}"
+            );
+        }
     }
 
     #[test]
