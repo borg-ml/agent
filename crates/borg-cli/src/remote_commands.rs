@@ -4994,20 +4994,25 @@ async fn run_local_agent_session(
                             if schema_rejected && stale_local_owner {
                                 tracing::info!(%session_id, "recovering obsolete owner after schema rejection");
                             } else if let Some(terminal) = terminal.as_mut() {
+                                let apply_started = std::time::Instant::now();
+                                let event_dirtied = terminal.apply_session_event(&event);
+                                terminal_dirty |= event_dirtied;
+                                tui_timing.observe("event_apply", apply_started.elapsed(), queued_events);
                                 let stream_text = session_event_contains_stream_text(&event.kind);
-                                let stream_burst_started = stream_text && {
+                                // Streamed text suspends the activity ticks only while it
+                                // is painted by the render tick. Hidden child deltas do not
+                                // dirty the terminal, so they must not stop spinners.
+                                let painted_stream_text = stream_text && event_dirtied;
+                                let stream_burst_started = painted_stream_text && {
                                     let now = tokio::time::Instant::now();
                                     let started = should_wake_stream_burst(last_stream_text_at, now);
                                     last_stream_text_at = Some(now);
                                     started
                                 };
-                                if stream_text {
+                                if painted_stream_text {
                                     tool_started_frame_hold_until = None;
                                     streaming_frame_pending = true;
                                 }
-                                let apply_started = std::time::Instant::now();
-                                terminal_dirty |= terminal.apply_session_event(&event);
-                                tui_timing.observe("event_apply", apply_started.elapsed(), queued_events);
                                 if stream_text
                                     && session_event_has_fresh_timestamp(&event.kind)
                                     && event_age_ms < 600_000

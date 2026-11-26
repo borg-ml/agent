@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.22.6)
 
+- The TUI no longer freezes its spinners and timers while subagents stream
+  text you are not looking at. Hidden child output kept the frame loop in
+  "streaming" mode without anything to paint, so nothing redrew until another
+  visible change arrived; busy teams could leave the screen frozen for long
+  stretches.
+
 - The status line no longer shows "ready" for a whole turn after Esc sends
   pending input while the session is idle. The stop acknowledgement now ends
   when a new turn starts, not only when the stopped turn completes, so the
