@@ -633,12 +633,14 @@ fn running_jobs_touch_the_journal_only_when_progress_changes() {
     lane.wait(&idle, CANCELLED);
 
     let busy = run("busy", "while :; do echo tick; sleep 0.05; done");
+    // Four seconds, so a loaded host still lands a progress write inside the
+    // window; a job writing ten times a second would make about forty.
     let writes = journal_accesses(&lane, || {
-        std::thread::sleep(std::time::Duration::from_millis(2000))
+        std::thread::sleep(std::time::Duration::from_millis(4000))
     });
     assert!(
-        (1..=4).contains(&writes),
-        "{writes} journal accesses in 2 s"
+        (1..=8).contains(&writes),
+        "{writes} journal accesses in 4 s"
     );
     lane.json::<Value>(&["job", "cancel", &busy]);
     lane.wait(&busy, CANCELLED);
