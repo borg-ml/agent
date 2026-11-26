@@ -80,13 +80,18 @@ pub(crate) fn render(frame: &mut Frame<'_>, provider: &str, sign_in: &SignIn) {
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    rows.push((String::new(), Style::default()));
-    rows.push((
-        "Scan with your phone, or open:".to_string(),
-        Style::default().fg(MUTED),
-    ));
+    // The wrapped link goes where `link_at` marks, unless it would crowd out
+    // the QR code: Ctrl+Y copies the link, so the code wins the space.
+    let link_at = rows.len();
+    let mut link_rows = vec![
+        (String::new(), Style::default()),
+        (
+            "Scan with your phone, or open:".to_string(),
+            Style::default().fg(MUTED),
+        ),
+    ];
     for row in chunks(url, text_width) {
-        rows.push((
+        link_rows.push((
             row,
             Style::default()
                 .fg(Color::White)
@@ -120,12 +125,29 @@ pub(crate) fn render(frame: &mut Frame<'_>, provider: &str, sign_in: &SignIn) {
     } else {
         "Ctrl+Y copy link · Ctrl+O open in browser · Esc hide"
     };
-    // Title, blank, rows, blank, footer.
+    // Title, blank, rows, blank, footer; the short form keeps a one-row hint
+    // in place of the link. The code may use the whole terminal, not only the
+    // text column: a long sign-in link makes it wider than that column.
     let chrome = rows.len() as u16 + 4;
     let qr = qr_lines(url).filter(|qr| {
         let wide = qr.first().map_or(0, |row| row.chars().count()) as u16;
-        wide <= area.width && qr.len() as u16 + chrome <= area.height
+        wide <= full.width && qr.len() as u16 + chrome + 2 <= full.height
     });
+    let link_fits = qr
+        .as_ref()
+        .is_none_or(|qr| qr.len() as u16 + chrome + link_rows.len() as u16 <= full.height);
+    let link_rows = if link_fits {
+        link_rows
+    } else {
+        vec![
+            (String::new(), Style::default()),
+            (
+                "Scan with your phone · Ctrl+Y copies the link".to_string(),
+                Style::default().fg(MUTED),
+            ),
+        ]
+    };
+    rows.splice(link_at..link_at, link_rows);
     let buffer = frame.buffer_mut();
     let mut y = area.y + 1;
     let right = area.right();
@@ -144,7 +166,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, provider: &str, sign_in: &SignIn) {
     match &qr {
         Some(qr) => {
             let wide = qr.first().map_or(0, |row| row.chars().count()) as u16;
-            let x = area.x + (area.width - wide) / 2;
+            let x = full.x + (full.width - wide) / 2;
             for row in qr {
                 put(
                     y,

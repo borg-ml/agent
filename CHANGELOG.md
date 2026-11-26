@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.22.6)
 
+- The sign-in view shows its QR code whenever the terminal can physically fit
+  it. It used to require the code to fit inside the 96-column text column
+  together with the fully wrapped sign-in link, so a long sign-in link said
+  "Enlarge the terminal" at any size. The code now uses the whole terminal, and
+  the wrapped link gives way to a one-line hint (Ctrl+Y still copies it).
+
 - A goal whose agent can only wait now blocks instead of continuing. Turns
   that did nothing but wait for agents or watchers counted as progress, so a
   director that kept reporting the same blocker was prompted to continue
