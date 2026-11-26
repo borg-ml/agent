@@ -1128,6 +1128,29 @@ impl RuntimeSessionStore {
         self.deferred.push(event);
     }
 
+    /// Commit a pending run together with `event` when it can share the run's
+    /// transaction, so recording after deferred output costs one commit rather
+    /// than two. Returns the event untouched when it must be written alone: a
+    /// live or coalesced event, or one whose workspace delivery row settles on
+    /// append.
+    async fn flush_deferred_with(
+        &mut self,
+        events: &mpsc::Sender<SessionEvent>,
+        event: SessionEvent,
+    ) -> Result<Option<SessionEvent>> {
+        let shares_run = !self.deferred.is_empty()
+            && matches!(event.kind.persistence(), crate::EventPersistence::Durable)
+            && !(self.workspace_projection.is_some()
+                && WorkspaceProjection::needs_delivery_transition(&event));
+        if !shares_run {
+            self.flush_deferred().await?;
+            return Ok(Some(event));
+        }
+        self.defer(events, event);
+        self.flush_deferred().await?;
+        Ok(None)
+    }
+
     /// Commit and deliver the deferred run. Every other write and delivery
     /// path calls this first, so journal and delivery order stay exactly the
     /// order in which events were recorded.
@@ -7636,12 +7659,20 @@ async fn run_agent_session_store_kernel_inner(
                                             &mut goal_active_since,
                                         ).await?;
                                     }
-                                    let terminal = vec![SessionEventKind::StatusChanged {
-                                        status: SessionStatus::Running,
-                                        lifecycle: Some(SubagentLifecycle::Running),
-                                        detail: Some(TurnPhase::Cancelling.detail().to_string()),
-                                    }];
-                                    record_all(&mut journal, &events, session_id, terminal).await?;
+                                    // Commits with the turn's settlement: the
+                                    // viewer already shows the stop it asked for.
+                                    journal.defer(
+                                        &events,
+                                        SessionEvent::new(
+                                            session_id,
+                                            0,
+                                            SessionEventKind::StatusChanged {
+                                                status: SessionStatus::Running,
+                                                lifecycle: Some(SubagentLifecycle::Running),
+                                                detail: Some(TurnPhase::Cancelling.detail().to_string()),
+                                            },
+                                        ),
+                                    );
                                     Ok::<(), anyhow::Error>(())
                                 }
                             );
@@ -8146,6 +8177,7 @@ async fn run_agent_session_store_kernel_inner(
                         push_coalesced_provider_event(&mut provider_batch, kind);
                     }
                     let mut remaining = VecDeque::from(provider_batch);
+                    let mut cut_short = false;
                     while let Some(kind) = remaining.pop_front() {
                         // Control does not queue behind provider output. Checked
                         // between events and before this event own durable work,
@@ -8165,6 +8197,7 @@ async fn run_agent_session_store_kernel_inner(
                             if cancellation {
                                 provider_carry.push_back(kind);
                                 provider_carry.append(&mut remaining);
+                                cut_short = true;
                                 break;
                             }
                         }
@@ -8306,7 +8339,12 @@ async fn run_agent_session_store_kernel_inner(
                         .await?;
                     }
                     }
-                    journal.flush_deferred().await?;
+                    // A cancellation settles what this batch deferred together
+                    // with the turn's tail: committing it first put one more
+                    // journal write between the Escape and its effect.
+                    if !cut_short {
+                        journal.flush_deferred().await?;
+                    }
                 }
                 Some(kind) = receipt_rx.recv() => {
                     let _trace = SessionBranchTrace::begin(trace_loop, &actor_step, session_id, "receipt", provider_events.len() + provider_carry.len());
@@ -16122,12 +16160,15 @@ async fn record(
     {
         return Ok(());
     }
-    journal.flush_deferred().await?;
+    let Some(event) = journal
+        .flush_deferred_with(events, SessionEvent::new(session_id, 0, kind))
+        .await?
+    else {
+        return Ok(());
+    };
     let preceding_diagnostics = journal.take_projection_diagnostics();
-    let persistence = kind.persistence();
-    let event = journal
-        .append(SessionEvent::new(session_id, 0, kind))
-        .await?;
+    let persistence = event.kind.persistence();
+    let event = journal.append(event).await?;
     let following_diagnostics = journal.take_projection_diagnostics();
     for diagnostic in preceding_diagnostics {
         deliver_recorded_event(
@@ -16166,6 +16207,16 @@ async fn record_all(
 ) -> Result<()> {
     if kinds.is_empty() {
         return Ok(());
+    }
+    if kinds
+        .iter()
+        .all(|kind| matches!(kind.persistence(), crate::EventPersistence::Durable))
+    {
+        // Same settlement, one transaction with the output it follows.
+        for kind in kinds {
+            journal.defer(events, SessionEvent::new(session_id, 0, kind));
+        }
+        return journal.flush_deferred().await;
     }
     journal.flush_deferred().await?;
     let preceding_diagnostics = journal.take_projection_diagnostics();

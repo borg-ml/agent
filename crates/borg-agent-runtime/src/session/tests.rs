@@ -27133,7 +27133,7 @@ async fn escape_does_not_commit_the_turn_backlog_one_event_at_a_time() {
     command_tx.send(HostCommand::Stop { session_id }).await.ok();
     let _ = tokio::time::timeout(Duration::from_secs(30), actor).await;
     observer.abort();
-    // About four commits; the per-event drain took over a hundred.
+    // A few commits; the per-event drain took over a hundred.
     assert!(
         completed < Duration::from_secs(5),
         "the turn ended {completed:?} after Escape with {commit_ms}ms commits"
