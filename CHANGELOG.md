@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.22.6)
 
+- Clicking beside a screenshot in the TUI no longer opens it. On graphics
+  terminals the clickable area of an image spanned the whole transcript width,
+  but a screenshot capped at 24 rows often fills only part of it. Only the
+  picture itself and its caption open the file now.
+
 - Busy teams no longer stall every session on the host. Each journal write
   sent its Postgres wakeup (NOTIFY) inside its own transaction, which holds
   one cluster-wide lock until the commit reaches disk, so all writes from all

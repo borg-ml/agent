@@ -20965,7 +20965,8 @@ fn graphics_preview_is_scaled_down_to_a_bounded_tile() {
 #[test]
 fn graphics_preview_does_not_add_a_partial_row_below_screenshot() {
     // At 480 px wide this 16:9 image is 270 px high: fit it into 13
-    // complete 20 px rows rather than drawing a stray fourteenth row.
+    // complete 20 px rows rather than drawing a stray fourteenth row. Those
+    // rows narrow it to 58 columns, and only those columns open the image.
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("shot.png");
     image::RgbImage::from_pixel(2560, 1440, image::Rgb([10, 20, 30]))
@@ -20973,7 +20974,7 @@ fn graphics_preview_does_not_add_a_partial_row_below_screenshot() {
         .unwrap();
     assert_eq!(
         attachments::graphics_preview_rows(&path, 60, (8, 20), 24),
-        Some(13)
+        Some((58, 13))
     );
 }
 

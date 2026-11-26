@@ -19967,7 +19967,9 @@ fn composer_terminal_cursor_style(style: ComposerCursorStyle) -> SetCursorStyle 
 }
 
 /// One attachment tile in the rendered transcript: consecutive link rows that
-/// share the same image file and column span, minus the trailing label row.
+/// share the same image file and start column, minus the trailing label row.
+/// The picture rows span the columns the image covers; the label is narrower
+/// or wider, so the width comes from the first row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ImagePreviewSlot {
     path: PathBuf,
@@ -19986,7 +19988,6 @@ fn image_preview_slots(links: &[LinkRowRange]) -> Vec<ImagePreviewSlot> {
         while end < links.len()
             && links[end].url == first.url
             && links[end].start == first.start
-            && links[end].end == first.end
             && links[end].row == links[end - 1].row + 1
         {
             end += 1;

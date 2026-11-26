@@ -628,7 +628,8 @@ struct AgentRosterEntry {
 
 #[derive(Default)]
 struct MessageMarkdownCache {
-    previews: HashMap<(PathBuf, usize, usize), Vec<Line<'static>>>,
+    /// A tile's rows and the columns its picture covers.
+    previews: HashMap<(PathBuf, usize, usize), (usize, Vec<Line<'static>>)>,
     messages: HashMap<(usize, usize), MarkdownRender>,
     #[cfg(test)]
     misses: usize,
@@ -654,6 +655,11 @@ const GLYPH_PREVIEW_TILE_ROWS: usize = 24;
 /// Rows a graphics preview may reserve. A larger image is scaled down to fit,
 /// so one screenshot cannot bury the transcript; its link opens it full size.
 const MAX_GRAPHICS_PREVIEW_ROWS: usize = 24;
+
+fn glyph_tile(lines: Option<Vec<Line<'static>>>) -> (usize, Vec<Line<'static>>) {
+    let lines = lines.unwrap_or_default();
+    (lines.iter().map(Line::width).max().unwrap_or(0), lines)
+}
 
 impl Default for Transcript {
     fn default() -> Self {
@@ -3322,7 +3328,7 @@ impl Transcript {
                                     .or_insert_with(|| {
                                         match self.image_cell {
                                             Some(cell) => {
-                                                if let Some(rows) =
+                                                if let Some((columns, rows)) =
                                                     attachments::graphics_preview_rows(
                                                         path,
                                                         tile_width,
@@ -3333,28 +3339,30 @@ impl Transcript {
                                                     // The graphics protocol draws
                                                     // over these rows; reserving
                                                     // them is what sizes the image.
-                                                    vec![Line::default(); rows]
+                                                    (columns, vec![Line::default(); rows])
                                                 } else {
                                                     // Unreadable size: a glyph
                                                     // tile at least shows shape.
-                                                    attachments::preview(
+                                                    glyph_tile(attachments::preview(
                                                         path,
                                                         available.min(GLYPH_PREVIEW_TILE_WIDTH),
                                                         GLYPH_PREVIEW_TILE_ROWS,
-                                                    )
-                                                    .unwrap_or_default()
+                                                    ))
                                                 }
                                             }
-                                            None => {
-                                                attachments::preview(path, tile_width, tile_rows)
-                                                    .unwrap_or_default()
-                                            }
+                                            None => glyph_tile(attachments::preview(
+                                                path, tile_width, tile_rows,
+                                            )),
                                         }
                                     })
                                     .clone()
                             })
                             .collect::<Vec<_>>();
-                        let height = previews.iter().map(Vec::len).max().unwrap_or(0);
+                        let height = previews
+                            .iter()
+                            .map(|(_, rows)| rows.len())
+                            .max()
+                            .unwrap_or(0);
                         for row in 0..=height {
                             let mut line = Line::from("  ");
                             for (column, (number, path)) in group.iter().enumerate() {
@@ -3365,24 +3373,30 @@ impl Transcript {
                                     ));
                                 }
                                 let start = line.width();
-                                let tile = if row == height {
-                                    Line::from(Span::styled(
+                                let (covered, tile) = if row == height {
+                                    let caption = Line::from(Span::styled(
                                         truncate_table_cell(
                                             &self.preview_caption(*number, path),
                                             tile_width,
                                         ),
                                         Style::default().fg(Color::LightCyan),
-                                    ))
+                                    ));
+                                    (caption.width(), caption)
                                 } else {
-                                    previews[column].get(row).cloned().unwrap_or_default()
+                                    let (covered, rows) = &previews[column];
+                                    (*covered, rows.get(row).cloned().unwrap_or_default())
                                 };
                                 let padding = tile_width.saturating_sub(tile.width());
                                 line.spans.extend(tile.spans);
-                                if let Ok(url) = url::Url::from_file_path(path) {
+                                // Only the picture and its caption open the
+                                // file, not the blank cells beside them.
+                                if covered > 0
+                                    && let Ok(url) = url::Url::from_file_path(path)
+                                {
                                     link_rows.push(LinkRowRange {
                                         row: lines.len(),
                                         start,
-                                        end: start + tile_width,
+                                        end: start + covered,
                                         url: url.to_string(),
                                     });
                                 }

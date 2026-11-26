@@ -78,8 +78,8 @@ pub(super) fn preview(
     )
 }
 
-/// Rows a graphics preview needs at `width` columns so the image is drawn at
-/// its own resolution.
+/// Columns and rows a graphics preview covers at up to `width` columns so the
+/// image is drawn at its own resolution.
 ///
 /// One cell carries `cell` pixels, so the tile geometry *is* the resolution the
 /// reader sees: reserving the rows the image needs is what keeps text inside a
@@ -89,7 +89,7 @@ pub(super) fn graphics_preview_rows(
     width: usize,
     cell: (u16, u16),
     max_rows: usize,
-) -> Option<usize> {
+) -> Option<(usize, usize)> {
     if width == 0 || max_rows == 0 {
         return None;
     }
@@ -112,7 +112,12 @@ pub(super) fn graphics_preview_rows(
     // mostly-empty last row, which can look like a separate stripe below a
     // screenshot when the terminal composites the image over that row.
     let rows = (f64::from(image_height) * scale / cell_height).floor();
-    Some((rows.max(1.0) as usize).min(max_rows))
+    let rows = (rows.max(1.0) as usize).min(max_rows);
+    // The row cap can shrink the image below `width`: report the columns it
+    // actually covers so the blank cells beside it are not part of the tile.
+    let scale = scale.min(rows as f64 * cell_height / f64::from(image_height));
+    let columns = (f64::from(image_width) * scale / cell_width).ceil() as usize;
+    Some((columns.clamp(1, width), rows))
 }
 
 /// Decode an attachment for a terminal graphics protocol; bounded like `preview`.
