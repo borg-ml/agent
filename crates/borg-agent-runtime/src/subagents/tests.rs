@@ -10016,7 +10016,7 @@ async fn childless_wait_reads_queued_peer_reports_before_and_during_the_wait() {
             .followup_task_as(worker, "/root", "please report progress")
             .await
             .unwrap();
-        assert!(coordinator.awaiting_reply.lock().unwrap().contains(&worker));
+        assert!(coordinator.is_awaiting_reply(worker));
         let (steer, _) = coordinator
             .persist_team_message(
                 root,
@@ -10085,7 +10085,7 @@ async fn childless_wait_reads_queued_peer_reports_before_and_during_the_wait() {
         );
         assert_eq!(result["messages"][0]["text"], "repair is ready");
         assert!(
-            !coordinator.take_awaiting_reply(worker),
+            !coordinator.is_awaiting_reply(worker),
             "a returned report clears the outstanding reply wait"
         );
         let unread = coordinator
@@ -12739,4 +12739,22 @@ fn self_matching_pgrep_wait_loops_are_recognised() {
     ));
     assert!(!refused("for pid in $(pgrep -f cargo); do echo $pid; done"));
     assert!(!refused("echo 'while pgrep -f x; do sleep 1; done'"));
+}
+
+// A session that asked several peers keeps waiting until each has answered: one
+// reply (seen by both the wait and the prompt) answers one followup, not all.
+#[tokio::test]
+async fn one_reply_answers_one_of_several_followups() {
+    let (_directory, scratch, coordinator, _root, worker) = waiting_team().await;
+    for text in ["first question", "second question"] {
+        coordinator.followup_task_as(worker, "/root", text).await.unwrap();
+    }
+    let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+    assert!(coordinator.take_awaiting_reply(worker, first));
+    assert!(coordinator.take_awaiting_reply(worker, first));
+    assert!(coordinator.is_awaiting_reply(worker));
+    assert!(coordinator.take_awaiting_reply(worker, second));
+    assert!(!coordinator.is_awaiting_reply(worker));
+    assert!(!coordinator.take_awaiting_reply(worker, Uuid::new_v4()));
+    scratch.discard().await;
 }

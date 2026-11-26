@@ -4778,6 +4778,15 @@ pub struct TeamMessageOptions {
     pub idempotency_key: Option<String>,
 }
 
+/// A session's unanswered followup_tasks, and the latest team messages counted
+/// as answers (bounded) so one message is never counted twice.
+#[derive(Default)]
+struct AwaitingReplies {
+    outstanding: usize,
+    answered: std::collections::VecDeque<Uuid>,
+}
+const AWAITING_REPLY_MEMORY: usize = 64;
+
 struct RoutedTeamMessage {
     receipt: Option<WorkspaceMessageReceipt>,
     dispatched_locally: bool,
@@ -4821,10 +4830,11 @@ pub struct SubagentCoordinator {
     root_message_tx: broadcast::Sender<TeamInboxMessage>,
     root_message_dispatches: Arc<Mutex<HashMap<Uuid, Instant>>>,
     projected_root_messages: Arc<Mutex<HashSet<Uuid>>>,
-    /// Sessions that sent a followup_task and have not heard back since. The
-    /// next team message to reach one while it is idle starts a turn, so a
-    /// reply is acted on instead of filed as a queued report.
-    awaiting_reply: Arc<std::sync::Mutex<HashSet<Uuid>>>,
+    /// Per session, the followup_tasks it sent that have not been answered.
+    /// Each team message reaching the session answers at most one, so a
+    /// session that asked three peers keeps waiting after the first reply,
+    /// and a reply is acted on instead of filed as a queued report.
+    awaiting_reply: Arc<std::sync::Mutex<HashMap<Uuid, AwaitingReplies>>>,
     consultation_lock: Arc<Mutex<()>>,
     configure_lock: Arc<Mutex<()>>,
     configuration_tx: broadcast::Sender<(Uuid, Uuid, std::result::Result<(), String>)>,
@@ -4892,7 +4902,7 @@ impl SubagentCoordinator {
             root_message_tx,
             root_message_dispatches: Arc::new(Mutex::new(HashMap::new())),
             projected_root_messages: Arc::new(Mutex::new(HashSet::new())),
-            awaiting_reply: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            awaiting_reply: Arc::new(std::sync::Mutex::new(HashMap::new())),
             consultation_lock: Arc::new(Mutex::new(())),
             configure_lock: Arc::new(Mutex::new(())),
             configuration_tx: broadcast::channel(16).0,
@@ -8168,13 +8178,38 @@ impl SubagentCoordinator {
             .map(|_| ())
     }
 
-    /// Whether `session_id` sent a followup_task it has not had an answer to;
-    /// taking it clears the wait, so one reply wakes the session once.
-    pub(crate) fn take_awaiting_reply(&self, session_id: Uuid) -> bool {
+    /// Whether `session_id` has a followup_task still unanswered.
+    pub(crate) fn is_awaiting_reply(&self, session_id: Uuid) -> bool {
         self.awaiting_reply
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&session_id)
+            .get(&session_id)
+            .is_some_and(|replies| replies.outstanding > 0)
+    }
+
+    /// Counts team message `message_id` reaching `session_id` as the answer to
+    /// one of its unanswered followup_tasks. True when it is one, also when it
+    /// was already counted (the wait and the prompt both see a message).
+    pub(crate) fn take_awaiting_reply(&self, session_id: Uuid, message_id: Uuid) -> bool {
+        let mut awaiting = self
+            .awaiting_reply
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(replies) = awaiting.get_mut(&session_id) else {
+            return false;
+        };
+        if replies.answered.contains(&message_id) {
+            return true;
+        }
+        if replies.outstanding == 0 {
+            return false;
+        }
+        replies.outstanding -= 1;
+        if replies.answered.len() == AWAITING_REPLY_MEMORY {
+            replies.answered.pop_front();
+        }
+        replies.answered.push_back(message_id);
+        true
     }
 
     async fn route_followup_task_with_options_as(
@@ -8188,7 +8223,9 @@ impl SubagentCoordinator {
         self.awaiting_reply
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(actor_session_id);
+            .entry(actor_session_id)
+            .or_default()
+            .outstanding += 1;
         let (actor, local_id, root_session_id, status) = {
             let table = self.table.lock().await;
             let actor = table.task_name(actor_session_id)?;

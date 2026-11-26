@@ -164,11 +164,7 @@ impl SubagentCoordinator {
         // With no child working there is nothing to wait for, unless a
         // followup_task this agent sent is still unanswered: then the wait
         // blocks until that reply arrives as input.
-        let awaiting_reply = self
-            .awaiting_reply
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(&actor);
+        let awaiting_reply = self.is_awaiting_reply(actor);
         let idle_at_start = !awaiting_reply && !self.children(actor).await.iter().any(working);
         let mut until = if idle_at_start {
             deadline.min(started + IDLE_GRACE)
@@ -196,14 +192,12 @@ impl SubagentCoordinator {
                     return self.report(actor, reason, unseen, started).await;
                 }
                 () = input_arrives(&mut input, &reported) => {
-                    self.take_awaiting_reply(actor);
                     let unseen = self.unseen(actor).await?;
                     return self.report(actor, "input_pending", unseen, started).await;
                 }
                 message = wakes.recv(), if wakes_open => match message {
                     Ok(_) => {
                         reported.store(true, Ordering::Release);
-                        self.take_awaiting_reply(actor);
                         let unseen = self.unseen(actor).await?;
                         return self.report(actor, "input_pending", unseen, started).await;
                     }
@@ -242,12 +236,7 @@ impl SubagentCoordinator {
                 if !self.unseen(actor).await?.is_empty() {
                     settle_at = Some(tokio::time::Instant::now() + COALESCE);
                 } else {
-                    let awaiting_reply = self
-                        .awaiting_reply
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .contains(&actor);
-                    if !awaiting_reply && !self.children(actor).await.iter().any(working) {
+                    if !self.is_awaiting_reply(actor) && !self.children(actor).await.iter().any(working) {
                         // A failed admission may remove the last reservation with
                         // no worker lifecycle event. Do not wait half an hour on it.
                         until = until.min(tokio::time::Instant::now() + IDLE_GRACE);
@@ -354,7 +343,9 @@ impl SubagentCoordinator {
                 .extend(unseen.messages.iter().map(|(id, ..)| *id));
         }
         if !unseen.messages.is_empty() {
-            self.take_awaiting_reply(actor);
+            for (id, ..) in &unseen.messages {
+                self.take_awaiting_reply(actor, *id);
+            }
             // Acknowledge only reports returned here. A hosted child's images
             // remain pending for normal delivery; this result only shows text.
             let inbox = if self.is_root_session(actor) {

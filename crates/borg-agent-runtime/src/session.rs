@@ -4244,7 +4244,7 @@ async fn run_agent_session_store_kernel_inner(
                             && !is_autonomy
                             && subagents
                                 .as_ref()
-                                .is_some_and(|team| team.take_awaiting_reply(session_id));
+                                .is_some_and(|team| team.take_awaiting_reply(session_id, message_id));
                         if actor == EventActor::System
                             && !is_autonomy
                             && (delivery == PromptDelivery::Queue
