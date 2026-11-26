@@ -2297,6 +2297,66 @@ impl SessionStore for PostgresSessionStore {
     }
 }
 
+/// A session row locked by the current transaction, with the projected state
+/// that its appends advance in memory.
+struct SessionRow {
+    session_id: Uuid,
+    inherited_event_count: u64,
+    next_sequence: u64,
+    state: SessionState,
+    /// Set once an event is appended, so a row that only served as a lock is
+    /// not rewritten.
+    updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl SessionRow {
+    /// `for update` is the whole design: it serialises writers for THIS
+    /// session and no other. Two agents appending to two sessions proceed in
+    /// parallel, which is what SQLite's single file writer made impossible.
+    async fn lock(transaction: &mut Transaction<'_, Postgres>, session_id: Uuid) -> Result<Self> {
+        let row = sqlx::query(
+            "select inherited_event_count, next_sequence, state_json from sessions \
+             where id = $1 for update",
+        )
+        .bind(session_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .with_context(|| format!("session {session_id} does not exist"))?;
+        Ok(Self {
+            session_id,
+            inherited_event_count: u64::try_from(row.try_get::<i64, _>("inherited_event_count")?)
+                .context("negative inherited event count")?,
+            next_sequence: u64::try_from(row.try_get::<i64, _>("next_sequence")?)
+                .context("negative session sequence")?,
+            state: serde_json::from_str(row.try_get("state_json")?)?,
+            updated_at: None,
+        })
+    }
+}
+
+async fn store_session_row(
+    transaction: &mut Transaction<'_, Postgres>,
+    row: Option<SessionRow>,
+) -> Result<()> {
+    let Some(row) = row else {
+        return Ok(());
+    };
+    let Some(updated_at) = row.updated_at else {
+        return Ok(());
+    };
+    sqlx::query(
+        "update sessions set next_sequence = $1, state_json = $2, projection_version = 3, \
+         updated_at = $3 where id = $4",
+    )
+    .bind(i64::try_from(row.next_sequence).unwrap_or(i64::MAX))
+    .bind(serde_json::to_string(&row.state)?)
+    .bind(updated_at)
+    .bind(row.session_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::testing::{ScratchDatabase, test_url};
@@ -2695,64 +2755,4 @@ mod tests {
         );
         scratch.discard().await;
     }
-}
-
-/// A session row locked by the current transaction, with the projected state
-/// that its appends advance in memory.
-struct SessionRow {
-    session_id: Uuid,
-    inherited_event_count: u64,
-    next_sequence: u64,
-    state: SessionState,
-    /// Set once an event is appended, so a row that only served as a lock is
-    /// not rewritten.
-    updated_at: Option<chrono::DateTime<chrono::Utc>>,
-}
-
-impl SessionRow {
-    /// `for update` is the whole design: it serialises writers for THIS
-    /// session and no other. Two agents appending to two sessions proceed in
-    /// parallel, which is what SQLite's single file writer made impossible.
-    async fn lock(transaction: &mut Transaction<'_, Postgres>, session_id: Uuid) -> Result<Self> {
-        let row = sqlx::query(
-            "select inherited_event_count, next_sequence, state_json from sessions \
-             where id = $1 for update",
-        )
-        .bind(session_id)
-        .fetch_optional(&mut **transaction)
-        .await?
-        .with_context(|| format!("session {session_id} does not exist"))?;
-        Ok(Self {
-            session_id,
-            inherited_event_count: u64::try_from(row.try_get::<i64, _>("inherited_event_count")?)
-                .context("negative inherited event count")?,
-            next_sequence: u64::try_from(row.try_get::<i64, _>("next_sequence")?)
-                .context("negative session sequence")?,
-            state: serde_json::from_str(row.try_get("state_json")?)?,
-            updated_at: None,
-        })
-    }
-}
-
-async fn store_session_row(
-    transaction: &mut Transaction<'_, Postgres>,
-    row: Option<SessionRow>,
-) -> Result<()> {
-    let Some(row) = row else {
-        return Ok(());
-    };
-    let Some(updated_at) = row.updated_at else {
-        return Ok(());
-    };
-    sqlx::query(
-        "update sessions set next_sequence = $1, state_json = $2, projection_version = 3, \
-         updated_at = $3 where id = $4",
-    )
-    .bind(i64::try_from(row.next_sequence).unwrap_or(i64::MAX))
-    .bind(serde_json::to_string(&row.state)?)
-    .bind(updated_at)
-    .bind(row.session_id)
-    .execute(&mut **transaction)
-    .await?;
-    Ok(())
 }
