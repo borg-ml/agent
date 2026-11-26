@@ -182,6 +182,7 @@ impl PostgresSessionStore {
             .append_durable_in_transaction(&mut transaction, event)
             .await?;
         transaction.commit().await?;
+        self.committed(admitted.session_id);
         Ok(admitted)
     }
 
@@ -210,6 +211,7 @@ impl PostgresSessionStore {
             .append_durable_in_transaction(&mut transaction, event)
             .await?;
         transaction.commit().await?;
+        self.committed(event.session_id);
         Ok(event)
     }
 }

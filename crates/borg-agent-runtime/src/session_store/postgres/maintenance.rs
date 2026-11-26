@@ -293,6 +293,7 @@ impl PostgresSessionStore {
                 .context("importing a session event")?;
         }
         transaction.commit().await?;
+        self.committed(session_id);
         Ok(true)
     }
 }

@@ -529,7 +529,6 @@ impl PostgresSessionStore {
         .bind(event.session_id)
         .execute(&mut **transaction)
         .await?;
-        super::publication::notify(transaction, event.session_id).await?;
         Ok(compact_event)
     }
 
@@ -773,8 +772,8 @@ impl PostgresSessionStore {
             .bind(event.session_id)
             .execute(&mut *transaction)
             .await?;
-        super::publication::notify(&mut transaction, event.session_id).await?;
         transaction.commit().await?;
+        self.committed(event.session_id);
         // Return the committed input, not the reconstructed stream. Snapshots
         // keep the live key's identity and start time so clients do not
         // restart its timer; the first fragment of a newly anchored message
@@ -905,6 +904,13 @@ impl PostgresSessionStore {
             );
         }
         transaction.commit().await?;
+        for session_id in appended
+            .iter()
+            .map(|event| event.session_id)
+            .collect::<std::collections::HashSet<_>>()
+        {
+            self.committed(session_id);
+        }
         Ok(appended)
     }
 }
@@ -1950,6 +1956,7 @@ impl SessionStore for PostgresSessionStore {
             .append_durable_in_transaction(&mut transaction, event)
             .await?;
         transaction.commit().await?;
+        self.committed(event.session_id);
         Ok(event)
     }
 

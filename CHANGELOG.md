@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.22.6)
 
+- Busy teams no longer stall every session on the host. Each journal write
+  sent its Postgres wakeup (NOTIFY) inside its own transaction, which holds
+  one cluster-wide lock until the commit reaches disk, so all writes from all
+  sessions committed one at a time. With many subagents a prompt could wait
+  seconds just to be saved. Wakeups are now sent after commit and coalesced.
+
 - The TUI no longer freezes its spinners and timers while subagents stream
   text you are not looking at. Hidden child output kept the frame loop in
   "streaming" mode without anything to paint, so nothing redrew until another

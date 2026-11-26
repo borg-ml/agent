@@ -103,6 +103,7 @@ pub struct PostgresSessionStore {
     schema_incomplete: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Whether `sessions.archive_ref` exists, cached; see `archive_column`.
     archive_column: std::sync::Arc<archive::ColumnCache>,
+    committed: std::sync::Arc<publication::CommittedHints>,
 }
 
 /// A workspace projection supplied by the embedding controller.
@@ -233,6 +234,7 @@ impl PostgresSessionStore {
             workspace_override: None,
             schema_incomplete: Default::default(),
             archive_column: Default::default(),
+            committed: Default::default(),
         };
         store.ensure_schema().await?;
         store.clear_stranded_turn_live_state().await?;

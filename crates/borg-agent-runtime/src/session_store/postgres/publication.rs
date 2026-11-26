@@ -1,21 +1,67 @@
 //! Commit-coupled wakeups, not event transport. A reconnect always tails durable
 //! watermarks: NOTIFY is deliberately only a hint and carries no private data.
 use anyhow::Result;
-use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 pub const CHANNEL: &str = "borg_session_committed";
 
-pub async fn notify(tx: &mut Transaction<'_, Postgres>, session_id: Uuid) -> Result<()> {
-    sqlx::query("select pg_notify($1,$2)")
-        .bind(CHANNEL)
-        .bind(session_id.to_string())
-        .execute(&mut **tx)
-        .await?;
-    Ok(())
+/// Wakeups sent after the writer commits, never inside its transaction.
+///
+/// A transaction that NOTIFYs holds Postgres's single cluster-wide notify lock
+/// from pre-commit until its WAL flush finishes, so every event append on the
+/// host committed one at a time behind every other. With busy subagents that
+/// queue reached seconds and stalled prompt admission. A NOTIFY-only statement
+/// writes no WAL, and hints raised while one is in flight coalesce into the
+/// next, so writers never wait on notification at all.
+#[derive(Debug, Default)]
+pub struct CommittedHints {
+    state: std::sync::Mutex<(std::collections::HashSet<Uuid>, bool)>,
+}
+
+impl CommittedHints {
+    fn hint(self: &std::sync::Arc<Self>, pool: &sqlx::PgPool, session_id: Uuid) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        {
+            let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.0.insert(session_id);
+            if std::mem::replace(&mut state.1, true) {
+                return;
+            }
+        }
+        let (hints, pool) = (std::sync::Arc::clone(self), pool.clone());
+        runtime.spawn(async move {
+            loop {
+                let batch: Vec<String> = {
+                    let mut state =
+                        hints.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if state.0.is_empty() {
+                        state.1 = false;
+                        return;
+                    }
+                    state.0.drain().map(|id| id.to_string()).collect()
+                };
+                if let Err(error) =
+                    sqlx::query("select pg_notify($1, session) from unnest($2::text[]) session")
+                        .bind(CHANNEL)
+                        .bind(&batch)
+                        .execute(&pool)
+                        .await
+                {
+                    tracing::warn!(%error, "committed-session wakeup failed");
+                }
+            }
+        });
+    }
 }
 
 impl super::PostgresSessionStore {
+    /// Call after `commit()` of a transaction that appended to `session_id`.
+    pub(super) fn committed(&self, session_id: Uuid) {
+        self.committed.hint(self.pool(), session_id);
+    }
+
     /// LISTEN completes before the caller reads checkpoints/tails. Notifications
     /// received during tail construction remain queued on this connection.
     pub async fn subscribe_committed(&self) -> Result<sqlx::postgres::PgListener> {
