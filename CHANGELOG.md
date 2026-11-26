@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.22.6)
 
+- The status line no longer shows "ready" for a whole turn after Esc sends
+  pending input while the session is idle. The stop acknowledgement now ends
+  when a new turn starts, not only when the stopped turn completes, so the
+  next turn shows as running.
+
 - Markdown tables in the TUI are framed with a top and bottom border, so the
   last row no longer looks cut off where the next paragraph begins. Inline
   HTML that models put in table cells is laid out: `<br>` and `<p>` start a new

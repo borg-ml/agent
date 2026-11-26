@@ -4835,9 +4835,11 @@ impl BorgTerminal {
         if matches!(event.kind, SessionEventKind::TurnCompleted { .. }) {
             self.interrupt_acknowledged = false;
         }
-        if matches!(event.kind, SessionEventKind::TurnStarted { .. })
-            && !self.interrupt_acknowledged
-        {
+        // An acknowledged stop only hides the stopped turn's trailing running
+        // events. Esc with pending input is acknowledged even when no turn was
+        // running, so a new turn must end it or its whole run shows as ready.
+        if matches!(event.kind, SessionEventKind::TurnStarted { .. }) {
+            self.interrupt_acknowledged = false;
             self.interrupt_requested = false;
             self.activity_clock.restart(event.created_at);
         }
