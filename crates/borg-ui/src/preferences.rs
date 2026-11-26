@@ -718,7 +718,10 @@ keep = true
         opencode.save_changes_to(&original, &path).unwrap();
 
         assert_eq!(
-            EditorPreferences::load_from(&path).unwrap().interaction.last_model,
+            EditorPreferences::load_from(&path)
+                .unwrap()
+                .interaction
+                .last_model,
             opencode.interaction.last_model
         );
     }

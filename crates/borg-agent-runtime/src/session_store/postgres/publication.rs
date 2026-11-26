@@ -24,7 +24,10 @@ impl CommittedHints {
             return;
         };
         {
-            let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             state.0.insert(session_id);
             if std::mem::replace(&mut state.1, true) {
                 return;
@@ -34,8 +37,10 @@ impl CommittedHints {
         runtime.spawn(async move {
             loop {
                 let batch: Vec<String> = {
-                    let mut state =
-                        hints.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let mut state = hints
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     if state.0.is_empty() {
                         state.1 = false;
                         return;
