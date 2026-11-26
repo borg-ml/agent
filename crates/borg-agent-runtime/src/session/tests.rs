@@ -15825,6 +15825,7 @@ async fn parent_journal_preserves_full_child_transcript_events() {
             task_name: "/root/worker".to_string(),
             event: child_event,
         },
+        false,
     )
     .await
     .unwrap();
@@ -15894,6 +15895,7 @@ async fn parent_journal_preserves_full_child_transcript_events() {
         &coordinator,
         &test_watches(observer),
         child_message(8, "I am complete", MessageStatus::Complete),
+        false,
     )
     .await
     .unwrap();
@@ -15906,6 +15908,7 @@ async fn parent_journal_preserves_full_child_transcript_events() {
         &coordinator,
         &watches,
         child_message(0, "I", MessageStatus::InProgress),
+        false,
     )
     .await
     .unwrap();
@@ -15916,6 +15919,7 @@ async fn parent_journal_preserves_full_child_transcript_events() {
         &coordinator,
         &watches,
         child_message(8, "I am complete", MessageStatus::Complete),
+        false,
     )
     .await
     .unwrap();
@@ -16013,6 +16017,7 @@ async fn parent_journal_preserves_full_child_transcript_events() {
         &coordinator,
         &watches,
         child_message(8, "I am complete", MessageStatus::Complete),
+        false,
     )
     .await
     .unwrap();
@@ -16031,6 +16036,7 @@ async fn parent_journal_preserves_full_child_transcript_events() {
         &coordinator,
         &watches,
         report,
+        false,
     )
     .await
     .unwrap();
@@ -26972,4 +26978,165 @@ fn estimated_post_compaction_context_tokens_counts_summary_and_retained_tail() {
         tokens > 0,
         "post-compaction context tokens must count the summary and retained tail, got {tokens}"
     );
+}
+
+/// Streams tool events at a steady rate until cancelled, like a busy model.
+struct SteadyExecutor {
+    aborted_at: Arc<Mutex<Option<std::time::Instant>>>,
+    sent: Arc<std::sync::atomic::AtomicU64>,
+    interval: Duration,
+}
+
+#[async_trait::async_trait]
+impl AgentTurnExecutor for SteadyExecutor {
+    async fn execute(
+        &self,
+        _turn: AgentTurn,
+        events: mpsc::Sender<SessionEventKind>,
+        _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+    ) -> Result<AgentTurnResult> {
+        let _marker = AbortMarker(Arc::clone(&self.aborted_at));
+        let mut index = 0u64;
+        loop {
+            index += 1;
+            for kind in [
+                SessionEventKind::ToolStarted {
+                    tool_call_id: format!("steady-{index}"),
+                    name: "exec_command".into(),
+                    input: serde_json::json!({"cmd": "echo"}),
+                    input_ref: None,
+                    parent_tool_call_id: None,
+                },
+                SessionEventKind::ToolCompleted {
+                    tool_call_id: format!("steady-{index}"),
+                    output: "ok".into(),
+                    output_ref: None,
+                    is_error: false,
+                    input: None,
+                    input_ref: None,
+                    parent_tool_call_id: None,
+                },
+            ] {
+                events.send(kind).await.ok();
+                self.sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            tokio::time::sleep(self.interval).await;
+        }
+    }
+}
+
+/// Escape must not wait for the turn's backlog to commit one event at a time.
+///
+/// The model stopped within 0.2s, but with every journal commit slowed to
+/// 250ms the observer saw the turn end 33s later: the drain after an interrupt
+/// committed each of ~128 buffered events alone. On a loaded host commits took
+/// over a second, so a stop took minutes. The tail now commits as one run, so
+/// the wait is a few commits whatever the backlog.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn escape_does_not_commit_the_turn_backlog_one_event_at_a_time() {
+    let commit_ms = 200;
+    let root = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    for statement in [
+        format!(
+            "create function probe_commit_delay() returns trigger language plpgsql as $$ begin \
+             if current_setting('probe.slept', true) is distinct from txid_current()::text then \
+             perform set_config('probe.slept', txid_current()::text, true); \
+             perform pg_sleep({commit_ms} / 1000.0); end if; return null; end $$"
+        ),
+        "create constraint trigger probe_commit_delay after insert on session_events \
+         deferrable initially deferred for each row execute function probe_commit_delay()"
+            .to_string(),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(statement))
+            .execute(store.pool())
+            .await
+            .unwrap();
+    }
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel::<SessionEvent>(1024);
+    let completed_at = Arc::new(Mutex::new(None::<std::time::Instant>));
+    let observer = tokio::spawn({
+        let completed_at = Arc::clone(&completed_at);
+        async move {
+            while let Some(event) = event_rx.recv().await {
+                if matches!(event.kind, SessionEventKind::TurnCompleted { .. }) {
+                    completed_at
+                        .lock()
+                        .unwrap()
+                        .get_or_insert_with(std::time::Instant::now);
+                }
+            }
+        }
+    });
+    let aborted_at = Arc::new(Mutex::new(None));
+    let sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let executor = Arc::new(SteadyExecutor {
+        aborted_at: Arc::clone(&aborted_at),
+        sent: Arc::clone(&sent),
+        interval: Duration::from_millis(20),
+    });
+    let actor = tokio::spawn({
+        let journal_path = root.path().join("session.lock");
+        let cwd = root.path().to_path_buf();
+        let store = Arc::clone(&store);
+        async move {
+            run_session_actor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: Uuid::new_v4(),
+                    cwd,
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    ultrafast: None,
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::FullAccess,
+                    name: None,
+                    initial_prompt: Some("stream".to_string()),
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+                store,
+            )
+            .await
+        }
+    });
+    // Fill the provider channel: the actor commits slower than this streams.
+    while sent.load(std::sync::atomic::Ordering::Relaxed) < 200 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let requested = std::time::Instant::now();
+    command_tx
+        .send(HostCommand::Interrupt { session_id })
+        .await
+        .unwrap();
+    let deadline = requested + Duration::from_secs(120);
+    while completed_at.lock().unwrap().is_none() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let completed = completed_at
+        .lock()
+        .unwrap()
+        .map(|at| at.duration_since(requested))
+        .expect("the interrupted turn ends");
+    command_tx.send(HostCommand::Stop { session_id }).await.ok();
+    let _ = tokio::time::timeout(Duration::from_secs(30), actor).await;
+    observer.abort();
+    // About four commits; the per-event drain took over a hundred.
+    assert!(
+        completed < Duration::from_secs(5),
+        "the turn ended {completed:?} after Escape with {commit_ms}ms commits"
+    );
+    scratch.discard().await;
 }

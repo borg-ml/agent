@@ -594,11 +594,6 @@ impl PostgresWorkspaceStore {
                 sqlx::query("insert into workspace_plan_migrations(workspace_id,source_session_id,event_id) values($1,$2,$3)")
                     .bind(event.workspace_id.to_string()).bind(source_session_id.to_string()).bind(event.id.to_string()).execute(&mut *transaction).await?;
             }
-            sqlx::query("select pg_notify($1,$2)")
-                .bind(WORK_COMMITTED_CHANNEL)
-                .bind(event.workspace_id.to_string())
-                .execute(&mut *transaction)
-                .await?;
         }
         let is_message = matches!(&event.kind, WorkspaceEventKind::Message { .. });
         if is_message {
@@ -619,14 +614,27 @@ impl PostgresWorkspaceStore {
                 &mode,
             )
             .await?;
-            // Commit-coupled outbox wake: hosts upload undelivered messages
-            // when one commits, from whichever process authored it.
-            sqlx::query("select pg_notify('borg_workspace_outbox', $1)")
-                .bind(event.workspace_id.to_string())
-                .execute(&mut *transaction)
-                .await?;
         }
         transaction.commit().await?;
+        // Wakeups follow the commit. A NOTIFY inside the transaction holds the
+        // server's single notify lock until the WAL flush, which serialised
+        // every journal commit on the host behind each team message.
+        let channels = [
+            event.kind.is_work().then_some(WORK_COMMITTED_CHANNEL),
+            // Hosts upload undelivered messages when one commits, from
+            // whichever process authored it.
+            is_message.then_some(MESSAGE_COMMITTED_CHANNEL),
+        ];
+        for channel in channels.into_iter().flatten() {
+            if let Err(error) = sqlx::query("select pg_notify($1,$2)")
+                .bind(channel)
+                .bind(event.workspace_id.to_string())
+                .execute(&self.pool)
+                .await
+            {
+                tracing::warn!(%error, channel, "workspace commit wakeup failed");
+            }
+        }
         Ok(event)
     }
 

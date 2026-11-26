@@ -5,6 +5,15 @@ Git comparison.
 
 ## Unreleased (since 0.22.6)
 
+- Escape, prompts and model changes no longer wait minutes behind a busy
+  team. Every journal write rewrote the session's whole projected state, about
+  100 KB for a director with many agents, once per event, so a backlog of 256
+  events cost 2.8s on a loaded disk; a write now rewrites it once per batch
+  (0.18s). After an interrupt the turn's buffered events, and a director's
+  child activity, also commit as one batch rather than one commit each: with
+  slow commits an Escape took 33s to end the turn and now takes about 1s.
+  Team-message and work wakeups are sent after their commit, not inside it.
+
 - Clicking beside a screenshot in the TUI no longer opens it. On graphics
   terminals the clickable area of an image spanned the whole transcript width,
   but a screenshot capped at 24 rows often fills only part of it. Only the

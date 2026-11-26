@@ -35,17 +35,9 @@ pub(crate) const MAX_HISTORY_QUERY_BYTES: usize = 8 * 1024;
 pub const MAX_RUNTIME_CHECKPOINT_BYTES: usize = 512 * 1024;
 pub const HARNESS_CHECKPOINT_PREFIX: &str = "__borg_harness__";
 
-fn historical_projection_json(
-    sequence: u64,
-    inherited_event_count: u64,
-    projection_json: &str,
-) -> &str {
+fn is_projection_checkpoint(sequence: u64, inherited_event_count: u64) -> bool {
     let local_sequence = sequence.saturating_sub(inherited_event_count);
-    if local_sequence == 1 || local_sequence.is_multiple_of(FORK_PROJECTION_CHECKPOINT_INTERVAL) {
-        projection_json
-    } else {
-        ""
-    }
+    local_sequence == 1 || local_sequence.is_multiple_of(FORK_PROJECTION_CHECKPOINT_INTERVAL)
 }
 
 /// Version of the durable runtime namespace manifest. The manifest describes

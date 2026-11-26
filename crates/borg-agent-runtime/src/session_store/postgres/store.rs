@@ -33,7 +33,7 @@ use crate::session_store::{
     SessionLineage, SessionLiveEvent, SessionPayloadKind, SessionPayloadRef, SessionRecovery,
     SessionState, SessionStatus, SessionStore, SessionStoreFork, SessionStoreHealth,
     SessionSummary, SessionWorkspaceBinding, deferred_json_payload, deferred_provider_payload,
-    deferred_text_payload, deferred_tool_output_payload, event_kind, historical_projection_json,
+    deferred_text_payload, deferred_tool_output_payload, event_kind, is_projection_checkpoint,
     oversized_provider_payload_bytes,
 };
 
@@ -274,26 +274,40 @@ impl PostgresSessionStore {
     pub(super) async fn append_durable_in_transaction(
         &self,
         transaction: &mut Transaction<'_, Postgres>,
+        event: SessionEvent,
+    ) -> Result<SessionEvent> {
+        let mut row = None;
+        let event = self.append_to_row(transaction, event, &mut row).await?;
+        store_session_row(transaction, row).await?;
+        Ok(event)
+    }
+
+    /// Append one event against the session row held in `row`.
+    ///
+    /// The row is read once per transaction and written back by
+    /// [`store_session_row`]. A busy root's state is about 100 KB, mostly its
+    /// agents' plans; reading and rewriting it for every event of a batch made
+    /// a batch cost grow with its length, and each copy was WAL to flush.
+    async fn append_to_row(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
         mut event: SessionEvent,
+        row: &mut Option<SessionRow>,
     ) -> Result<SessionEvent> {
         if let SessionEventKind::ReasoningBlockStarted { reasoning_id } = &event.kind {
             // Reuse the durable event uniqueness constraint as the admission
             // fence: a completed block UUID can never be started again.
             event.id = *reasoning_id;
         }
-
-        // `for update` is the whole design: it serialises writers for THIS
-        // session and no other. Two agents appending to two sessions proceed
-        // in parallel, which is what SQLite's single file writer made
-        // impossible.
-        let mut row = sqlx::query(
-            "select inherited_event_count, next_sequence, state_json from sessions \
-             where id = $1 for update",
-        )
-        .bind(event.session_id)
-        .fetch_optional(&mut **transaction)
-        .await?
-        .with_context(|| format!("session {} does not exist", event.session_id))?;
+        if row
+            .as_ref()
+            .is_some_and(|row| row.session_id != event.session_id)
+        {
+            store_session_row(transaction, row.take()).await?;
+        }
+        if row.is_none() {
+            *row = Some(SessionRow::lock(transaction, event.session_id).await?);
+        }
 
         let reasoning_keys = event.kind.cleared_live_state_keys();
         let close_all_reasoning = event.kind.clears_live_turn_state()
@@ -313,12 +327,9 @@ impl PostgresSessionStore {
             for prior in prior {
                 let mut reasoning: SessionEvent = serde_json::from_value(prior)?;
                 super::live_text::materialize(transaction, &mut reasoning).await?;
-                let state: SessionState = serde_json::from_str(row.try_get("state_json")?)?;
-                let snapshot = reasoning_snapshot(&reasoning, &state, true, event.created_at);
-                Box::pin(self.append_durable_in_transaction(transaction, snapshot)).await?;
-                row = sqlx::query(
-                    "select inherited_event_count,next_sequence,state_json from sessions where id=$1",
-                ).bind(event.session_id).fetch_one(&mut **transaction).await?;
+                let state = &row.as_ref().expect("session row is held").state;
+                let snapshot = reasoning_snapshot(&reasoning, state, true, event.created_at);
+                Box::pin(self.append_to_row(transaction, snapshot, row)).await?;
             }
         }
 
@@ -348,7 +359,7 @@ impl PostgresSessionStore {
                     *status = MessageStatus::Failed;
                     message.id = Uuid::new_v4();
                     message.sequence = 0;
-                    Box::pin(self.append_durable_in_transaction(transaction, message)).await?;
+                    Box::pin(self.append_to_row(transaction, message, row)).await?;
                 }
             }
             sqlx::query(
@@ -357,18 +368,10 @@ impl PostgresSessionStore {
             .bind(event.session_id)
             .execute(&mut **transaction)
             .await?;
-            row = sqlx::query(
-                "select inherited_event_count, next_sequence, state_json from sessions where id = $1",
-            )
-            .bind(event.session_id)
-            .fetch_one(&mut **transaction)
-            .await?;
         }
 
-        let inherited_event_count = u64::try_from(row.try_get::<i64, _>("inherited_event_count")?)
-            .context("negative inherited event count")?;
-        let next_sequence = u64::try_from(row.try_get::<i64, _>("next_sequence")?)
-            .context("negative session sequence")?;
+        let row = row.as_mut().expect("session row is held");
+        let (inherited_event_count, next_sequence) = (row.inherited_event_count, row.next_sequence);
         if event.sequence == 0 {
             event.sequence = next_sequence;
         }
@@ -378,8 +381,8 @@ impl PostgresSessionStore {
             event.sequence
         );
 
-        let mut state: SessionState = serde_json::from_str(row.try_get("state_json")?)?;
-        state.apply(&event)?;
+        row.state.apply(&event)?;
+        let state = &row.state;
         let stored_event_kind = event_kind(&event.kind)?;
         let compact_event = self.compact_payloads(transaction, &event).await?;
         // POSTGRES CANNOT PUT \u0000 IN JSONB. `jsonb` parses to a normalised
@@ -427,12 +430,15 @@ impl PostgresSessionStore {
         } else {
             (Some(serde_json::to_value(&compact_event)?), None, None)
         };
-        let projection_json = serde_json::to_string(&state)?;
         // Only checkpoint rows carry a projection; the rest replay forward from
         // the newest one. Identical policy to SQLite, and the single largest
         // reason this journal is smaller than its predecessor.
         let historical_projection =
-            historical_projection_json(event.sequence, inherited_event_count, &projection_json);
+            if is_projection_checkpoint(event.sequence, inherited_event_count) {
+                serde_json::to_string(state)?
+            } else {
+                String::new()
+            };
         let message_id = match &event.kind {
             SessionEventKind::Message { message_id, .. }
             | SessionEventKind::PromptRecalled { message_id, .. }
@@ -519,16 +525,8 @@ impl PostgresSessionStore {
             }
         }
 
-        sqlx::query(
-            "update sessions set next_sequence = $1, state_json = $2, projection_version = 3, \
-             updated_at = $3 where id = $4",
-        )
-        .bind(i64::try_from(event.sequence.saturating_add(1)).unwrap_or(i64::MAX))
-        .bind(projection_json)
-        .bind(event.created_at)
-        .bind(event.session_id)
-        .execute(&mut **transaction)
-        .await?;
+        row.next_sequence = event.sequence.saturating_add(1);
+        row.updated_at = Some(event.created_at);
         Ok(compact_event)
     }
 
@@ -897,12 +895,14 @@ impl PostgresSessionStore {
     async fn append_batch_once(&self, events: &[SessionEvent]) -> Result<Vec<SessionEvent>> {
         let mut transaction = self.pool().begin().await?;
         let mut appended = Vec::with_capacity(events.len());
+        let mut row = None;
         for event in events {
             appended.push(
-                self.append_durable_in_transaction(&mut transaction, event.clone())
+                self.append_to_row(&mut transaction, event.clone(), &mut row)
                     .await?,
             );
         }
+        store_session_row(&mut transaction, row).await?;
         transaction.commit().await?;
         for session_id in appended
             .iter()
@@ -2695,4 +2695,64 @@ mod tests {
         );
         scratch.discard().await;
     }
+}
+
+/// A session row locked by the current transaction, with the projected state
+/// that its appends advance in memory.
+struct SessionRow {
+    session_id: Uuid,
+    inherited_event_count: u64,
+    next_sequence: u64,
+    state: SessionState,
+    /// Set once an event is appended, so a row that only served as a lock is
+    /// not rewritten.
+    updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl SessionRow {
+    /// `for update` is the whole design: it serialises writers for THIS
+    /// session and no other. Two agents appending to two sessions proceed in
+    /// parallel, which is what SQLite's single file writer made impossible.
+    async fn lock(transaction: &mut Transaction<'_, Postgres>, session_id: Uuid) -> Result<Self> {
+        let row = sqlx::query(
+            "select inherited_event_count, next_sequence, state_json from sessions \
+             where id = $1 for update",
+        )
+        .bind(session_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .with_context(|| format!("session {session_id} does not exist"))?;
+        Ok(Self {
+            session_id,
+            inherited_event_count: u64::try_from(row.try_get::<i64, _>("inherited_event_count")?)
+                .context("negative inherited event count")?,
+            next_sequence: u64::try_from(row.try_get::<i64, _>("next_sequence")?)
+                .context("negative session sequence")?,
+            state: serde_json::from_str(row.try_get("state_json")?)?,
+            updated_at: None,
+        })
+    }
+}
+
+async fn store_session_row(
+    transaction: &mut Transaction<'_, Postgres>,
+    row: Option<SessionRow>,
+) -> Result<()> {
+    let Some(row) = row else {
+        return Ok(());
+    };
+    let Some(updated_at) = row.updated_at else {
+        return Ok(());
+    };
+    sqlx::query(
+        "update sessions set next_sequence = $1, state_json = $2, projection_version = 3, \
+         updated_at = $3 where id = $4",
+    )
+    .bind(i64::try_from(row.next_sequence).unwrap_or(i64::MAX))
+    .bind(serde_json::to_string(&row.state)?)
+    .bind(updated_at)
+    .bind(row.session_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
 }

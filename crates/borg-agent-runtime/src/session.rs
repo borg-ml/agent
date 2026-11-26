@@ -1391,6 +1391,10 @@ const PROVIDER_EVENT_BATCH_LIMIT: usize = 8;
 /// Raw provider events read ahead while coalescing one batch. Bounds the time
 /// spent folding a long run of snapshots before the actor returns to select.
 const PROVIDER_EVENT_SCAN_LIMIT: usize = 1_024;
+/// Child activity drained into one journal commit. A team's mirrored events
+/// arrive at about one a second per busy child, and committing each one alone
+/// is what let a director fall minutes behind its own children.
+const CHILD_ACTIVITY_BURST_LIMIT: usize = 64;
 #[cfg(not(test))]
 const PROVIDER_DRAIN_LIVENESS_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
@@ -3306,8 +3310,16 @@ async fn run_agent_session_store_kernel_inner(
         let mut team_events = store.fork_team_events(session_id).await?;
         team_events.extend(recovery.subagent_events.iter().cloned());
         for activity in team.restore_from_events(&team_events).await? {
-            record_subagent_activity(&mut journal, &events, session_id, team, &watches, activity)
-                .await?;
+            record_subagent_activity(
+                &mut journal,
+                &events,
+                session_id,
+                team,
+                &watches,
+                activity,
+                false,
+            )
+            .await?;
         }
         if team.director().epoch > 0 && store.state(session_id).await?.team_director.is_none() {
             record(
@@ -3949,18 +3961,28 @@ async fn run_agent_session_store_kernel_inner(
                                             child_activity_open = false;
                                             continue;
                                         };
-                                        if work_plan_topology_changed(&activity) {
-                                            work_plan_refresh.force_refresh = true;
-                                            work_plan_refresh.start(&journal, &work_plan, subagents.as_ref());
+                                        let mut burst = vec![activity];
+                                        while burst.len() < CHILD_ACTIVITY_BURST_LIMIT
+                                            && let Ok(next) = child_activity_rx.try_recv()
+                                        {
+                                            burst.push(next);
                                         }
-                                        record_subagent_activity(
-                                            &mut journal,
-                                            &events,
-                                            session_id,
-                                            subagents.as_ref().expect("child activity requires coordinator"),
-                                            &watches,
-                                            activity,
-                                        ).await?;
+                                        for activity in burst {
+                                            if work_plan_topology_changed(&activity) {
+                                                work_plan_refresh.force_refresh = true;
+                                                work_plan_refresh.start(&journal, &work_plan, subagents.as_ref());
+                                            }
+                                            record_subagent_activity(
+                                                &mut journal,
+                                                &events,
+                                                session_id,
+                                                subagents.as_ref().expect("child activity requires coordinator"),
+                                                &watches,
+                                                activity,
+                                                true,
+                                            ).await?;
+                                        }
+                                        journal.flush_deferred().await?;
                                         continue;
                                     }
                                     _ = root_inbox_wakeup(&mut root_inbox_changes, root_inbox_queued.as_deref()), if owns_team => {
@@ -5311,6 +5333,7 @@ async fn run_agent_session_store_kernel_inner(
                         team,
                         &watches,
                         activity,
+                        false,
                     )
                     .await?;
                 }
@@ -6254,15 +6277,22 @@ async fn run_agent_session_store_kernel_inner(
                         if context_usage_observation(&kind) {
                             provider_context_usage_valid = true;
                         }
-                        record_provider_event(
-                            kind,
-                            &mut pending_steers,
-                            &mut steers_awaiting_consumption,
-                            &mut journal,
-                            &events,
-                            session_id,
-                        )
-                        .await?;
+                        // The turn's tail commits as one run, as it does while
+                        // streaming. One commit per event here is what kept an
+                        // Escape waiting behind every event it interrupted.
+                        if batchable_provider_event(&kind) {
+                            journal.defer(&events, SessionEvent::new(session_id, 0, kind));
+                        } else {
+                            record_provider_event(
+                                kind,
+                                &mut pending_steers,
+                                &mut steers_awaiting_consumption,
+                                &mut journal,
+                                &events,
+                                session_id,
+                            )
+                            .await?;
+                        }
                         if let Some(tokens) = usage {
                             account_goal_tokens(
                                 &mut journal,
@@ -7772,6 +7802,7 @@ async fn run_agent_session_store_kernel_inner(
                                         team,
                                         &watches,
                                         activity,
+                                        false,
                                     )
                                     .await?;
                                 }
@@ -8315,18 +8346,28 @@ async fn run_agent_session_store_kernel_inner(
                         child_activity_open = false;
                         continue;
                     };
-                    if work_plan_topology_changed(&activity) {
-                        work_plan_refresh.force_refresh = true;
-                        work_plan_refresh.start(&journal, &work_plan, subagents.as_ref());
+                    let mut burst = vec![activity];
+                    while burst.len() < CHILD_ACTIVITY_BURST_LIMIT
+                        && let Ok(next) = child_activity_rx.try_recv()
+                    {
+                        burst.push(next);
                     }
-                    record_subagent_activity(
-                        &mut journal,
-                        &events,
-                        session_id,
-                        subagents.as_ref().expect("child activity requires coordinator"),
-                        &watches,
-                        activity,
-                    ).await?;
+                    for activity in burst {
+                        if work_plan_topology_changed(&activity) {
+                            work_plan_refresh.force_refresh = true;
+                            work_plan_refresh.start(&journal, &work_plan, subagents.as_ref());
+                        }
+                        record_subagent_activity(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            subagents.as_ref().expect("child activity requires coordinator"),
+                            &watches,
+                            activity,
+                            true,
+                        ).await?;
+                    }
+                    journal.flush_deferred().await?;
                 }
             }
         }
@@ -14807,6 +14848,8 @@ async fn forward_child_activity(
 /// drains at stop, the durable root-inbox refresh -- comes through here, so the
 /// journal and the watcher cannot disagree about a child's life, and a further
 /// source only has to call this rather than be added to every loop.
+/// `defer` holds the activity row for the caller's next flush, so a burst of
+/// child activity commits once instead of once per child event.
 async fn record_subagent_activity(
     journal: &mut RuntimeSessionStore,
     events: &mpsc::Sender<SessionEvent>,
@@ -14814,6 +14857,7 @@ async fn record_subagent_activity(
     subagents: &SubagentCoordinator,
     watches: &crate::watch::Watches,
     activity: SubagentActivity,
+    defer: bool,
 ) -> Result<()> {
     // A child's assistant message is a mutable live projection until its
     // Complete boundary. Marking the first in-progress snapshot as projected
@@ -14930,7 +14974,11 @@ async fn record_subagent_activity(
         agent,
         event,
     };
-    record(journal, events, session_id, kind).await?;
+    if defer && projected_message_id.is_none() && batchable_provider_event(&kind) {
+        journal.defer(events, SessionEvent::new(session_id, 0, kind));
+    } else {
+        record(journal, events, session_id, kind).await?;
+    }
     watches
         .observe_agent(observed_agent.0, observed_agent.1, &observed_agent.2)
         .await;
@@ -14950,7 +14998,10 @@ async fn refresh_durable_root_inbox(
     let reports = subagents.refresh_root_inbox_reports().await?;
     let changed = !reports.is_empty();
     for (_, activity) in reports {
-        record_subagent_activity(journal, events, session_id, subagents, watches, activity).await?;
+        record_subagent_activity(
+            journal, events, session_id, subagents, watches, activity, false,
+        )
+        .await?;
     }
     subagents.wake_pending_root_messages().await;
     // Only a sweep confirms, acknowledges or retries a dispatch.
@@ -15278,8 +15329,21 @@ async fn account_goal_tokens(
     {
         current.status = GoalStatus::BudgetLimited;
         *active_since = None;
+        return record_goal(journal, events, session_id, goal).await;
     }
-    record_goal(journal, events, session_id, goal).await
+    // A usage tally rides the provider output it accounts for. Recording it
+    // flushed that run, so every model usage report cost its own commit.
+    journal.defer(
+        events,
+        SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::GoalUpdated {
+                goal: current.clone(),
+            },
+        ),
+    );
+    Ok(())
 }
 
 async fn settle_goal_time(
