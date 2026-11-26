@@ -685,7 +685,9 @@ fn stall_detection_counts_every_process_of_the_job() {
     let run = |name: &str, script: &str| {
         let mut spec = lane.spec(name, script);
         spec.timeout_ms = 60_000;
-        spec.stall_timeout_ms = Some(1_500);
+        // Long enough that a loaded host still samples the busy and chatty
+        // jobs making progress; 1.5s killed them during release runs.
+        spec.stall_timeout_ms = Some(5_000);
         lane.submit(&spec)
     };
     // The leader waits; its child burns one CPU-second without output. A
