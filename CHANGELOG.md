@@ -5,6 +5,11 @@ Git comparison.
 
 ## Unreleased (since 0.22.6)
 
+- A goal whose agent can only wait now blocks instead of continuing. Turns
+  that did nothing but wait for agents or watchers counted as progress, so a
+  director that kept reporting the same blocker was prompted to continue
+  indefinitely, resending its whole context each time.
+
 - A Claude turn that ends with a complete tool call and an `end_turn` stop
   reason now runs the call instead of failing with "native provider returned
   tool calls with inconsistent finish reason `stop`". Several

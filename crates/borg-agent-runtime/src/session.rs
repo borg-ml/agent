@@ -6074,7 +6074,7 @@ async fn run_agent_session_store_kernel_inner(
         let mut role_notice_pending = false;
         let mut network_recovery_pending = network_retry_message_id.is_some();
         let mut turn_had_side_effects = false;
-        let mut turn_called_tools = false;
+        let mut turn_advanced_goal = false;
         let mut retryable_provider_errors = Vec::new();
         let mut turn_reported_error = false;
         let mut batch_pending_after_interrupt = false;
@@ -6267,7 +6267,7 @@ async fn run_agent_session_store_kernel_inner(
                         }
                         turn_reported_error |= matches!(&kind, SessionEventKind::Error { .. });
                         turn_had_side_effects |= provider_event_has_side_effect(&kind);
-                        turn_called_tools |= matches!(kind, SessionEventKind::ToolStarted { .. });
+                        turn_advanced_goal |= tool_advances_goal(&kind);
                         if watchdog.phase() == TurnPhase::AwaitingProvider {
                             watchdog.set_phase(TurnPhase::Active);
                             record(
@@ -6375,7 +6375,7 @@ async fn run_agent_session_store_kernel_inner(
                             retry_not_before = None;
                             if !interrupted {
                                 goal_turn_failures.reset();
-                                if !is_goal_continuation(&prompt) || turn_called_tools {
+                                if !is_goal_continuation(&prompt) || turn_advanced_goal {
                                     idle_goal_turns = 0;
                                 } else {
                                     idle_goal_turns = idle_goal_turns.saturating_add(1);
@@ -8252,7 +8252,7 @@ async fn run_agent_session_store_kernel_inner(
                     }
                     turn_reported_error |= matches!(&kind, SessionEventKind::Error { .. });
                     turn_had_side_effects |= provider_event_has_side_effect(&kind);
-                    turn_called_tools |= matches!(kind, SessionEventKind::ToolStarted { .. });
+                    turn_advanced_goal |= tool_advances_goal(&kind);
                     if watchdog.phase() == TurnPhase::AwaitingProvider {
                         watchdog.set_phase(TurnPhase::Active);
                         record(
@@ -15892,6 +15892,19 @@ async fn record_goal(
         SessionEventKind::GoalUpdated { goal },
     )
     .await
+}
+
+/// Waiting is not work. A goal turn that only waits for agents or watchers made
+/// no progress: counting it as progress let a goal whose agent kept saying it
+/// was blocked continue indefinitely, a full-context turn each time.
+fn tool_advances_goal(kind: &SessionEventKind) -> bool {
+    let SessionEventKind::ToolStarted { name, input, .. } = kind else {
+        return false;
+    };
+    let waits = matches!(name.as_str(), "wait_agent" | "await_watchers")
+        || (name == "capability"
+            && input.get("name").and_then(Value::as_str) == Some("await_watchers"));
+    !waits
 }
 
 const GOAL_CONTINUATION_LEAD: &str = "Continue working toward the active session goal.";
