@@ -216,21 +216,21 @@ async fn slow_inbox_sweeps_do_not_withhold_completed_tools_until_stop() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        next_matching(&mut events, |kind| {
-            matches!(kind, SessionEventKind::GoalCleared { .. })
-        }),
-    )
-    .await
-    .unwrap();
-    let completed = tokio::time::timeout(
-        Duration::from_secs(3),
-        next_matching(&mut events, |kind| {
-            matches!(kind, SessionEventKind::ToolCompleted { tool_call_id, .. }
-            if tool_call_id == TOOL_ID)
-        }),
-    )
+    // The tool may be delivered on either side of the cleared goal: which one
+    // the actor reaches first depends on scheduling, and waiting for them in a
+    // fixed order skipped a tool that arrived first.
+    let (mut cleared, mut tool) = (false, false);
+    let completed = tokio::time::timeout(Duration::from_secs(8), async {
+        while !(cleared && tool) {
+            match events.recv().await.expect("actor remains available").kind {
+                SessionEventKind::GoalCleared { .. } => cleared = true,
+                SessionEventKind::ToolCompleted { tool_call_id, .. } if tool_call_id == TOOL_ID => {
+                    tool = true
+                }
+                _ => {}
+            }
+        }
+    })
     .await;
     let mail = if completed.is_ok() {
         let message_id = append_team_message(
