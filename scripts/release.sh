@@ -212,7 +212,13 @@ require_disk_space() {
 run_build() (
   # A separate job process group lets us stop Cargo and its compiler children.
   set -m
-  "$@" &
+  # Builds and tests must not inherit the landing lock: a job a failed test
+  # leaves running would otherwise hold it and block every later landing.
+  if [[ -n "${landing_lock_fd:-}" ]]; then
+    "$@" {landing_lock_fd}>&- &
+  else
+    "$@" &
+  fi
   build_pid=$!
   stop_build() {
     if kill -TERM -- "-$build_pid" 2>/dev/null; then
