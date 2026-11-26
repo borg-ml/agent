@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.22.6)
+## Unreleased (since 0.23.0)
+
+## 0.23.0 (2026-11-26)
 
 - The sign-in view shows its QR code whenever the terminal can physically fit
   it. It used to require the code to fit inside the 96-column text column
