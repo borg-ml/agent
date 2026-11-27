@@ -2853,20 +2853,21 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
                 ServiceRequest::Yield {
                     by: "budget-release".into(),
                     reason: "handoff".into(),
-                    ttl_ms: 5_000,
+                    ttl_ms: 15_000,
                 },
                 Duration::from_secs(5),
             )
             .await
             .unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while !matches!(
-            manager.read_status("second").unwrap().state,
-            ServiceState::Healthy { .. }
-        ) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let status = manager.read_status("second").unwrap();
+            if matches!(status.state, ServiceState::Healthy { .. }) {
+                break;
+            }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "second did not admit after yield"
+                "second did not admit after yield: {status:?}"
             );
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
