@@ -342,49 +342,58 @@ fn project_id(value: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// The Antigravity Hub release Borg reports, read once per process from the
-/// Hub's update manifest so newly released models are served.
-async fn hub_version() -> &'static str {
-    static VERSION: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
-    VERSION
-        .get_or_init(|| async {
-            let manifest = async {
-                reqwest::Client::builder()
-                    .timeout(Duration::from_secs(5))
-                    .build()
-                    .ok()?
-                    .get(HUB_MANIFEST)
-                    .header(reqwest::header::USER_AGENT, "electron-builder")
-                    .send()
-                    .await
-                    .ok()?
-                    .text()
-                    .await
-                    .ok()
-            };
-            manifest
-                .await
-                .and_then(|text| {
-                    text.lines()
+/// The Antigravity Hub release Borg reports. Returns `FALLBACK_HUB_VERSION`
+/// immediately so first-turn TTFT never blocks on the update manifest, while a
+/// one-time background fetch picks up newer releases for subsequent turns.
+async fn hub_version() -> String {
+    static VERSION: std::sync::OnceLock<std::sync::RwLock<String>> = std::sync::OnceLock::new();
+    static REFRESHED: std::sync::Once = std::sync::Once::new();
+    let store = VERSION.get_or_init(|| std::sync::RwLock::new(FALLBACK_HUB_VERSION.to_owned()));
+    REFRESHED.call_once(|| {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let fetched = async {
+                    let client = client().ok()?;
+                    let text = client
+                        .get(HUB_MANIFEST)
+                        .timeout(Duration::from_secs(5))
+                        .header(reqwest::header::USER_AGENT, "electron-builder")
+                        .send()
+                        .await
+                        .ok()?
+                        .text()
+                        .await
+                        .ok()?;
+                    let version = text
+                        .lines()
                         .find_map(|line| line.strip_prefix("version:"))
-                        .map(|version| version.trim().trim_matches(['"', '\'']).to_owned())
-                })
-                .filter(|version| {
+                        .map(|version| version.trim().trim_matches(['"', '\'']).to_owned())?;
                     let parts: Vec<u32> = version
                         .split('.')
                         .filter_map(|part| part.parse().ok())
                         .collect();
-                    parts.len() == 3 && (parts[0], parts[1], parts[2]) >= MINIMUM_HUB_VERSION
-                })
-                .unwrap_or_else(|| FALLBACK_HUB_VERSION.to_owned())
-        })
-        .await
+                    (parts.len() == 3 && (parts[0], parts[1], parts[2]) >= MINIMUM_HUB_VERSION)
+                        .then_some(version)
+                }
+                .await;
+                if let Some(version) = fetched
+                    && let Ok(mut guard) = store.write()
+                {
+                    *guard = version;
+                }
+            });
+        }
+    });
+    store
+        .read()
+        .map(|guard| guard.clone())
+        .unwrap_or_else(|_| FALLBACK_HUB_VERSION.to_owned())
 }
 
 /// The Hub `User-Agent`; Cloud Code decides from it which models to serve.
 pub(crate) async fn user_agent() -> String {
     let version = hub_version().await;
-    let changelist = match version {
+    let changelist = match version.as_str() {
         "2.23.0" => "; cl=998057262",
         "2.23.1" => "; cl=998881661",
         "2.24.0" => "; cl=1000335682",
@@ -456,13 +465,15 @@ impl CodeAssistError {
 }
 
 /// The wire model ids this login can call, in the order Antigravity lists them.
-pub(crate) async fn available_model_ids(auth_file: Option<PathBuf>) -> Result<Vec<String>> {
-    let mut access = access_from(auth_file.clone(), None).await?;
+pub(crate) async fn available_model_ids_with_access(
+    access: &mut SubscriptionAccess,
+    auth_file: &Option<PathBuf>,
+) -> Result<Vec<String>> {
     let client = client()?;
     let response = post_project_json(
         &client,
-        &mut access,
-        &auth_file,
+        access,
+        auth_file,
         "fetchAvailableModels",
         "Gemini model list",
     )
@@ -1029,11 +1040,25 @@ fn private_directory(path: &Path) -> Result<()> {
 }
 
 pub(crate) fn client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client.clone());
+    }
+    let built = reqwest::Client::builder()
+        .tcp_nodelay(true)
+        .pool_idle_timeout(Duration::from_secs(90))
+        .tcp_keepalive(Duration::from_secs(30))
+        .http2_keep_alive_interval(Duration::from_secs(30))
+        .http2_keep_alive_while_idle(true)
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .context("create Gemini authentication client")
+        .context("create Gemini authentication client")?;
+    let _ = CLIENT.set(built);
+    CLIENT
+        .get()
+        .cloned()
+        .context("Gemini authentication client unavailable")
 }
 
 async fn response_json(response: reqwest::Response) -> Result<Value> {

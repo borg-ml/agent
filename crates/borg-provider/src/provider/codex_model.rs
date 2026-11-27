@@ -89,6 +89,11 @@ fn model_http_client(account: &str) -> Result<reqwest::Client> {
         return Ok(client.clone());
     }
     let client = reqwest::Client::builder()
+        .tcp_nodelay(true)
+        .pool_idle_timeout(Duration::from_secs(90))
+        .tcp_keepalive(Duration::from_secs(30))
+        .http2_keep_alive_interval(Duration::from_secs(30))
+        .http2_keep_alive_while_idle(true)
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(30))
         .cookie_provider(Arc::new(RoutingCookies::default()))
@@ -205,12 +210,12 @@ struct SubscriptionAccess {
 
 // Public stable-release metadata keeps new subscription models visible without
 // depending on an installed Codex runtime. No credentials accompany this GET.
-async fn catalog_client_version(client: &reqwest::Client) -> String {
+// When `blocking` is false, return the fallback/cached version immediately so
+// first-turn TTFT never blocks on npmjs while refreshing in the background.
+async fn catalog_client_version(client: &reqwest::Client, blocking: bool) -> String {
     static CACHE: OnceLock<tokio::sync::Mutex<Option<(Instant, String)>>> = OnceLock::new();
-    let mut cache = CACHE
-        .get_or_init(|| tokio::sync::Mutex::new(None))
-        .lock()
-        .await;
+    let cache_mutex = CACHE.get_or_init(|| tokio::sync::Mutex::new(None));
+    let mut cache = cache_mutex.lock().await;
     if let Some((checked, version)) = cache.as_ref()
         && checked.elapsed() < CATALOG_CACHE_TTL
     {
@@ -218,14 +223,32 @@ async fn catalog_client_version(client: &reqwest::Client) -> String {
     }
     let previous = cache
         .as_ref()
-        .map(|(_, version)| version.as_str())
-        .unwrap_or(CATALOG_CLIENT_VERSION_FALLBACK);
+        .map(|(_, version)| version.clone())
+        .unwrap_or_else(|| CATALOG_CLIENT_VERSION_FALLBACK.to_owned());
+    if !blocking {
+        *cache = Some((Instant::now(), previous.clone()));
+        drop(cache);
+        let client = client.clone();
+        let fallback = previous.clone();
+        tokio::spawn(async move {
+            match fetch_catalog_client_version(&client, CODEX_VERSION_ENDPOINT).await {
+                Ok(version) if stable_version(&version) >= stable_version(&fallback) => {
+                    *cache_mutex.lock().await = Some((Instant::now(), version));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "Codex version metadata unavailable; retaining compatible catalog version");
+                }
+            }
+        });
+        return previous;
+    }
     let version = match fetch_catalog_client_version(client, CODEX_VERSION_ENDPOINT).await {
-        Ok(version) if stable_version(&version) >= stable_version(previous) => version,
-        Ok(_) => previous.to_owned(),
+        Ok(version) if stable_version(&version) >= stable_version(&previous) => version,
+        Ok(_) => previous,
         Err(error) => {
             tracing::warn!(%error, "Codex version metadata unavailable; retaining compatible catalog version");
-            previous.to_owned()
+            previous
         }
     };
     *cache = Some((Instant::now(), version.clone()));
@@ -378,7 +401,19 @@ impl SubscriptionAccess {
             }
             return Ok(found.clone());
         }
-        self.fetch_catalog(client).await?;
+        self.fetch_catalog_with_version_mode(client, false).await?;
+        if let Some(found) = MODELS
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|entry| entry.models.iter().find(|entry| entry.slug == model))
+            .cloned()
+        {
+            return Ok(found);
+        }
+        // Only pay the external npmjs version lookup if the requested model was
+        // missing from the catalog fetched with the bundled fallback version.
+        self.fetch_catalog_with_version_mode(client, true).await?;
         MODELS
             .lock()
             .await
@@ -389,7 +424,15 @@ impl SubscriptionAccess {
     }
 
     async fn fetch_catalog(&mut self, client: &reqwest::Client) -> Result<()> {
-        let version = catalog_client_version(client).await;
+        self.fetch_catalog_with_version_mode(client, false).await
+    }
+
+    async fn fetch_catalog_with_version_mode(
+        &mut self,
+        client: &reqwest::Client,
+        blocking_version: bool,
+    ) -> Result<()> {
+        let version = catalog_client_version(client, blocking_version).await;
         let account = self.identity();
         // The catalog gates model visibility on its client protocol version, not Borg releases.
         // Keep Borg identified by originator; no installed executable is needed.

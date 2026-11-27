@@ -19,6 +19,7 @@ const TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
 const MAX_CREDENTIAL_BYTES: u64 = 256 * 1024;
 
 /// Deliberately not Debug or Serialize: access credentials never enter journals.
+#[derive(Clone)]
 pub struct SubscriptionAccess {
     pub(crate) token: String,
     pub(crate) account_id: String,
@@ -110,6 +111,41 @@ pub async fn access_from(
         .context("ChatGPT credential task failed")?
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct AuthFileStamp {
+    path: PathBuf,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    dev_ino: (u64, u64),
+}
+
+impl AuthFileStamp {
+    fn of(path: &Path) -> Option<Self> {
+        let meta = fs::metadata(path).ok()?;
+        #[cfg(unix)]
+        let dev_ino = {
+            use std::os::unix::fs::MetadataExt;
+            (meta.dev(), meta.ino())
+        };
+        Some(Self {
+            path: path.to_path_buf(),
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            #[cfg(unix)]
+            dev_ino,
+        })
+    }
+}
+
+struct CachedSubscriptionAccess {
+    stamp: AuthFileStamp,
+    expiry: i64,
+    access: SubscriptionAccess,
+}
+
+static ACCESS_CACHE: std::sync::Mutex<Vec<CachedSubscriptionAccess>> = std::sync::Mutex::new(Vec::new());
+
 async fn access_at(
     path: PathBuf,
     rejected_token: Option<String>,
@@ -118,6 +154,16 @@ async fn access_at(
     let path = path
         .canonicalize()
         .context("cannot locate saved ChatGPT subscription; reconnect with borg login codex")?;
+    let now = Utc::now().timestamp();
+    if rejected_token.is_none()
+        && let Some(stamp) = AuthFileStamp::of(&path)
+        && let Ok(cache) = ACCESS_CACHE.lock()
+        && let Some(hit) = cache
+            .iter()
+            .find(|entry| entry.stamp == stamp && entry.expiry > now + 90)
+    {
+        return Ok(hit.access.clone());
+    }
     let _lock = credential_lock(&path).await?;
     let mut document = load(&path)?;
     let account = account_from_document(&document)?;
@@ -127,9 +173,8 @@ async fn access_at(
         .context("saved ChatGPT access token is missing")?
         .to_owned();
     let claims = jwt_claims(&token)?;
-    let expired = claims["exp"]
-        .as_i64()
-        .is_none_or(|expiry| expiry <= Utc::now().timestamp() + 60);
+    let expiry = claims["exp"].as_i64().unwrap_or(0);
+    let expired = expiry <= Utc::now().timestamp() + 60;
     let rejected = rejected_token.as_deref() == Some(token.as_str());
     if expired || rejected {
         let refresh = document["tokens"]["refresh_token"]
@@ -181,13 +226,36 @@ async fn access_at(
         document["last_refresh"] = json!(Utc::now().to_rfc3339());
         save(&path, &document)?;
     }
-    Ok(SubscriptionAccess {
+    let result = SubscriptionAccess {
         token: document["tokens"]["access_token"]
             .as_str()
             .context("ChatGPT access token missing")?
             .to_owned(),
         account_id: account.account_id,
-    })
+    };
+    let final_expiry = if expired || rejected {
+        jwt_claims(&result.token)
+            .ok()
+            .and_then(|c| c["exp"].as_i64())
+            .unwrap_or(0)
+    } else {
+        expiry
+    };
+    if final_expiry > Utc::now().timestamp() + 90
+        && let Some(stamp) = AuthFileStamp::of(&path)
+        && let Ok(mut cache) = ACCESS_CACHE.lock()
+    {
+        cache.retain(|entry| entry.stamp.path != path);
+        if cache.len() >= 16 {
+            cache.remove(0);
+        }
+        cache.push(CachedSubscriptionAccess {
+            stamp,
+            expiry: final_expiry,
+            access: result.clone(),
+        });
+    }
+    Ok(result)
 }
 
 async fn credential_lock(path: &Path) -> Result<fs::File> {
@@ -299,11 +367,22 @@ fn save(path: &Path, document: &Value) -> Result<()> {
 }
 
 fn client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client.clone());
+    }
+    let built = reqwest::Client::builder()
+        .tcp_nodelay(true)
+        .pool_idle_timeout(Duration::from_secs(90))
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .context("create ChatGPT authentication client")
+        .context("create ChatGPT authentication client")?;
+    let _ = CLIENT.set(built);
+    CLIENT
+        .get()
+        .cloned()
+        .context("ChatGPT authentication client unavailable")
 }
 
 async fn response_json(response: reqwest::Response) -> Result<Value> {

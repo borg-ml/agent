@@ -5,6 +5,18 @@ Git comparison.
 
 ## Unreleased (since 0.23.0)
 
+- Lower TTFT and inter-round latency across providers and the native harness:
+  enabled HTTP/2 multiplexing and keepalive (`reqwest` `http2` + `tcp_nodelay`
+  + 90 s idle pools) across Anthropic, Claude, Codex, Gemini, OpenRouter, and
+  OpenCode clients; stopped blocking first-turn TTFT on external version
+  metadata fetches in Gemini (`hub_version`) and Codex
+  (`catalog_client_version`); reused pooled HTTP clients and stat-validated
+  Codex credential reads; overlapped independent turn-startup I/O in
+  `native_harness` via `tokio::join!`; batched `TurnStarted` + `StatusChanged`
+  into one journal commit; replaced per-round full `SessionState` reads with a
+  targeted `session_configuration` query; cached historical image tile counts;
+  and widened parallel read-only tool batches from 4 to 16.
+
 - Faster, smoother live streaming with dramatically lower database load:
   streamed assistant and reasoning deltas now coalesce in batches, deliver to
   attached terminals immediately in memory, and flush live preview state to

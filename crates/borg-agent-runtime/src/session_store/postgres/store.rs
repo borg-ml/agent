@@ -1275,6 +1275,26 @@ impl SessionStore for PostgresSessionStore {
         Ok(serde_json::from_str(&state_json)?)
     }
 
+    async fn session_configuration(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<crate::session_store::SessionConfiguration>> {
+        let config_json: Option<Option<serde_json::Value>> = super::retry_transient(|| async {
+            Ok(sqlx::query_scalar(
+                "select state_json::jsonb -> 'configuration' from sessions where id = $1",
+            )
+            .bind(session_id)
+            .fetch_optional(self.pool())
+            .await?)
+        })
+        .await?;
+        let Some(Some(value)) = config_json.filter(|v| v.as_ref().is_some_and(|v| !v.is_null()))
+        else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_value(value)?))
+    }
+
     async fn prompt_event(
         &self,
         session_id: Uuid,

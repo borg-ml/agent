@@ -1,7 +1,4 @@
 //! Shared stream contracts, subscription account metadata, and compatibility adapters.
-//!
-//! Claude turns run through Borg's native harness. The legacy Claude stream
-//! entrypoints remain only to reject calls without starting an external runtime.
 
 #![cfg_attr(not(any(feature = "codex", feature = "claude")), allow(dead_code))]
 

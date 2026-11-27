@@ -817,7 +817,7 @@ request: {shape}"
             body["response_format"] = response_format;
         }
 
-        let client = reqwest::Client::new();
+        let client = compatible_http_client();
         let request = client.post(&endpoint).bearer_auth(&api_key).json(&body);
         let response = apply_provider_request_timeout(request)
             .send()
@@ -1255,7 +1255,16 @@ fn mark_last_text_part(message: &mut Value, marker: &Value) -> bool {
 
 fn compatible_http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(reqwest::Client::new)
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .tcp_nodelay(true)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .tcp_keepalive(Duration::from_secs(30))
+        .http2_keep_alive_interval(Duration::from_secs(30))
+        .http2_keep_alive_while_idle(true)
+            .build()
+            .unwrap_or_default()
+    })
 }
 
 /// Chat-completions `tool` messages are text-only on every server, so a tool

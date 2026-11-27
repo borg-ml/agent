@@ -94,7 +94,7 @@ impl GeminiModelProvider {
                 ProviderErrorKind::Fatal,
             ));
         }
-        let wire_model = wire_model(&self.model, self.effort.as_deref(), auth_file.clone()).await;
+        let wire_model = wire_model(&self.model, self.effort.as_deref(), &mut access, &auth_file).await;
         trace.invocation.args = vec![wire_model.clone()];
         let inner = request_body(&wire_model, self.effort.as_deref(), &request, account);
         let user_agent = gemini_subscription::user_agent().await;
@@ -214,6 +214,11 @@ fn stream_client() -> reqwest::Client {
     CLIENT
         .get_or_init(|| {
             reqwest::Client::builder()
+                .tcp_nodelay(true)
+                .pool_idle_timeout(std::time::Duration::from_secs(90))
+                .tcp_keepalive(std::time::Duration::from_secs(30))
+                .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+                .http2_keep_alive_while_idle(true)
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("Gemini HTTP client")
@@ -226,7 +231,12 @@ fn stream_client() -> reqwest::Client {
 /// The id Cloud Code serves `model` under for this login. Some models are
 /// advertised only with their thinking tier (`gemini-3.8-flash-high`), so the
 /// tier matching `effort` wins, then the bare id, then the highest tier.
-async fn wire_model(model: &str, effort: Option<&str>, auth_file: Option<PathBuf>) -> String {
+async fn wire_model(
+    model: &str,
+    effort: Option<&str>,
+    access: &mut gemini_subscription::SubscriptionAccess,
+    auth_file: &Option<PathBuf>,
+) -> String {
     static CACHE: std::sync::Mutex<Option<(Instant, Vec<String>)>> = std::sync::Mutex::new(None);
     let cached = CACHE
         .lock()
@@ -236,7 +246,7 @@ async fn wire_model(model: &str, effort: Option<&str>, auth_file: Option<PathBuf
         .map(|(_, ids)| ids);
     let ids = match cached {
         Some(ids) => ids,
-        None => match gemini_subscription::available_model_ids(auth_file).await {
+        None => match gemini_subscription::available_model_ids_with_access(access, auth_file).await {
             Ok(ids) => {
                 if let Ok(mut cache) = CACHE.lock() {
                     *cache = Some((Instant::now(), ids.clone()));

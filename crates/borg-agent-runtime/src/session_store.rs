@@ -1682,6 +1682,15 @@ pub trait SessionStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<SessionEvent>>;
     async fn state(&self, session_id: Uuid) -> Result<SessionState>;
+
+    /// Read only the session's configuration without loading the full projected
+    /// `SessionState` (plans, processes, usage, etc.).
+    async fn session_configuration(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<SessionConfiguration>> {
+        Ok(self.state(session_id).await?.configuration)
+    }
     /// Cache-routing identity only; a fork must still start its own provider continuation.
     async fn prompt_cache_session_id(&self, session_id: Uuid) -> Result<Uuid>;
 

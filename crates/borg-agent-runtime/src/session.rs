@@ -5955,29 +5955,25 @@ async fn run_agent_session_store_kernel_inner(
             )
             .await?;
         }
-        record(
+        record_all(
             &mut journal,
             &events,
             session_id,
-            SessionEventKind::TurnStarted {
-                message_id: prompt.message_id,
-                provider: launch.provider,
-                model: launch.model.clone(),
-                effort: launch.effort.clone(),
-                fast: launch.fast.unwrap_or(false),
-                ultrafast: launch.ultrafast.unwrap_or(false),
-            },
-        )
-        .await?;
-        record(
-            &mut journal,
-            &events,
-            session_id,
-            SessionEventKind::StatusChanged {
-                status: SessionStatus::Running,
-                lifecycle: Some(SubagentLifecycle::Running),
-                detail: Some(TurnPhase::AwaitingProvider.detail().to_string()),
-            },
+            vec![
+                SessionEventKind::TurnStarted {
+                    message_id: prompt.message_id,
+                    provider: launch.provider,
+                    model: launch.model.clone(),
+                    effort: launch.effort.clone(),
+                    fast: launch.fast.unwrap_or(false),
+                    ultrafast: launch.ultrafast.unwrap_or(false),
+                },
+                SessionEventKind::StatusChanged {
+                    status: SessionStatus::Running,
+                    lifecycle: Some(SubagentLifecycle::Running),
+                    detail: Some(TurnPhase::AwaitingProvider.detail().to_string()),
+                },
+            ],
         )
         .await?;
         start_workspace_projection_repair(
@@ -6076,16 +6072,19 @@ async fn run_agent_session_store_kernel_inner(
         }
         let active_provider = launch.provider;
         let active_model = launch.model.clone();
+        let (prompt_cache_session_id, turn_state) = tokio::try_join!(
+            journal.store.prompt_cache_session_id(session_id),
+            journal.state(session_id),
+        )?;
+        let context_generation = turn_state.context_generation;
         let turn = AgentTurn {
             session_id,
-            prompt_cache_session_id: Some(journal.store.prompt_cache_session_id(session_id).await?),
+            prompt_cache_session_id: Some(prompt_cache_session_id),
             message_id: prompt.message_id,
-            context_generation: journal.state(session_id).await?.context_generation,
+            context_generation,
             prior_native_context_tokens: if native_provider && provider_context_usage_valid {
                 native_context_usage
-            } else if native_provider
-                && journal.state(session_id).await?.context_generation == resumed_context_generation
-            {
+            } else if native_provider && context_generation == resumed_context_generation {
                 resumed_native_context_tokens.take()
             } else {
                 None

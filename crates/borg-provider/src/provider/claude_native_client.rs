@@ -140,6 +140,11 @@ impl NativeConnector {
             device_id: Arc::new(device_id),
             http: reqwest::Client::builder()
                 .https_only(true)
+                .tcp_nodelay(true)
+                .pool_idle_timeout(Duration::from_secs(90))
+                .tcp_keepalive(Duration::from_secs(30))
+                .http2_keep_alive_interval(Duration::from_secs(30))
+                .http2_keep_alive_while_idle(true)
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(5))
                 .build()?,

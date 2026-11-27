@@ -1101,8 +1101,8 @@ fn policy_flag(value: Option<Value>, name: &str) -> Result<bool> {
 impl AgentToolDispatcher {
     // The dispatcher deliberately receives each independently disableable
     // service explicitly at its construction boundary.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    #[allow(dead_code)]
     pub(crate) fn new(
         goals: SessionGoalTools,
         todos: SessionTodoTools,

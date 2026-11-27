@@ -682,13 +682,26 @@ async fn fetch(operation: Operation, body: Option<&Value>, bearer: Option<&str>)
 
 #[cfg(not(test))]
 async fn fetch(operation: Operation, body: Option<&Value>, bearer: Option<&str>) -> Result<Value> {
-    let client = reqwest::Client::builder()
-        .https_only(true)
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(30))
-        .connect_timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|_| anyhow::anyhow!("cannot initialize Claude TLS client"))?;
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = match CLIENT.get() {
+        Some(client) => client.clone(),
+        None => {
+            let built = reqwest::Client::builder()
+                .https_only(true)
+                .tcp_nodelay(true)
+                .pool_idle_timeout(Duration::from_secs(90))
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(30))
+                .connect_timeout(Duration::from_secs(10))
+                .build()
+                .map_err(|_| anyhow::anyhow!("cannot initialize Claude TLS client"))?;
+            let _ = CLIENT.set(built);
+            CLIENT
+                .get()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("cannot initialize Claude TLS client"))?
+        }
+    };
     // Claude throttles these account endpoints per client. A throttled or
     // briefly failing check is retried, honouring Retry-After, before the turn
     // is handed to the reconnection loop; it never means the plan is exhausted.

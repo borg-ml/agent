@@ -237,10 +237,24 @@ pub struct UsageWindow {
 pub async fn usage(key: &str) -> Result<Vec<UsageWindow>> {
     let key = key.trim();
     ensure!(!key.is_empty(), "the subscription key is empty");
-    let response = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .build()
-        .context("create OpenCode Go usage client")?
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = match CLIENT.get() {
+        Some(client) => client.clone(),
+        None => {
+            let built = reqwest::Client::builder()
+                .tcp_nodelay(true)
+                .pool_idle_timeout(std::time::Duration::from_secs(90))
+                .timeout(std::time::Duration::from_secs(20))
+                .build()
+                .context("create OpenCode Go usage client")?;
+            let _ = CLIENT.set(built);
+            CLIENT
+                .get()
+                .cloned()
+                .context("OpenCode Go usage client unavailable")?
+        }
+    };
+    let response = client
         .get(format!("{BASE_URL}/usage"))
         .bearer_auth(key)
         .header("accept", "application/json")

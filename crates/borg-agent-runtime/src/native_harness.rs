@@ -827,17 +827,25 @@ impl NativeHarness {
                 .configure_execution_provider(self.execution_provider.clone());
         }
         let session_store = turn.agent_tools.session_store();
-        let runtime = NativeToolRuntime::start(NativeToolRuntimeConfig {
-            session_id: turn.session_id,
-            root: turn.cwd.clone(),
-            permission: turn.permission_mode,
-            agent_tools: turn.agent_tools.clone(),
-            extension_skill_roots: turn.extension_skill_roots.clone(),
-            execution_provider: turn.agent_tools.execution_provider(),
-            session_store,
-            workflow_process_manager: self.workflow_process_manager.clone(),
-        })
-        .await?;
+        // Overlap independent turn-startup I/O (workspace/skill scan, prompt
+        // attachment loading, harness/memory appendix, and model context window
+        // lookup) so TTFT pays only the slowest branch instead of their sum.
+        let (runtime_res, user_message_res, harness_appendix_res, prefetched_window) = tokio::join!(
+            NativeToolRuntime::start(NativeToolRuntimeConfig {
+                session_id: turn.session_id,
+                root: turn.cwd.clone(),
+                permission: turn.permission_mode,
+                agent_tools: turn.agent_tools.clone(),
+                extension_skill_roots: turn.extension_skill_roots.clone(),
+                execution_provider: turn.agent_tools.execution_provider(),
+                session_store,
+                workflow_process_manager: self.workflow_process_manager.clone(),
+            }),
+            native_user_message(&turn.cwd, &turn.prompt, &turn.attachments),
+            turn.agent_tools.harness_prompt_appendix(),
+            self.model_client.context_window(turn.provider, &model),
+        );
+        let runtime = runtime_res?;
         let tools = runtime.tool_definitions(turn.provider)?;
         let mut messages = Vec::with_capacity(turn.conversation.len().saturating_add(3));
         let mut system_prompt = super::agent::CODING_SYSTEM_PROMPT.to_string();
@@ -927,7 +935,7 @@ impl NativeHarness {
         let earlier_tool_calls = tool_call_ids(&history);
         messages.extend(history);
         let new_message_start = messages.len();
-        let user_message = native_user_message(&turn.cwd, &turn.prompt, &turn.attachments).await?;
+        let user_message = user_message_res?;
         record_native_message(&events, turn.provider, &user_message).await?;
         messages.push(user_message);
         if turn.answers_human {
@@ -952,7 +960,7 @@ impl NativeHarness {
         // availability, harness state) trails the prompt instead of sitting in
         // the head, and stays in history once sent, so a change only extends
         // the cached prefix.
-        let harness_prompt_appendix = turn.agent_tools.harness_prompt_appendix().await?;
+        let harness_prompt_appendix = harness_appendix_res?;
         let mut subagent_count = turn
             .prompt_context_base
             .get(&ContextSlot::Subagents)
@@ -1046,7 +1054,7 @@ impl NativeHarness {
         let mut route_window_tokens = self.capped_window(
             turn.provider,
             &model,
-            self.model_client.context_window(turn.provider, &model).await,
+            prefetched_window,
         );
         // Every request this turn sends, compaction included, shares these
         // fields, so each one extends the prefix the previous one cached.
@@ -1109,7 +1117,7 @@ impl NativeHarness {
             // Read only speed at a model boundary. The request and side-effectful
             // tools already in flight keep their context and are never cancelled.
             if let Some(store) = turn.agent_tools.session_store()
-                && let Some(config) = store.state(turn.session_id).await?.configuration
+                && let Some(config) = store.session_configuration(turn.session_id).await?
                 && config.provider == turn.provider && config.model.as_deref() == Some(model.as_str())
                 && config.effort == session_effort
             {
@@ -1149,15 +1157,20 @@ impl NativeHarness {
                 )
                 .await?;
             }
-            let current = turn.agent_tools.subagent_count_prompt().await;
-            // Compare with the last delivered snapshot, not its message shape:
-            // canonicalization merges user context and an explicit context edit
-            // may remove it. Neither should resend an unchanged count.
-            if let Some(content) = ContextSlot::Subagents.next(subagent_count.as_deref(), current) {
-                record_prompt_context(&events, turn.provider, ContextSlot::Subagents, &content).await?;
-                messages.push(ModelMessage::user(content.clone()));
-                subagent_count = Some(content);
-                canonicalize_native_messages(&mut messages);
+            // Round 1 already refreshed `ContextSlot::Subagents` during turn
+            // setup right before entering this loop; re-query only on later
+            // rounds after tools or steers ran.
+            if model_round > 1 {
+                let current = turn.agent_tools.subagent_count_prompt().await;
+                // Compare with the last delivered snapshot, not its message shape:
+                // canonicalization merges user context and an explicit context edit
+                // may remove it. Neither should resend an unchanged count.
+                if let Some(content) = ContextSlot::Subagents.next(subagent_count.as_deref(), current) {
+                    record_prompt_context(&events, turn.provider, ContextSlot::Subagents, &content).await?;
+                    messages.push(ModelMessage::user(content.clone()));
+                    subagent_count = Some(content);
+                    canonicalize_native_messages(&mut messages);
+                }
             }
             editor.publish(&messages, true).await;
             let request = ModelTurnRequest {
@@ -1752,7 +1765,7 @@ impl NativeHarness {
             let mut trailing_context_tokens = 0_u64;
             if parallel_reads || parallel_sends {
                 let pairs = tool_calls.iter().zip(&inputs).collect::<Vec<_>>();
-                for chunk in pairs.chunks(if parallel_sends { 32 } else { 4 }) {
+                for chunk in pairs.chunks(if parallel_sends { 32 } else { 16 }) {
                     // A steer collected from an earlier chunk preempts the
                     // chunks that have not started. This one has not started
                     // yet, so it is the boundary the steer was waiting for.
@@ -3364,6 +3377,32 @@ impl ProviderModelClient {
 
 /// Trim only the outgoing replay. Durable history keeps the image so a
 /// subsequent compaction or an explicit revisit can still refer to it.
+fn cached_image_piece_count(data_base64: &str) -> usize {
+    use std::hash::{Hash, Hasher};
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<(usize, u64), usize>>> =
+        std::sync::OnceLock::new();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    data_base64.hash(&mut hasher);
+    let key = (data_base64.len(), hasher.finish());
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Ok(guard) = cache.lock()
+        && let Some(&count) = guard.get(&key)
+    {
+        return count;
+    }
+    let count = base64::engine::general_purpose::STANDARD
+        .decode(data_base64)
+        .map(|bytes| borg_provider::image_tiles::piece_count(&bytes))
+        .unwrap_or(1);
+    if let Ok(mut guard) = cache.lock() {
+        if guard.len() >= 256 {
+            guard.clear();
+        }
+        guard.insert(key, count);
+    }
+    count
+}
+
 fn limit_request_images(request: &mut ModelTurnRequest) {
     let mut remaining = MAX_REPLAY_IMAGE_BLOCKS;
     for message in request.messages.iter_mut().rev() {
@@ -3385,10 +3424,7 @@ fn limit_request_images(request: &mut ModelTurnRequest) {
             let blocks = if remaining == 0 {
                 1
             } else {
-                base64::engine::general_purpose::STANDARD
-                    .decode(&attachment.data_base64)
-                    .map(|bytes| borg_provider::image_tiles::piece_count(&bytes))
-                    .unwrap_or(1)
+                cached_image_piece_count(&attachment.data_base64)
             };
             if blocks <= remaining {
                 remaining -= blocks;
