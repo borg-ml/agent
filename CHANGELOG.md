@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.23.0)
+## Unreleased (since 0.23.1)
+
+## 0.23.1 (2026-11-27)
 
 - Lower TTFT and inter-round latency across providers and the native harness:
   enabled HTTP/2 multiplexing and keepalive (`reqwest` `http2` + `tcp_nodelay`
