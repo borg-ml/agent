@@ -27140,3 +27140,176 @@ async fn escape_does_not_commit_the_turn_backlog_one_event_at_a_time() {
     );
     scratch.discard().await;
 }
+
+// Streaming reasoning deltas and periodic snapshots must not trigger one
+// Postgres live-state commit per token; they must deliver live immediately,
+// coalesce store writes, and still archive the exact full text at completion.
+#[tokio::test]
+async fn streaming_reasoning_deltas_coalesce_live_store_writes_and_archive_full_text() {
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    let reasoning_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let expected_reasoning: String = (0..200).map(|i| format!("tok{i} ")).collect();
+
+    struct BurstReasoningExecutor {
+        reasoning_id: Uuid,
+        message_id: Uuid,
+    }
+    #[async_trait::async_trait]
+    impl AgentTurnExecutor for BurstReasoningExecutor {
+        async fn execute(
+            &self,
+            _turn: AgentTurn,
+            events: mpsc::Sender<SessionEventKind>,
+            _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+        ) -> Result<AgentTurnResult> {
+            events
+                .send(SessionEventKind::ReasoningBlockStarted {
+                    reasoning_id: self.reasoning_id,
+                })
+                .await
+                .unwrap();
+            let mut acc = String::new();
+            for i in 0..200 {
+                let chunk = format!("tok{i} ");
+                acc.push_str(&chunk);
+                events
+                    .send(SessionEventKind::ReasoningBlockDelta {
+                        reasoning_id: self.reasoning_id,
+                        delta: chunk,
+                    })
+                    .await
+                    .unwrap();
+                if i % 5 == 0 {
+                    events
+                        .send(SessionEventKind::ReasoningBlockSnapshot {
+                            reasoning_id: self.reasoning_id,
+                            text: acc.clone(),
+                        })
+                        .await
+                        .unwrap();
+                }
+            }
+            events
+                .send(SessionEventKind::ReasoningBlockCompleted {
+                    reasoning_id: self.reasoning_id,
+                })
+                .await
+                .unwrap();
+            events
+                .send(SessionEventKind::MessageDelta {
+                    message_id: self.message_id,
+                    delta: "done".into(),
+                })
+                .await
+                .unwrap();
+            events
+                .send(SessionEventKind::Message {
+                    message_id: self.message_id,
+                    actor: EventActor::Assistant,
+                    text: "done".into(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                })
+                .await
+                .unwrap();
+            Ok(AgentTurnResult {
+                provider_session_id: None,
+                final_text: "done".into(),
+            })
+        }
+    }
+
+    let (command_tx, command_rx) = mpsc::channel(16);
+    let (event_tx, mut event_rx) = mpsc::channel(512);
+    let executor = Arc::new(BurstReasoningExecutor {
+        reasoning_id,
+        message_id,
+    });
+    let lock_dir = tempfile::tempdir().unwrap();
+    let lock_path = lock_dir.path().join("session.lock");
+    let actor_store: Arc<dyn SessionStore> = Arc::new(store.clone());
+    let actor = tokio::spawn(async move {
+        run_session_actor(
+            &lock_path,
+            session_id,
+            LaunchSession {
+                request_id: Uuid::new_v4(),
+                cwd: std::env::temp_dir(),
+                provider: CodingProvider::Codex,
+                model: None,
+                effort: None,
+                fast: Some(false),
+                ultrafast: None,
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::FullAccess,
+                name: None,
+                initial_prompt: Some("think".to_string()),
+                capabilities: Default::default(),
+                subagent_concurrency_limit: None,
+                extension_skill_roots: Vec::new(),
+                team_policy: None,
+            },
+            command_rx,
+            event_tx,
+            executor,
+            actor_store,
+        )
+        .await
+    });
+
+    let mut live_reasoning = String::new();
+    tokio::time::timeout(EVENT_TIMEOUT, async {
+        while let Some(event) = event_rx.recv().await {
+            if let SessionEventKind::ReasoningBlockDelta {
+                reasoning_id: id,
+                ref delta,
+            } = event.kind
+                && id == reasoning_id
+            {
+                live_reasoning.push_str(delta);
+            }
+            if matches!(event.kind, SessionEventKind::TurnCompleted { .. }) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("turn completes");
+
+    assert_eq!(live_reasoning, expected_reasoning);
+    let live_revision: i64 =
+        sqlx::query_scalar("select live_revision from sessions where id = $1")
+            .bind(session_id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    // 200 deltas + 40 snapshots used to produce ~240 live_revision bumps;
+    // coalescing keeps Postgres live writes to a handful (start + anchor + tail).
+    assert!(
+        live_revision < 20,
+        "expected coalesced live_revision < 20 for 200 deltas + 40 snapshots, got {live_revision}"
+    );
+    let archived = store
+        .read(session_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|event| match event.kind {
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "reasoning_snapshot" && payload["complete"] == true =>
+            {
+                payload["text"].as_str().map(str::to_owned)
+            }
+            _ => None,
+        })
+        .expect("completed reasoning snapshot archived");
+    assert_eq!(archived, expected_reasoning);
+
+    command_tx.send(HostCommand::Stop { session_id }).await.ok();
+    let _ = tokio::time::timeout(EVENT_TIMEOUT, actor).await;
+    scratch.discard().await;
+}

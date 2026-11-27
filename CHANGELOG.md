@@ -5,6 +5,16 @@ Git comparison.
 
 ## Unreleased (since 0.23.0)
 
+- Faster, smoother live streaming with dramatically lower database load:
+  streamed assistant and reasoning deltas now coalesce in batches, deliver to
+  attached terminals immediately in memory, and flush live preview state to
+  PostgreSQL on a bounded cadence (250 ms / 16 KiB) and before every durable
+  boundary rather than running a full transaction on every reasoning token or
+  newline. Live preview writes skip parsing the full session state JSON, cache
+  durable anchors in memory, combine live-text lookup queries, and avoid
+  synchronous WAL fsyncs when no durable anchor is written. Attached TUI loops
+  also keep only the live tail instead of cloning full session history per turn.
+
 - Faster `runtime_exec` and Python `borg` tool calls: the persistent Python
   worker defers heavy stdlib imports (`asyncio`, `traceback`) and isolates its
   stdout control pipe so cold starts drop from ~83 ms to ~27 ms without child

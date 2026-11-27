@@ -547,6 +547,23 @@ enum PromptAdmissionState {
     Settled,
 }
 
+const LIVE_TEXT_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
+const LIVE_TEXT_FLUSH_MAX_BYTES: usize = 16 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum LiveDeltaStream {
+    Message(Uuid),
+    ReasoningBlock(Uuid),
+    ReasoningText,
+}
+
+struct PendingLiveDelta {
+    session_id: Uuid,
+    stream: LiveDeltaStream,
+    delta: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
 pub(crate) struct RuntimeSessionStore {
     store: Arc<dyn SessionStore>,
     context_events: Vec<SessionEvent>,
@@ -560,6 +577,11 @@ pub(crate) struct RuntimeSessionStore {
     plan_projection_generation: u64,
     received_agent_messages: HashSet<Uuid>,
     assistant_row_anchors: HashSet<Uuid>,
+    reasoning_nonblank_anchored: HashSet<Option<Uuid>>,
+    delta_backed_streams: HashSet<LiveDeltaStream>,
+    pending_live_deltas: Vec<PendingLiveDelta>,
+    pending_live_bytes: usize,
+    pending_live_flush_at: Option<tokio::time::Instant>,
     subagent_snapshots: HashMap<Uuid, crate::SubagentSnapshot>,
     /// Plain durable provider output held so a run of it commits as one
     /// transaction. Every other write flushes it first.
@@ -922,6 +944,11 @@ impl RuntimeSessionStore {
             plan_projection_generation: 0,
             received_agent_messages: HashSet::new(),
             assistant_row_anchors: HashSet::new(),
+            reasoning_nonblank_anchored: HashSet::new(),
+            delta_backed_streams: HashSet::new(),
+            pending_live_deltas: Vec::new(),
+            pending_live_bytes: 0,
+            pending_live_flush_at: None,
             subagent_snapshots: HashMap::new(),
             deferred: Vec::new(),
             deferred_delivery: None,
@@ -1100,8 +1127,122 @@ impl RuntimeSessionStore {
     /// stays authoritative and still takes every event in order; the mirror is
     /// repairable by design (`repair` batches ordinary rows and runs from every
     /// turn boundary), and a person waiting at the keyboard is not.
+    fn buffer_live_delta(
+        &mut self,
+        session_id: Uuid,
+        stream: LiveDeltaStream,
+        delta: &str,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        if delta.is_empty() {
+            return;
+        }
+        self.pending_live_bytes = self.pending_live_bytes.saturating_add(delta.len());
+        if let Some(existing) = self
+            .pending_live_deltas
+            .iter_mut()
+            .find(|entry| entry.session_id == session_id && entry.stream == stream)
+        {
+            existing.delta.push_str(delta);
+        } else {
+            self.pending_live_deltas.push(PendingLiveDelta {
+                session_id,
+                stream,
+                delta: delta.to_owned(),
+                created_at,
+            });
+        }
+        self.pending_live_flush_at
+            .get_or_insert_with(|| tokio::time::Instant::now() + LIVE_TEXT_FLUSH_INTERVAL);
+    }
+
+    fn drop_superseded_live_deltas(&mut self, kind: &SessionEventKind) {
+        match kind {
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::Assistant,
+                status: MessageStatus::Complete | MessageStatus::Failed,
+                ..
+            } => {
+                let target = LiveDeltaStream::Message(*message_id);
+                self.delta_backed_streams.remove(&target);
+                self.pending_live_deltas.retain(|entry| {
+                    if entry.stream == target {
+                        self.pending_live_bytes =
+                            self.pending_live_bytes.saturating_sub(entry.delta.len());
+                        false
+                    } else {
+                        true
+                    }
+                });
+                if self.pending_live_deltas.is_empty() {
+                    self.pending_live_flush_at = None;
+                }
+            }
+            SessionEventKind::ReasoningBlockCompleted { reasoning_id } => {
+                self.reasoning_nonblank_anchored.remove(&Some(*reasoning_id));
+                self.delta_backed_streams
+                    .remove(&LiveDeltaStream::ReasoningBlock(*reasoning_id));
+            }
+            SessionEventKind::ReasoningCompleted => {
+                self.reasoning_nonblank_anchored.remove(&None);
+                self.delta_backed_streams
+                    .remove(&LiveDeltaStream::ReasoningText);
+            }
+            SessionEventKind::TurnCompleted { .. } | SessionEventKind::ContextCleared => {
+                self.reasoning_nonblank_anchored.clear();
+                self.delta_backed_streams.clear();
+            }
+            _ => {}
+        }
+    }
+
+    fn live_deltas_due(&self) -> bool {
+        self.pending_live_bytes >= LIVE_TEXT_FLUSH_MAX_BYTES
+            || self
+                .pending_live_flush_at
+                .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+    }
+
+    async fn flush_pending_live_deltas(&mut self) -> Result<()> {
+        if self.pending_live_deltas.is_empty() {
+            self.pending_live_bytes = 0;
+            self.pending_live_flush_at = None;
+            return Ok(());
+        }
+        let entries = std::mem::take(&mut self.pending_live_deltas);
+        self.pending_live_bytes = 0;
+        self.pending_live_flush_at = None;
+        for entry in entries {
+            let kind = match entry.stream {
+                LiveDeltaStream::Message(message_id) => SessionEventKind::MessageDelta {
+                    message_id,
+                    delta: entry.delta,
+                },
+                LiveDeltaStream::ReasoningBlock(reasoning_id) => {
+                    SessionEventKind::ReasoningBlockDelta {
+                        reasoning_id,
+                        delta: entry.delta,
+                    }
+                }
+                LiveDeltaStream::ReasoningText => SessionEventKind::ReasoningTextDelta {
+                    delta: entry.delta,
+                },
+            };
+            let mut event = SessionEvent::new(entry.session_id, 0, kind);
+            event.created_at = entry.created_at;
+            let committed = self.store.append(event).await?;
+            self.note_assistant_row_anchor(&committed);
+        }
+        Ok(())
+    }
+
     async fn append_all(&mut self, events: Vec<SessionEvent>) -> Result<Vec<SessionEvent>> {
         self.flush_deferred().await?;
+        for event in &events {
+            self.drop_superseded_live_deltas(&event.kind);
+        }
+        self.flush_pending_live_deltas().await?;
         self.append_all_now(events).await
     }
 
@@ -1159,6 +1300,10 @@ impl RuntimeSessionStore {
             return Ok(());
         }
         let run = std::mem::take(&mut self.deferred);
+        for event in &run {
+            self.drop_superseded_live_deltas(&event.kind);
+        }
+        self.flush_pending_live_deltas().await?;
         let events = self
             .deferred_delivery
             .take()
@@ -1262,6 +1407,8 @@ impl RuntimeSessionStore {
 
     async fn append(&mut self, mut event: SessionEvent) -> Result<SessionEvent> {
         self.flush_deferred().await?;
+        self.drop_superseded_live_deltas(&event.kind);
+        self.flush_pending_live_deltas().await?;
         self.retain_system_override(std::slice::from_mut(&mut event))
             .await?;
         let event = self.store.append(event).await?;
@@ -8346,6 +8493,16 @@ async fn run_agent_session_store_kernel_inner(
                         journal.flush_deferred().await?;
                     }
                 }
+                _ = async {
+                    tokio::time::sleep_until(
+                        journal
+                            .pending_live_flush_at
+                            .expect("guarded live delta flush deadline"),
+                    )
+                    .await
+                }, if journal.pending_live_flush_at.is_some() => {
+                    journal.flush_pending_live_deltas().await?;
+                }
                 Some(kind) = receipt_rx.recv() => {
                     let _trace = SessionBranchTrace::begin(trace_loop, &actor_step, session_id, "receipt", provider_events.len() + provider_carry.len());
                     record(&mut journal, &events, session_id, kind).await?;
@@ -13101,8 +13258,10 @@ async fn record_provider_event(
     session_id: Uuid,
 ) -> Result<()> {
     crate::sensitive_input::mark_external_private_request(&mut kind);
-    // Assistant fragments need only their first display anchor. Reasoning
-    // fragments also update the coalesced state archived at the next boundary.
+    // Streaming text and reasoning deltas reach live subscribers immediately
+    // in memory. Only the one-time durable display anchor hits Postgres on the
+    // first nonblank chunk; subsequent chunks buffer in memory and flush on a
+    // bounded cadence or immediately before any durable boundary.
     if matches!(
         kind,
         SessionEventKind::MessageDelta { .. }
@@ -13111,26 +13270,95 @@ async fn record_provider_event(
     ) {
         journal.flush_deferred().await?;
         let event = SessionEvent::new(session_id, 0, kind);
-        let needs_store = match &event.kind {
-            SessionEventKind::MessageDelta { message_id, delta } => {
-                !delta.is_empty() && !journal.assistant_row_anchors.contains(message_id)
+        let (stream, delta, needs_anchor, reasoning_anchor_key) = match &event.kind {
+            SessionEventKind::MessageDelta { message_id, delta } => (
+                LiveDeltaStream::Message(*message_id),
+                delta.as_str(),
+                !delta.is_empty() && !journal.assistant_row_anchors.contains(message_id),
+                None,
+            ),
+            SessionEventKind::ReasoningBlockDelta {
+                reasoning_id,
+                delta,
+            } => (
+                LiveDeltaStream::ReasoningBlock(*reasoning_id),
+                delta.as_str(),
+                !delta.trim().is_empty()
+                    && !journal
+                        .reasoning_nonblank_anchored
+                        .contains(&Some(*reasoning_id)),
+                Some(Some(*reasoning_id)),
+            ),
+            SessionEventKind::ReasoningTextDelta { delta } => (
+                LiveDeltaStream::ReasoningText,
+                delta.as_str(),
+                !delta.trim().is_empty() && !journal.reasoning_nonblank_anchored.contains(&None),
+                Some(None),
+            ),
+            _ => unreachable!(),
+        };
+        journal.delta_backed_streams.insert(stream);
+        if needs_anchor {
+            let committed = journal.append(event).await?;
+            if let Some(key) = reasoning_anchor_key {
+                journal.reasoning_nonblank_anchored.insert(key);
             }
-            SessionEventKind::ReasoningTextDelta { .. }
-            | SessionEventKind::ReasoningBlockDelta { .. } => true,
-            _ => false,
-        };
-        let event = if needs_store {
-            journal.append(event).await?
+            deliver_recorded_event(
+                events,
+                session_id,
+                committed,
+                crate::EventPersistence::Ephemeral,
+            )
+            .await;
         } else {
-            event
-        };
+            let created_at = event.created_at;
+            if !delta.is_empty() {
+                journal.buffer_live_delta(session_id, stream, delta, created_at);
+            }
+            deliver_recorded_event(
+                events,
+                session_id,
+                event,
+                crate::EventPersistence::Ephemeral,
+            )
+            .await;
+            if journal.live_deltas_due() {
+                journal.flush_pending_live_deltas().await?;
+            }
+        }
+        return Ok(());
+    }
+    // When a native stream is already persisting incremental deltas through
+    // `pending_live_deltas`, periodic cumulative snapshots do not need a second
+    // Postgres transaction on every 40ms tick; deliver them live and let the
+    // coalesced delta flusher persist on its bounded cadence and at boundaries.
+    let delta_backed_stream = match &kind {
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::Assistant,
+            status: MessageStatus::InProgress,
+            ..
+        } => Some(LiveDeltaStream::Message(*message_id)),
+        SessionEventKind::ReasoningBlockSnapshot { reasoning_id, .. } => {
+            Some(LiveDeltaStream::ReasoningBlock(*reasoning_id))
+        }
+        SessionEventKind::ReasoningDelta { .. } => Some(LiveDeltaStream::ReasoningText),
+        _ => None,
+    };
+    if let Some(stream) = delta_backed_stream
+        && journal.delta_backed_streams.contains(&stream)
+    {
+        let event = SessionEvent::new(session_id, 0, kind);
         deliver_recorded_event(
             events,
             session_id,
             event,
-            crate::EventPersistence::Ephemeral,
+            crate::EventPersistence::Coalesced,
         )
         .await;
+        if journal.live_deltas_due() {
+            journal.flush_pending_live_deltas().await?;
+        }
         return Ok(());
     }
     complete_consumed_steers(&kind, awaiting, journal, events, session_id).await?;
@@ -16302,12 +16530,47 @@ fn batchable_provider_event(kind: &SessionEventKind) -> bool {
 }
 
 fn push_coalesced_provider_event(batch: &mut Vec<SessionEventKind>, next: SessionEventKind) {
-    if let Some(previous) = batch.last_mut()
-        && let Some(key) = crate::live_queue::snapshot_key(previous)
-        && crate::live_queue::snapshot_key(&next) == Some(key)
-    {
-        crate::live_queue::merge_snapshot(previous, next);
-        return;
+    if let Some(previous) = batch.last_mut() {
+        match (previous, &next) {
+            (
+                SessionEventKind::MessageDelta { message_id, delta },
+                SessionEventKind::MessageDelta {
+                    message_id: next_id,
+                    delta: next_delta,
+                },
+            ) if message_id == next_id => {
+                delta.push_str(next_delta);
+                return;
+            }
+            (
+                SessionEventKind::ReasoningBlockDelta {
+                    reasoning_id,
+                    delta,
+                },
+                SessionEventKind::ReasoningBlockDelta {
+                    reasoning_id: next_id,
+                    delta: next_delta,
+                },
+            ) if reasoning_id == next_id => {
+                delta.push_str(next_delta);
+                return;
+            }
+            (
+                SessionEventKind::ReasoningTextDelta { delta },
+                SessionEventKind::ReasoningTextDelta { delta: next_delta },
+            ) => {
+                delta.push_str(next_delta);
+                return;
+            }
+            (previous, _) => {
+                if let Some(key) = crate::live_queue::snapshot_key(previous)
+                    && crate::live_queue::snapshot_key(&next) == Some(key)
+                {
+                    crate::live_queue::merge_snapshot(previous, next);
+                    return;
+                }
+            }
+        }
     }
     batch.push(next);
 }

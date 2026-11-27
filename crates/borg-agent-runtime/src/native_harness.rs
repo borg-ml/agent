@@ -4236,15 +4236,30 @@ async fn call_model_streaming(
     let mut completed = None;
     let mut control_applied = false;
     let mut preparing: Vec<Option<String>> = Vec::new();
+    let flush_sleep = tokio::time::sleep(Duration::ZERO);
+    tokio::pin!(flush_sleep);
+    let mut armed_flush_deadline: Option<tokio::time::Instant> = None;
     loop {
-        // Live assistant text is rate limited, so the tail of a burst is often
-        // still unpublished when the model moves on. Give that tail its own
-        // deadline instead of letting it wait for an unrelated boundary event.
-        let pending_text_flush = (text.len() != emitted_text_len)
-            .then(|| crate::agent::live_output_interval().saturating_sub(last_text_emit.elapsed()));
-        let pending_reasoning_flush = (reasoning.pending()).then(|| {
-            crate::agent::live_output_interval().saturating_sub(last_reasoning_emit.elapsed())
-        });
+        // Live assistant text and reasoning snapshots are rate limited, so the
+        // tail of a burst is often still unpublished when the model pauses. One
+        // reused timer handles whichever tail matures first instead of creating
+        // two fresh timer entries on every streamed token.
+        let interval = crate::agent::live_output_interval();
+        let text_deadline = (text.len() != emitted_text_len)
+            .then(|| tokio::time::Instant::from_std(last_text_emit + interval));
+        let reasoning_deadline = reasoning
+            .pending()
+            .then(|| tokio::time::Instant::from_std(last_reasoning_emit + interval));
+        let next_flush_deadline = match (text_deadline, reasoning_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        if let Some(deadline) = next_flush_deadline
+            && armed_flush_deadline != Some(deadline)
+        {
+            flush_sleep.as_mut().reset(deadline);
+            armed_flush_deadline = Some(deadline);
+        }
         tokio::select! {
             biased;
             result = &mut call, if completed.is_none() => {
@@ -4307,18 +4322,18 @@ async fn call_model_streaming(
                 }
                 None => control_applied = true,
             },
-            () = tokio::time::sleep(pending_text_flush.unwrap_or_default()),
-                if pending_text_flush.is_some() =>
-            {
-                send_live_assistant_text(context.events, context.assistant_message_id, &text).await;
-                emitted_text_len = text.len();
-                last_text_emit = Instant::now();
-            }
-            () = tokio::time::sleep(pending_reasoning_flush.unwrap_or_default()),
-                if pending_reasoning_flush.is_some() =>
-            {
-                reasoning.flush(context.events).await;
-                last_reasoning_emit = Instant::now();
+            () = &mut flush_sleep, if next_flush_deadline.is_some() => {
+                armed_flush_deadline = None;
+                let now = tokio::time::Instant::now();
+                if reasoning_deadline.is_some_and(|deadline| deadline <= now) {
+                    reasoning.flush(context.events).await;
+                    last_reasoning_emit = Instant::now();
+                }
+                if text_deadline.is_some_and(|deadline| deadline <= now) {
+                    send_live_assistant_text(context.events, context.assistant_message_id, &text).await;
+                    emitted_text_len = text.len();
+                    last_text_emit = Instant::now();
+                }
             }
             progress = progress_rx.recv(), if progress_open => {
                 // The model wrote this text before whatever comes next, so it
@@ -4353,9 +4368,7 @@ async fn call_model_streaming(
                         },
                     )
                     .await;
-                    if last_text_emit.elapsed() >= crate::agent::live_output_interval()
-                        || chunk.ends_with(b"\n")
-                    {
+                    if last_text_emit.elapsed() >= crate::agent::live_output_interval() {
                         send_live_assistant_text(context.events, context.assistant_message_id, &text).await;
                         emitted_text_len = text.len();
                         last_text_emit = Instant::now();
@@ -4372,7 +4385,7 @@ async fn call_model_streaming(
                         .or_else(|| payload.get("text").and_then(Value::as_str).map(str::to_string))
                     {
                         reasoning.delta(context.events, provider_item_id.as_deref(), &text).await;
-                        if reasoning.pending() && (last_reasoning_emit.elapsed() >= crate::agent::live_output_interval() || reasoning.ends_line()) {
+                        if reasoning.pending() && last_reasoning_emit.elapsed() >= crate::agent::live_output_interval() {
                             reasoning.flush(context.events).await;
                             last_reasoning_emit = Instant::now();
                         }

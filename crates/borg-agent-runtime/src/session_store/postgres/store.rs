@@ -39,7 +39,7 @@ use crate::session_store::{
 
 fn reasoning_snapshot(
     reasoning: &SessionEvent,
-    state: &SessionState,
+    provider: CodingProvider,
     complete: bool,
     created_at: DateTime<Utc>,
 ) -> SessionEvent {
@@ -63,10 +63,7 @@ fn reasoning_snapshot(
         reasoning.session_id,
         0,
         SessionEventKind::ProviderEvent {
-            provider: state
-                .configuration
-                .as_ref()
-                .map_or(CodingProvider::Codex, |config| config.provider),
+            provider,
             kind: "reasoning_snapshot".into(),
             payload,
         },
@@ -327,8 +324,14 @@ impl PostgresSessionStore {
             for prior in prior {
                 let mut reasoning: SessionEvent = serde_json::from_value(prior)?;
                 super::live_text::materialize(transaction, &mut reasoning).await?;
-                let state = &row.as_ref().expect("session row is held").state;
-                let snapshot = reasoning_snapshot(&reasoning, state, true, event.created_at);
+                let provider = row
+                    .as_ref()
+                    .expect("session row is held")
+                    .state
+                    .configuration
+                    .as_ref()
+                    .map_or(CodingProvider::Codex, |config| config.provider);
+                let snapshot = reasoning_snapshot(&reasoning, provider, true, event.created_at);
                 Box::pin(self.append_to_row(transaction, snapshot, row)).await?;
             }
         }
@@ -504,6 +507,10 @@ impl PostgresSessionStore {
         if close_all_reasoning {
             sqlx::query("delete from session_live_state where session_id=$1 and live_key like 'reasoning:%'")
                 .bind(event.session_id).execute(&mut **transaction).await?;
+            self.live_anchors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear_session_reasoning(event.session_id);
         }
         if event.kind.clears_live_turn_state() {
             sqlx::query(
@@ -513,15 +520,23 @@ impl PostgresSessionStore {
             .bind(event.session_id)
             .execute(&mut **transaction)
             .await?;
+            self.live_anchors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear_session_reasoning(event.session_id);
         } else {
             for live_key in event.kind.cleared_live_state_keys() {
                 sqlx::query(
                     "delete from session_live_state where session_id = $1 and live_key = $2",
                 )
                 .bind(event.session_id)
-                .bind(live_key)
+                .bind(&live_key)
                 .execute(&mut **transaction)
                 .await?;
+                self.live_anchors
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear_live_key(event.session_id, &live_key);
             }
         }
 
@@ -534,20 +549,28 @@ impl PostgresSessionStore {
         &self,
         transaction: &mut Transaction<'_, Postgres>,
         event: &SessionEvent,
-    ) -> Result<bool> {
-        let (message_id, _text) = match &event.kind {
+    ) -> Result<(bool, Option<Uuid>)> {
+        let message_id = match &event.kind {
             SessionEventKind::Message {
                 message_id,
                 actor: crate::EventActor::Assistant,
                 status: MessageStatus::InProgress,
                 text,
                 ..
-            } if !text.trim().is_empty() => (*message_id, text),
+            } if !text.trim().is_empty() => *message_id,
             SessionEventKind::MessageDelta { message_id, delta } if !delta.is_empty() => {
-                (*message_id, delta)
+                *message_id
             }
-            _ => return Ok(false),
+            _ => return Ok((false, None)),
         };
+        if self
+            .live_anchors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .has_message_anchor(event.session_id, message_id)
+        {
+            return Ok((false, None));
+        }
         let exists: bool = sqlx::query_scalar(
             "select exists(select 1 from session_events where session_id = $1 and message_id = $2 and event_kind = 'message')",
         )
@@ -572,7 +595,7 @@ impl PostgresSessionStore {
             self.append_durable_in_transaction(transaction, anchor)
                 .await?;
         }
-        Ok(!exists)
+        Ok((!exists, Some(message_id)))
     }
 
     /// Store one coalesced live snapshot, replacing any previous value for its
@@ -624,36 +647,38 @@ impl PostgresSessionStore {
             .context("coalesced session event has no live-state key")?;
         event.sequence = 0;
         let mut transaction = self.pool().begin().await?;
-        let row =
-            sqlx::query("select live_revision, state_json from sessions where id = $1 for update")
-                .bind(event.session_id)
-                .fetch_optional(&mut *transaction)
-                .await?
-                .with_context(|| format!("session {} does not exist", event.session_id))?;
+        // Read only status and provider via SQL jsonb extraction instead of
+        // transferring and deserializing the full ~100 KB `state_json` row on
+        // every live streaming update.
+        let row = sqlx::query(
+            "select live_revision,                     state_json::jsonb ->> 'status' as status,                     state_json::jsonb -> 'configuration' ->> 'provider' as provider              from sessions where id = $1 for update",
+        )
+        .bind(event.session_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .with_context(|| format!("session {} does not exist", event.session_id))?;
 
+        let mut cleared_keys = Vec::new();
         for key in event.kind.cleared_live_state_keys() {
             sqlx::query("delete from session_live_state where session_id = $1 and live_key = $2")
                 .bind(event.session_id)
-                .bind(key)
+                .bind(&key)
                 .execute(&mut *transaction)
                 .await?;
+            cleared_keys.push(key);
         }
 
-        if matches!(&event.kind, SessionEventKind::ReasoningBlockSnapshot { .. }) {
-            let admitted: bool = sqlx::query_scalar(
-                "select exists(select 1 from session_live_state where session_id=$1 and live_key=$2)",
-            ).bind(event.session_id).bind(&live_key).fetch_one(&mut *transaction).await?;
-            if !admitted {
-                transaction.commit().await?;
-                return Ok(original_event);
-            }
-        }
         let current_revision: i64 = row.try_get("live_revision")?;
-        let state: SessionState = serde_json::from_str(row.try_get("state_json")?)?;
+        let status_str: Option<String> = row.try_get("status")?;
+        let provider_str: Option<String> = row.try_get("provider")?;
         let turn_live_allowed = matches!(
-            state.status,
-            Some(SessionStatus::Running | SessionStatus::WaitingForApproval)
+            status_str.as_deref(),
+            Some("running" | "waiting_for_approval")
         );
+        let provider = provider_str
+            .as_deref()
+            .and_then(|value| serde_json::from_value::<CodingProvider>(serde_json::Value::String(value.to_owned())).ok())
+            .unwrap_or(CodingProvider::Codex);
         if !turn_live_allowed {
             // A provider task can finish after the actor published its terminal
             // status. Do not let that delayed snapshot resurrect a responding
@@ -665,15 +690,18 @@ impl PostgresSessionStore {
             .bind(event.session_id)
             .execute(&mut *transaction)
             .await?;
+            self.live_anchors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear_session_reasoning(event.session_id);
             if live_key != "context_window" {
+                sqlx::query("set local synchronous_commit = off")
+                    .execute(&mut *transaction)
+                    .await?;
                 transaction.commit().await?;
                 return Ok(original_event);
             }
         }
-
-        let anchored = self
-            .anchor_assistant_message(&mut transaction, &event)
-            .await?;
 
         let revision = current_revision.saturating_add(1);
         let mut stored_event = event.clone();
@@ -690,13 +718,27 @@ impl PostgresSessionStore {
             } => Some((text.as_str(), message_fragment)),
             _ => None,
         };
+        let mut known_text_offset = None;
         if streamed.is_some() {
-            if let Some(prior) =
-                super::live_text::seed_inline(&mut transaction, &event, &live_key).await?
+            let (prior, offset) =
+                super::live_text::seed_inline(&mut transaction, &event, &live_key).await?;
+            // Correlated reasoning blocks are only admitted when their live row
+            // was opened by `ReasoningBlockStarted`; reusing the lookup above
+            // avoids a separate `exists(...)` round-trip.
+            if matches!(&event.kind, SessionEventKind::ReasoningBlockSnapshot { .. })
+                && prior.is_none()
             {
+                sqlx::query("set local synchronous_commit = off")
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+                return Ok(original_event);
+            }
+            if let Some(prior) = prior {
                 stored_event.id = prior.id;
                 stored_event.created_at = prior.created_at;
             }
+            known_text_offset = offset;
             match &mut stored_event.kind {
                 SessionEventKind::ReasoningBlockSnapshot { text, .. }
                 | SessionEventKind::ReasoningDelta { text }
@@ -704,37 +746,57 @@ impl PostgresSessionStore {
                 _ => {}
             }
         }
+
+        let (anchored, anchored_message_id) = self
+            .anchor_assistant_message(&mut transaction, &event)
+            .await?;
+        let mut wrote_durable = anchored;
+        let mut mark_reasoning_visible = false;
+
         // The first nonblank reasoning frame adds one durable display anchor,
         // so the block keeps its transcript position; later frames stay live.
         if let SessionEventKind::ReasoningDelta { text }
         | SessionEventKind::ReasoningBlockSnapshot { text, .. } = &event.kind
             && !text.trim().is_empty()
         {
-            let visible: bool = sqlx::query_scalar(
-                "select exists(select 1 from session_live_text_chunks \
-                 where session_id = $1 and live_key = $2 \
-                 and btrim(convert_from(body, 'UTF8')) <> '')",
-            )
-            .bind(event.session_id)
-            .bind(&live_key)
-            .fetch_one(&mut *transaction)
-            .await?;
-            if !visible {
-                let mut snapshot = stored_event.clone();
-                snapshot.kind = match &event.kind {
-                    SessionEventKind::ReasoningBlockSnapshot { reasoning_id, .. } => {
-                        SessionEventKind::ReasoningBlockSnapshot {
-                            reasoning_id: *reasoning_id,
-                            text: text.clone(),
-                        }
-                    }
-                    _ => SessionEventKind::ReasoningDelta { text: text.clone() },
+            let cached_visible = self
+                .live_anchors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .has_reasoning_visible(event.session_id, &live_key);
+            if !cached_visible {
+                let visible: bool = if known_text_offset == Some(0) || known_text_offset.is_none() {
+                    false
+                } else {
+                    sqlx::query_scalar(
+                        "select exists(select 1 from session_live_text_chunks \
+                         where session_id = $1 and live_key = $2 \
+                         and btrim(convert_from(body, 'UTF8')) <> '')",
+                    )
+                    .bind(event.session_id)
+                    .bind(&live_key)
+                    .fetch_one(&mut *transaction)
+                    .await?
                 };
-                self.append_durable_in_transaction(
-                    &mut transaction,
-                    reasoning_snapshot(&snapshot, &state, false, snapshot.created_at),
-                )
-                .await?;
+                if !visible {
+                    let mut snapshot = stored_event.clone();
+                    snapshot.kind = match &event.kind {
+                        SessionEventKind::ReasoningBlockSnapshot { reasoning_id, .. } => {
+                            SessionEventKind::ReasoningBlockSnapshot {
+                                reasoning_id: *reasoning_id,
+                                text: text.clone(),
+                            }
+                        }
+                        _ => SessionEventKind::ReasoningDelta { text: text.clone() },
+                    };
+                    self.append_durable_in_transaction(
+                        &mut transaction,
+                        reasoning_snapshot(&snapshot, provider, false, snapshot.created_at),
+                    )
+                    .await?;
+                    wrote_durable = true;
+                }
+                mark_reasoning_visible = true;
             }
         }
 
@@ -754,13 +816,14 @@ impl PostgresSessionStore {
         .execute(&mut *transaction)
         .await?;
         if let Some((text, fragment)) = streamed {
-            super::live_text::append(
+            super::live_text::append_with_offset(
                 &mut transaction,
                 &event,
                 &live_key,
                 text,
                 fragment,
                 revision,
+                known_text_offset,
             )
             .await?;
         }
@@ -770,7 +833,26 @@ impl PostgresSessionStore {
             .bind(event.session_id)
             .execute(&mut *transaction)
             .await?;
+        // Live preview updates without a durable anchor are rebuildable; skip
+        // synchronous WAL fsync so streaming tokens never stall on disk I/O.
+        if !wrote_durable {
+            sqlx::query("set local synchronous_commit = off")
+                .execute(&mut *transaction)
+                .await?;
+        }
         transaction.commit().await?;
+        {
+            let mut anchors = self.live_anchors.lock().unwrap_or_else(|e| e.into_inner());
+            for key in &cleared_keys {
+                anchors.clear_live_key(event.session_id, key);
+            }
+            if let Some(message_id) = anchored_message_id {
+                anchors.mark_message_anchor(event.session_id, message_id);
+            }
+            if mark_reasoning_visible {
+                anchors.mark_reasoning_visible(event.session_id, &live_key);
+            }
+        }
         self.committed(event.session_id);
         // Return the committed input, not the reconstructed stream. Snapshots
         // keep the live key's identity and start time so clients do not

@@ -70,7 +70,7 @@ pub const SESSIONS_SHARED_ENV: &str = "BORG_SESSIONS_SHARED";
 /// with BORG_SESSIONS_POOL_SIZE.
 const POSTGRES_MAX_CONNECTIONS: u32 = 64;
 const POSTGRES_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(60);
-const POSTGRES_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
+const POSTGRES_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn production_pool_size() -> u32 {
     std::env::var("BORG_SESSIONS_POOL_SIZE")
@@ -104,6 +104,54 @@ pub struct PostgresSessionStore {
     /// Whether `sessions.archive_ref` exists, cached; see `archive_column`.
     archive_column: std::sync::Arc<archive::ColumnCache>,
     committed: std::sync::Arc<publication::CommittedHints>,
+    /// Process-local cache of durable live anchors (message rows and first
+    /// nonblank reasoning display anchors) so streaming updates skip redundant
+    /// existence/chunk-scan queries once anchored.
+    live_anchors: std::sync::Arc<std::sync::Mutex<LiveAnchorCache>>,
+}
+
+const LIVE_ANCHOR_CACHE_LIMIT: usize = 4096;
+
+#[derive(Debug, Default)]
+pub(super) struct LiveAnchorCache {
+    message_anchors: std::collections::HashSet<(uuid::Uuid, uuid::Uuid)>,
+    reasoning_visible: std::collections::HashSet<(uuid::Uuid, String)>,
+}
+
+impl LiveAnchorCache {
+    pub(super) fn has_message_anchor(&self, session_id: uuid::Uuid, message_id: uuid::Uuid) -> bool {
+        self.message_anchors.contains(&(session_id, message_id))
+    }
+
+    pub(super) fn mark_message_anchor(&mut self, session_id: uuid::Uuid, message_id: uuid::Uuid) {
+        if self.message_anchors.len() >= LIVE_ANCHOR_CACHE_LIMIT {
+            self.message_anchors.clear();
+        }
+        self.message_anchors.insert((session_id, message_id));
+    }
+
+    pub(super) fn has_reasoning_visible(&self, session_id: uuid::Uuid, live_key: &str) -> bool {
+        self.reasoning_visible
+            .contains(&(session_id, live_key.to_owned()))
+    }
+
+    pub(super) fn mark_reasoning_visible(&mut self, session_id: uuid::Uuid, live_key: &str) {
+        if self.reasoning_visible.len() >= LIVE_ANCHOR_CACHE_LIMIT {
+            self.reasoning_visible.clear();
+        }
+        self.reasoning_visible
+            .insert((session_id, live_key.to_owned()));
+    }
+
+    pub(super) fn clear_live_key(&mut self, session_id: uuid::Uuid, live_key: &str) {
+        self.reasoning_visible
+            .remove(&(session_id, live_key.to_owned()));
+    }
+
+    pub(super) fn clear_session_reasoning(&mut self, session_id: uuid::Uuid) {
+        self.reasoning_visible
+            .retain(|(owner, _)| *owner != session_id);
+    }
 }
 
 /// A workspace projection supplied by the embedding controller.
@@ -235,6 +283,7 @@ impl PostgresSessionStore {
             schema_incomplete: Default::default(),
             archive_column: Default::default(),
             committed: Default::default(),
+            live_anchors: Default::default(),
         };
         store.ensure_schema().await?;
         store.clear_stranded_turn_live_state().await?;

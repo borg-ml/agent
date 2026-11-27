@@ -2239,9 +2239,6 @@ impl ReasoningBlocks {
     pub(crate) fn pending(&self) -> bool {
         self.pending
     }
-    pub(crate) fn ends_line(&self) -> bool {
-        self.text.ends_with('\n')
-    }
 
     pub(crate) async fn flush(&mut self, events: &mpsc::Sender<SessionEventKind>) {
         if self.pending

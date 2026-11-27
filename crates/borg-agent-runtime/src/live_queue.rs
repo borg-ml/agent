@@ -288,6 +288,16 @@ impl LiveEventQueue {
     pub fn is_empty(&self) -> bool {
         self.events.is_empty()
     }
+
+    pub fn clear(&mut self) {
+        self.events.clear();
+        self.pending.clear();
+    }
+
+    pub fn retain(&mut self, mut predicate: impl FnMut(&SessionEvent) -> bool) {
+        self.events.retain(|event| predicate(event));
+        self.pending.clear();
+    }
 }
 
 impl FromIterator<SessionEvent> for LiveEventQueue {

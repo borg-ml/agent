@@ -3452,13 +3452,14 @@ async fn run_local_agent_session(
     let mut terminal_dirty = false;
     let mut history_has_coalesced_events = history.iter().any(|event| event.sequence == 0);
     // Rebuilding from durable history while a coalesced live row is on screen
-    // would roll that row back to its first-paint snapshot. While one streams,
-    // keep the events the transcript was actually built from, in arrival
-    // order, so an older page can be prepended and shown mid-turn.
-    let mut live_transcript_events = history
+    // would roll that row back to its first-paint snapshot. Keep only the
+    // sequence-zero live tail here rather than cloning the full durable
+    // history on every turn; prepend durable `history` only on lazy page loads.
+    let mut live_transcript_events: LiveEventQueue = history
         .iter()
-        .any(|event| event.sequence == 0 && coalesced_transcript_event(&event.kind))
-        .then(|| history.iter().cloned().collect::<LiveEventQueue>());
+        .filter(|event| event.sequence == 0)
+        .cloned()
+        .collect();
     let mut interaction_dirty = false;
     let mut streaming_frame_pending = false;
     let mut last_stream_text_at: Option<tokio::time::Instant> = None;
@@ -4360,14 +4361,24 @@ async fn run_local_agent_session(
                                 {
                                     history_page_before_sequence = before;
                                 }
-                                if let Some(live) = live_transcript_events.as_mut() {
-                                    live.extend_front(older.clone());
-                                }
                                 merge_tui_history_page(&mut history, older);
                                 history_start_reached = history_page_before_sequence <= 1;
                                 if let Some(terminal) = terminal.as_mut() {
-                                    let retained = live_transcript_events.as_ref().map(|live| live.iter().cloned().collect::<Vec<_>>());
-                                    terminal.replace_history(retained.as_deref().unwrap_or(&history));
+                                    if live_transcript_events.is_empty() {
+                                        terminal.replace_history(&history);
+                                    } else {
+                                        let mut retained = Vec::with_capacity(
+                                            history.len() + live_transcript_events.len(),
+                                        );
+                                        retained.extend(
+                                            history
+                                                .iter()
+                                                .filter(|event| event.sequence > 0)
+                                                .cloned(),
+                                        );
+                                        retained.extend(live_transcript_events.iter().cloned());
+                                        terminal.replace_history(&retained);
+                                    }
                                     terminal.seed_session_state(delivered_projection.state());
                                     terminal_dirty = true;
                                 }
@@ -5023,11 +5034,22 @@ async fn run_local_agent_session(
                                     render_frame_interval = tui_frame_interval(tui_streaming_fps);
                                     render_tick = tui_render_interval(render_frame_interval);
                                 }
-                                if event.sequence == 0 && coalesced_transcript_event(&event.kind) {
-                                    live_transcript_events.get_or_insert_with(|| history.iter().cloned().collect::<LiveEventQueue>());
-                                }
-                                if let Some(live) = live_transcript_events.as_mut() {
-                                    live.push_back(event.clone());
+                                if event.sequence == 0 {
+                                    if coalesced_transcript_event(&event.kind)
+                                        || matches!(
+                                            &event.kind,
+                                            SessionEventKind::MessageDelta { .. }
+                                                | SessionEventKind::ReasoningBlockDelta { .. }
+                                                | SessionEventKind::ReasoningTextDelta { .. }
+                                        )
+                                    {
+                                        live_transcript_events.push_back(event.clone());
+                                    }
+                                } else if !live_transcript_events.is_empty() {
+                                    retire_superseded_live_events(
+                                        &mut live_transcript_events,
+                                        &event.kind,
+                                    );
                                 }
                                 remember_streamed_history_event(&mut history, &event);
                                 if matches!(&event.kind, SessionEventKind::TurnCompleted { .. }) {
@@ -5037,7 +5059,7 @@ async fn run_local_agent_session(
                                         history.retain(|event| event.sequence > 0);
                                         history_has_coalesced_events = false;
                                     }
-                                    live_transcript_events = None;
+                                    live_transcript_events.clear();
                                 }
                                 immediate_frame_deferred |= terminal_dirty
                                     && queued_events > 0
@@ -8628,9 +8650,12 @@ async fn run_local_agent_session(
                                                         .await?;
                                                 restored.seed_team_roster(&agents);
                                                 restored.seed_history(&latest.events);
-                                                if let Some(live) = live_transcript_events.as_mut() {
-                                                    *live = latest.events.iter().cloned().collect();
-                                                }
+                                                live_transcript_events = latest
+                                                    .events
+                                                    .iter()
+                                                    .filter(|event| event.sequence == 0)
+                                                    .cloned()
+                                                    .collect();
                                                 seed_terminal_subagent_threads(
                                                     &mut restored,
                                                     &agents,
@@ -10531,6 +10556,48 @@ fn coalesced_transcript_event(kind: &SessionEventKind) -> bool {
 struct ResumeBootstrapHistory {
     events: Vec<SessionEvent>,
     page_before: u64,
+}
+
+fn retire_superseded_live_events(live: &mut LiveEventQueue, durable: &SessionEventKind) {
+    if durable.clears_live_turn_state() {
+        live.clear();
+        return;
+    }
+    match durable {
+        SessionEventKind::ReasoningBlockCompleted { reasoning_id } => {
+            let completed = *reasoning_id;
+            live.retain(|event| !matches!(
+                &event.kind,
+                SessionEventKind::ReasoningBlockDelta { reasoning_id, .. }
+                    | SessionEventKind::ReasoningBlockSnapshot { reasoning_id, .. }
+                    if *reasoning_id == completed
+            ));
+        }
+        SessionEventKind::ReasoningCompleted | SessionEventKind::ToolStarted { .. } => {
+            live.retain(|event| !matches!(
+                &event.kind,
+                SessionEventKind::ReasoningDelta { .. }
+                    | SessionEventKind::ReasoningTextDelta { .. }
+                    | SessionEventKind::ReasoningBlockDelta { .. }
+                    | SessionEventKind::ReasoningBlockSnapshot { .. }
+            ));
+        }
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::Assistant,
+            status: MessageStatus::Complete | MessageStatus::Failed,
+            ..
+        } => {
+            let completed = *message_id;
+            live.retain(|event| !matches!(
+                &event.kind,
+                SessionEventKind::MessageDelta { message_id, .. }
+                    | SessionEventKind::Message { message_id, .. }
+                    if *message_id == completed
+            ));
+        }
+        _ => {}
+    }
 }
 
 fn remember_streamed_history_event(history: &mut Vec<SessionEvent>, event: &SessionEvent) {
