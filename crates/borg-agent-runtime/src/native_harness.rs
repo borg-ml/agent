@@ -6062,10 +6062,9 @@ fn estimated_text_tokens(message: &ModelMessage) -> u64 {
 /// watcher entry (`list_watchers` / `await_watchers`: `[{"result": {"output":
 /// {"borg_attachments": [...]}}}]`); those are lifted too instead of reaching
 /// the model as base64 text.
-pub(crate) fn split_tool_result_attachments(output: String) -> (String, Vec<ModelInputAttachment>) {
-    let Ok(mut value) = serde_json::from_str::<Value>(&output) else {
-        return (output, Vec::new());
-    };
+pub(crate) fn split_tool_result_attachments_value(
+    value: &mut Value,
+) -> (bool, Vec<ModelInputAttachment>) {
     let mut attachments = Vec::new();
     let top_level = value
         .as_object()
@@ -6075,8 +6074,16 @@ pub(crate) fn split_tool_result_attachments(output: String) -> (String, Vec<Mode
             .as_object_mut()
             .is_some_and(|object| split_attachments_in(object, &mut attachments))
     } else {
-        split_watch_result_attachments(&mut value, &mut attachments)
+        split_watch_result_attachments(value, &mut attachments)
     };
+    (found, attachments)
+}
+
+pub(crate) fn split_tool_result_attachments(output: String) -> (String, Vec<ModelInputAttachment>) {
+    let Ok(mut value) = serde_json::from_str::<Value>(&output) else {
+        return (output, Vec::new());
+    };
+    let (found, attachments) = split_tool_result_attachments_value(&mut value);
     if !found {
         return (output, Vec::new());
     }

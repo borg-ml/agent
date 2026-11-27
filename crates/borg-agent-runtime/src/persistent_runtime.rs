@@ -10,12 +10,14 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
+use futures::stream::{FuturesUnordered, StreamExt};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -37,6 +39,7 @@ const MAX_RUNTIME_RESULT_BYTES: usize = 64 * 1024;
 const MAX_RUNTIME_LINE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_EXECUTION_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 const MAX_EXECUTION_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+const MAX_CONCURRENT_HOST_CALLS: usize = 64;
 
 tokio::task_local! {
     // Host calls can re-enter execute_as through another tool. Refuse cycles
@@ -572,8 +575,10 @@ async fn execute_request(
     bootstrap: Option<&Value>,
     host: Arc<dyn RuntimeHost>,
 ) -> Result<PersistentRuntimeResult> {
+    let mut write_buf = Vec::with_capacity(512);
     write_json_line(
         &mut process.stdin,
+        &mut write_buf,
         &json!({
             "type": "execute",
             "id": request_id,
@@ -585,26 +590,37 @@ async fn execute_request(
     .await?;
 
     let deadline = Instant::now() + timeout;
+    let timeout_sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+    tokio::pin!(timeout_sleep);
+
+    let mut line_buf = Vec::with_capacity(1024);
+    type InFlightHostCall = Pin<Box<dyn Future<Output = (String, Result<Value>)> + Send>>;
+    let mut in_flight: FuturesUnordered<InFlightHostCall> = FuturesUnordered::new();
+
     loop {
-        let line = read_line_until(&mut process.stdout, deadline).await?;
-        ensure!(
-            line.len() <= MAX_RUNTIME_LINE_BYTES,
-            "persistent runtime message exceeds {MAX_RUNTIME_LINE_BYTES} bytes"
-        );
-        let message: Value = serde_json::from_str(&line)
-            .with_context(|| "persistent runtime returned invalid protocol JSON")?;
-        match message.get("type").and_then(Value::as_str) {
-            Some("host_call") => {
-                let call_id = message
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .context("persistent runtime host call has no id")?;
-                let operation = message
-                    .get("operation")
-                    .and_then(Value::as_str)
-                    .context("persistent runtime host call has no operation")?;
-                let arguments = message.get("arguments").cloned().unwrap_or(Value::Null);
-                let host_message = match host.call(operation, arguments).await {
+        enum LoopEvent {
+            Timeout,
+            Line(std::io::Result<usize>),
+            HostDone(String, Result<Value>),
+        }
+
+        let event = tokio::select! {
+            biased;
+            _ = &mut timeout_sleep => LoopEvent::Timeout,
+            Some((call_id, outcome)) = in_flight.next(), if !in_flight.is_empty() => {
+                LoopEvent::HostDone(call_id, outcome)
+            }
+            read = process.stdout.read_until(b'\n', &mut line_buf),
+                if in_flight.len() < MAX_CONCURRENT_HOST_CALLS =>
+            {
+                LoopEvent::Line(read)
+            }
+        };
+
+        match event {
+            LoopEvent::Timeout => bail!("persistent Python execution timed out"),
+            LoopEvent::HostDone(call_id, outcome) => {
+                let host_message = match outcome {
                     Ok(result) => json!({
                         "type": "host_result",
                         "id": call_id,
@@ -618,100 +634,158 @@ async fn execute_request(
                         "error": format!("{error:#}"),
                     }),
                 };
-                write_json_line(&mut process.stdin, &host_message).await?;
+                write_json_line(&mut process.stdin, &mut write_buf, &host_message).await?;
             }
-            Some("result") => {
+            LoopEvent::Line(read) => {
+                let bytes = read?;
+                ensure!(bytes > 0, "persistent Python runtime exited unexpectedly");
                 ensure!(
-                    message.get("id").and_then(Value::as_str) == Some(request_id),
-                    "persistent runtime response id did not match request"
+                    line_buf.len() <= MAX_RUNTIME_LINE_BYTES,
+                    "persistent runtime message exceeds {MAX_RUNTIME_LINE_BYTES} bytes"
                 );
-                let ok = message
-                    .get("ok")
-                    .and_then(Value::as_bool)
-                    .context("persistent runtime response has no execution status")?;
-                if !ok {
-                    let per_field = MAX_RUNTIME_RESULT_BYTES / 4;
-                    let mut error = bounded_head_tail(
-                        message
-                            .get("error")
-                            .and_then(Value::as_str)
-                            .unwrap_or("persistent runtime execution failed")
-                            .to_string(),
-                        per_field,
-                    );
-                    // Execution is not a transaction: preserve evidence of
-                    // output/host calls that happened before the exception.
-                    for field in ["stdout", "stderr"] {
-                        if let Some(output) = message.get(field).and_then(Value::as_str)
-                            && !output.is_empty()
-                        {
-                            error.push_str(&format!(
-                                "\n\nCaptured {field} before failure:\n{}",
-                                bounded_head_tail(output.to_string(), per_field),
-                            ));
-                        }
-                    }
-                    return Err(RuntimeExecutionError(error).into());
+                while matches!(line_buf.last(), Some(b'\n' | b'\r')) {
+                    line_buf.pop();
                 }
-                let result = PersistentRuntimeResult {
-                    runtime,
-                    persistent: true,
-                    recovered_from_manifest: false,
-                    execution_count: 0,
-                    value: message.get("value").cloned().unwrap_or(Value::Null),
-                    stdout: message
-                        .get("stdout")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    stderr: message
-                        .get("stderr")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
+                let mut message: Value = serde_json::from_slice(&line_buf)
+                    .with_context(|| "persistent runtime returned invalid protocol JSON")?;
+                line_buf.clear();
+                let Some(object) = message.as_object_mut() else {
+                    bail!("persistent Python runtime message has no type");
                 };
-                return Ok(bound_runtime_result(result));
+                match object.get("type").and_then(Value::as_str) {
+                    Some("host_call") => {
+                        let call_id = match object.remove("id") {
+                            Some(Value::String(id)) => id,
+                            _ => bail!("persistent runtime host call has no id"),
+                        };
+                        let operation = match object.remove("operation") {
+                            Some(Value::String(operation)) => operation,
+                            _ => bail!("persistent runtime host call has no operation"),
+                        };
+                        let arguments = object.remove("arguments").unwrap_or(Value::Null);
+                        // Polled directly inside `execute_request`'s task so
+                        // `RUNTIME_HOST_CALL_CHAIN` task-local ancestry is
+                        // inherited by every concurrent call.
+                        let host_clone = Arc::clone(&host);
+                        in_flight.push(Box::pin(async move {
+                            let outcome = host_clone.call(&operation, arguments).await;
+                            (call_id, outcome)
+                        }));
+                    }
+                    Some("result") => {
+                        ensure!(
+                            object.get("id").and_then(Value::as_str) == Some(request_id),
+                            "persistent runtime response id did not match request"
+                        );
+                        let ok = object
+                            .get("ok")
+                            .and_then(Value::as_bool)
+                            .context("persistent runtime response has no execution status")?;
+                        if !ok {
+                            let per_field = MAX_RUNTIME_RESULT_BYTES / 4;
+                            let mut error = bounded_head_tail(
+                                match object.remove("error") {
+                                    Some(Value::String(error)) => error,
+                                    _ => "persistent runtime execution failed".to_string(),
+                                },
+                                per_field,
+                            );
+                            // Execution is not a transaction: preserve evidence of
+                            // output/host calls that happened before the exception.
+                            for field in ["stdout", "stderr"] {
+                                if let Some(Value::String(output)) = object.remove(field)
+                                    && !output.is_empty()
+                                {
+                                    error.push_str(&format!(
+                                        "\n\nCaptured {field} before failure:\n{}",
+                                        bounded_head_tail(output, per_field),
+                                    ));
+                                }
+                            }
+                            return Err(RuntimeExecutionError(error).into());
+                        }
+                        let result = PersistentRuntimeResult {
+                            runtime,
+                            persistent: true,
+                            recovered_from_manifest: false,
+                            execution_count: 0,
+                            value: object.remove("value").unwrap_or(Value::Null),
+                            stdout: match object.remove("stdout") {
+                                Some(Value::String(stdout)) => stdout,
+                                _ => String::new(),
+                            },
+                            stderr: match object.remove("stderr") {
+                                Some(Value::String(stderr)) => stderr,
+                                _ => String::new(),
+                            },
+                        };
+                        return Ok(bound_runtime_result(result));
+                    }
+                    Some(other) => {
+                        bail!("persistent runtime returned unknown message type `{other}`")
+                    }
+                    None => bail!("persistent Python runtime message has no type"),
+                }
             }
-            Some(other) => {
-                bail!("persistent runtime returned unknown message type `{other}`")
-            }
-            None => bail!("persistent Python runtime message has no type"),
         }
     }
 }
 
-async fn write_json_line(writer: &mut ChildStdin, value: &Value) -> Result<()> {
-    let mut line = serde_json::to_vec(value)?;
-    line.push(b'\n');
+async fn write_json_line(
+    writer: &mut ChildStdin,
+    buf: &mut Vec<u8>,
+    value: &Value,
+) -> Result<()> {
+    buf.clear();
+    serde_json::to_writer(&mut *buf, value)?;
+    buf.push(b'\n');
     let limit = if value["type"] == "host_result" {
         MAX_RUNTIME_LINE_BYTES
     } else {
         MAX_RUNTIME_REQUEST_BYTES
     };
     ensure!(
-        line.len() <= limit,
+        buf.len() <= limit,
         "persistent runtime request exceeds {limit} bytes"
     );
-    writer.write_all(&line).await?;
+    writer.write_all(buf).await?;
     writer.flush().await?;
     Ok(())
+}
+
+struct ByteCounter(usize);
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_json_len<T: Serialize>(value: &T) -> usize {
+    let mut counter = ByteCounter(0);
+    if serde_json::to_writer(&mut counter, value).is_ok() {
+        counter.0
+    } else {
+        usize::MAX
+    }
 }
 
 /// Keep an oversized result useful instead of failing the whole execution:
 /// the model asked for the value, and a head+tail excerpt with a marker lets
 /// it decide what to re-query, while the marker is honest about the gap.
 fn bound_runtime_result(mut result: PersistentRuntimeResult) -> PersistentRuntimeResult {
-    let (text, attachments) =
-        crate::native_harness::split_tool_result_attachments(result.value.to_string());
-    result.value = serde_json::from_str(&text).unwrap_or(Value::Null);
-    let serialized_len = |result: &PersistentRuntimeResult| {
-        serde_json::to_vec(result).map_or(usize::MAX, |bytes| bytes.len())
-    };
-    if serialized_len(&result) > MAX_RUNTIME_RESULT_BYTES {
+    let (_, attachments) =
+        crate::native_harness::split_tool_result_attachments_value(&mut result.value);
+    if serialized_json_len(&result) > MAX_RUNTIME_RESULT_BYTES {
         let per_field = MAX_RUNTIME_RESULT_BYTES / 4;
         result.stdout = bounded_head_tail(result.stdout, per_field);
         result.stderr = bounded_head_tail(result.stderr, per_field);
-        if serialized_len(&result) > MAX_RUNTIME_RESULT_BYTES {
+        if serialized_json_len(&result) > MAX_RUNTIME_RESULT_BYTES {
             let rendered = serde_json::to_string(&result.value).unwrap_or_default();
             result.value = json!({
                 "truncated": true,
@@ -751,54 +825,268 @@ pub(crate) fn bounded_head_tail(text: String, max_bytes: usize) -> String {
     )
 }
 
-async fn read_line_until(reader: &mut BufReader<ChildStdout>, deadline: Instant) -> Result<String> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    ensure!(
-        !remaining.is_zero(),
-        "persistent Python execution timed out"
-    );
-    let mut line = String::new();
-    let bytes = tokio::time::timeout(remaining, reader.read_line(&mut line))
-        .await
-        .context("persistent Python execution timed out")??;
-    ensure!(bytes > 0, "persistent Python runtime exited unexpectedly");
-    Ok(line.trim_end_matches(['\r', '\n']).to_string())
-}
-
-// This worker intentionally has no third-party dependency.  It preserves a
-// normal Python namespace across requests and supports top-level await when
-// the selected Python environment provides an async callable.  A future
-// `ipy` adapter can replace this worker with ipykernel without changing the
-// host contract above.
+// This worker intentionally has no third-party dependency and defers heavy
+// stdlib imports (`asyncio`, `traceback`) until first use to keep cold start
+// near bare CPython (~20 ms). It preserves a normal Python namespace across
+// requests, multiplexes concurrent host calls across threads, `borg.batch`,
+// and `borg.aio` (`asyncio.gather`) over the host JSON-lines transport, and
+// reuses a single asyncio event loop across top-level awaits.
 const PYTHON_WORKER_SOURCE: &str = r#"
 import ast
-import asyncio
-import contextlib
 import io
-import inspect
 import json
 import os
 import sys
 import threading
-import traceback
-import uuid
 
-# User code and its children must not read the host's JSON control stream.
-PROTOCOL_IN = os.fdopen(os.dup(0), "r", encoding="utf-8")
-os.set_inheritable(PROTOCOL_IN.fileno(), False)
-with open(os.devnull, "r") as user_stdin:
-    os.dup2(user_stdin.fileno(), 0)
-PROTOCOL_OUT = sys.__stdout__
-HOST_CALL_LOCK = threading.Lock()
+# User code and its children must not read or corrupt the host's JSON control
+# streams. Duplicate both fds as non-inheritable and point fds 0 and 1 at devnull.
+_IN_FD = os.dup(0)
+os.set_inheritable(_IN_FD, False)
+_OUT_FD = os.dup(1)
+os.set_inheritable(_OUT_FD, False)
+with open(os.devnull, "rb") as _user_stdin:
+    os.dup2(_user_stdin.fileno(), 0)
+with open(os.devnull, "wb") as _user_stdout:
+    os.dup2(_user_stdout.fileno(), 1)
+
+_WRITE_LOCK = threading.Lock()
+_RECV_COND = threading.Condition()
+_READER_ACTIVE = False
+_WAITERS = 0
+_IN_BUF = bytearray()
+_PENDING = {}
+_ASYNC_WAITERS = {}
+_NEXT_CALL_ID = 0
+_ASYNCIO = None
+_EVENT_LOOP = None
+_ASYNC_READER_INSTALLED = False
+
+_COMPACT_ENCODER = json.JSONEncoder(separators=(",", ":"), default=repr)
+_COMPACT_STRICT = json.JSONEncoder(separators=(",", ":"))
+
+async def _coro_probe():
+    return None
+_probe_obj = _coro_probe()
+_CORO_TYPE = type(_probe_obj)
+_probe_obj.close()
+del _coro_probe, _probe_obj
+
 NAMESPACE = {"__name__": "__borg_runtime__"}
+
+
+def _write_raw(data):
+    n = os.write(_OUT_FD, data)
+    if n == len(data):
+        return
+    if n <= 0:
+        raise RuntimeError("Borg host closed the runtime")
+    view = memoryview(data)
+    total = len(view)
+    sent = n
+    while sent < total:
+        n = os.write(_OUT_FD, view[sent:])
+        if n <= 0:
+            raise RuntimeError("Borg host closed the runtime")
+        sent += n
+
+
+def _encode_response(payload):
+    try:
+        return (_COMPACT_ENCODER.encode(payload) + "\n").encode("utf-8")
+    except TypeError:
+        safe = dict(payload)
+        if "value" in safe:
+            safe["value"] = repr(safe["value"])
+        return (_COMPACT_ENCODER.encode(safe) + "\n").encode("utf-8")
 
 
 def _json_safe(value):
     try:
-        json.dumps(value)
+        _COMPACT_STRICT.encode(value)
         return value
     except Exception:
         return repr(value)
+
+
+def _format_exception(error):
+    import traceback
+    return "".join(traceback.format_exception(error))
+
+
+def _pop_buffered_line():
+    nl = _IN_BUF.find(b"\n")
+    if nl < 0:
+        return None
+    line = bytes(_IN_BUF[:nl])
+    del _IN_BUF[:nl + 1]
+    return line
+
+
+def _read_line_sync():
+    while True:
+        line = _pop_buffered_line()
+        if line is not None:
+            return line
+        try:
+            chunk = os.read(_IN_FD, 65536)
+        except BlockingIOError:
+            import select
+            select.select([_IN_FD], [], [])
+            continue
+        if not chunk:
+            return None
+        _IN_BUF.extend(chunk)
+
+
+def _deliver_host_result(msg):
+    rid = msg.get("id")
+    res = (True, msg.get("result")) if msg.get("ok") else (False, msg.get("error", "Borg host call failed"))
+    if rid in _PENDING:
+        _PENDING[rid] = res
+    waiter = _ASYNC_WAITERS.pop(rid, None)
+    if waiter is not None:
+        loop, fut = waiter
+        def _resolve(f=fut, r=res):
+            if not f.done():
+                if r[0]:
+                    f.set_result(r[1])
+                else:
+                    f.set_exception(BorgError(r[1]))
+        loop.call_soon_threadsafe(_resolve)
+
+
+def _install_async_reader(loop):
+    global _ASYNC_READER_INSTALLED
+    if _ASYNC_READER_INSTALLED or os.name != "posix":
+        return
+    os.set_blocking(_IN_FD, False)
+    def _on_readable():
+        global _ASYNC_READER_INSTALLED
+        while True:
+            try:
+                chunk = os.read(_IN_FD, 65536)
+            except BlockingIOError:
+                break
+            if not chunk:
+                with _RECV_COND:
+                    for rid, (_, fut) in list(_ASYNC_WAITERS.items()):
+                        if not fut.done():
+                            fut.set_exception(RuntimeError("Borg host closed the runtime"))
+                    _ASYNC_WAITERS.clear()
+                _uninstall_async_reader(loop)
+                return
+            _IN_BUF.extend(chunk)
+        while True:
+            line = _pop_buffered_line()
+            if line is None:
+                break
+            msg = json.loads(line)
+            if msg.get("type") == "host_result":
+                with _RECV_COND:
+                    _deliver_host_result(msg)
+                    _RECV_COND.notify_all()
+        if not _ASYNC_WAITERS:
+            _uninstall_async_reader(loop)
+    loop.add_reader(_IN_FD, _on_readable)
+    _ASYNC_READER_INSTALLED = True
+    if _IN_BUF:
+        loop.call_soon(_on_readable)
+
+
+def _uninstall_async_reader(loop):
+    global _ASYNC_READER_INSTALLED
+    if not _ASYNC_READER_INSTALLED:
+        return
+    try:
+        loop.remove_reader(_IN_FD)
+    except Exception:
+        pass
+    try:
+        os.set_blocking(_IN_FD, True)
+    except Exception:
+        pass
+    _ASYNC_READER_INSTALLED = False
+
+
+def _run_async(coro):
+    global _ASYNCIO, _EVENT_LOOP
+    if _ASYNCIO is None:
+        import asyncio
+        _ASYNCIO = asyncio
+    if _EVENT_LOOP is None or _EVENT_LOOP.is_closed():
+        _EVENT_LOOP = _ASYNCIO.new_event_loop()
+    _ASYNCIO.set_event_loop(_EVENT_LOOP)
+    try:
+        return _EVENT_LOOP.run_until_complete(coro)
+    finally:
+        _uninstall_async_reader(_EVENT_LOOP)
+        _ASYNC_WAITERS.clear()
+
+
+def _next_id():
+    global _NEXT_CALL_ID
+    _NEXT_CALL_ID += 1
+    return str(_NEXT_CALL_ID)
+
+
+def _send_and_wait_sync(operation, arguments):
+    with _RECV_COND:
+        call_id = _next_id()
+        _PENDING[call_id] = None
+    frame = (_COMPACT_STRICT.encode({
+        "type": "host_call",
+        "id": call_id,
+        "operation": operation,
+        "arguments": {} if arguments is None else arguments,
+    }) + "\n").encode("utf-8")
+    try:
+        with _WRITE_LOCK:
+            _write_raw(frame)
+    except BaseException:
+        with _RECV_COND:
+            _PENDING.pop(call_id, None)
+        raise
+    return _wait_pending(call_id)
+
+
+def _wait_pending(call_id):
+    global _READER_ACTIVE, _WAITERS
+    with _RECV_COND:
+        while True:
+            entry = _PENDING.get(call_id)
+            if entry is not None:
+                del _PENDING[call_id]
+                ok, payload = entry
+                if ok:
+                    return payload
+                raise BorgError(payload)
+            if _READER_ACTIVE:
+                _WAITERS += 1
+                try:
+                    _RECV_COND.wait()
+                finally:
+                    _WAITERS -= 1
+                continue
+            _READER_ACTIVE = True
+            _RECV_COND.release()
+            try:
+                line = _read_line_sync()
+            finally:
+                _RECV_COND.acquire()
+                _READER_ACTIVE = False
+            if line is None:
+                for pending_id, val in list(_PENDING.items()):
+                    if val is None:
+                        _PENDING[pending_id] = (False, "Borg host closed the runtime")
+                if _WAITERS:
+                    _RECV_COND.notify_all()
+                raise RuntimeError("Borg host closed the runtime")
+            msg = json.loads(line)
+            if msg.get("type") == "host_result":
+                _deliver_host_result(msg)
+            if _WAITERS:
+                _RECV_COND.notify_all()
 
 
 def _restore_namespace(state):
@@ -822,34 +1110,148 @@ def _tool_arguments(arguments=None, fields=None):
     return {**({} if arguments is None else arguments), **(fields or {})}
 
 
+class _AsyncBorg:
+    """Async mirror of `borg` for concurrent calls via `await asyncio.gather(...)`."""
+
+    def __init__(self, sync_borg):
+        self._sync = sync_borg
+
+    def call(self, operation, arguments=None, /, **fields):
+        global _ASYNCIO
+        arguments = _tool_arguments(arguments, fields)
+        if _ASYNCIO is None:
+            import asyncio
+            _ASYNCIO = asyncio
+        loop = _ASYNCIO.get_running_loop()
+        if os.name != "posix":
+            return loop.run_in_executor(None, self._sync.call, operation, arguments)
+        fut = loop.create_future()
+        with _RECV_COND:
+            call_id = _next_id()
+            _ASYNC_WAITERS[call_id] = (loop, fut)
+        frame = (_COMPACT_STRICT.encode({
+            "type": "host_call",
+            "id": call_id,
+            "operation": operation,
+            "arguments": arguments,
+        }) + "\n").encode("utf-8")
+        try:
+            with _WRITE_LOCK:
+                _write_raw(frame)
+        except BaseException:
+            _ASYNC_WAITERS.pop(call_id, None)
+            raise
+        _install_async_reader(loop)
+        return fut
+
+    def tool(self, name, arguments=None, /, **fields):
+        return self.call("borg_tool", {"name": name, "arguments": _tool_arguments(arguments, fields)})
+
+    def exec(self, command=None, **kwargs):
+        arguments = {"cmd": command} if isinstance(command, str) else command
+        return self.tool("exec", _tool_arguments(arguments, kwargs))
+
+    def list(self, path=".", limit=200):
+        return self.call("list_files", {"path": path, "limit": limit})
+
+    def read(self, path, **kwargs):
+        arguments = {"path": path}
+        arguments.update(kwargs)
+        return self.call("read_file", arguments)
+
+    def search(self, pattern, **kwargs):
+        arguments = {"pattern": pattern}
+        arguments.update(kwargs)
+        return self.call("search_files", arguments)
+
+    def write(self, path, content, **kwargs):
+        arguments = {"path": path, "content": content}
+        arguments.update(kwargs)
+        return self.call("write_file", arguments)
+
+    def edit(self, path, old_text, new_text, **kwargs):
+        arguments = {"path": path, "old_text": old_text, "new_text": new_text}
+        arguments.update(kwargs)
+        return self.call("edit_file", arguments)
+
+    def tools(self, query=None, limit=10):
+        return self.call("capabilities", {} if query is None else {"query": query, "limit": limit})
+
+    def mcp(self, name, arguments=None):
+        return self.call("mcp_call", {"name": name, "arguments": {} if arguments is None else arguments})
+
+    def __getattr__(self, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return lambda arguments=None, /, **fields: self.tool(name, _tool_arguments(arguments, fields))
+
+
 class Borg:
     BorgError = BorgError
 
     def __init__(self):
         self.rlm = Rlm(self)
         self.harness = Harness(self)
+        self.aio = _AsyncBorg(self)
 
     def call(self, operation, arguments=None, /, **fields):
         arguments = _tool_arguments(arguments, fields)
-        with HOST_CALL_LOCK:
-            call_id = str(uuid.uuid4())
-            PROTOCOL_OUT.write(json.dumps({
-                "type": "host_call",
-                "id": call_id,
-                "operation": operation,
-                "arguments": {} if arguments is None else arguments,
-            }) + "\n")
-            PROTOCOL_OUT.flush()
-            while True:
-                line = PROTOCOL_IN.readline()
-                if not line:
-                    raise RuntimeError("Borg host closed the runtime")
-                message = json.loads(line)
-                if message.get("type") != "host_result" or message.get("id") != call_id:
-                    continue
-                if message.get("ok"):
-                    return message.get("result")
-                raise BorgError(message.get("error", "Borg host call failed"))
+        return _send_and_wait_sync(operation, arguments)
+
+    def batch(self, calls, *, return_exceptions=False, max_concurrency=32):
+        """Run multiple `(name, arguments)` host calls concurrently in pipelined waves."""
+        normalized = []
+        for item in calls:
+            if isinstance(item, dict):
+                op = item.get("operation") or item.get("name")
+                args = item.get("arguments")
+            elif isinstance(item, (tuple, list)) and 1 <= len(item) <= 2:
+                op = item[0]
+                args = item[1] if len(item) == 2 else {}
+            else:
+                raise TypeError("each batch entry must be (name, arguments_dict), (name,), or {'name': ..., 'arguments': ...}")
+            if not isinstance(op, str) or not op:
+                raise TypeError("batch call name must be a non-empty string")
+            normalized.append((op, _tool_arguments(args)))
+        if not normalized:
+            return []
+        chunk_size = max(1, min(int(max_concurrency), 64))
+        results = []
+        for start in range(0, len(normalized), chunk_size):
+            chunk = normalized[start:start + chunk_size]
+            call_ids = []
+            frames = []
+            with _RECV_COND:
+                for op, args in chunk:
+                    cid = _next_id()
+                    _PENDING[cid] = None
+                    call_ids.append(cid)
+                    frames.append((_COMPACT_STRICT.encode({
+                        "type": "host_call",
+                        "id": cid,
+                        "operation": op,
+                        "arguments": args,
+                    }) + "\n").encode("utf-8"))
+            try:
+                with _WRITE_LOCK:
+                    _write_raw(b"".join(frames))
+            except BaseException:
+                with _RECV_COND:
+                    for cid in call_ids:
+                        _PENDING.pop(cid, None)
+                raise
+            first_error = None
+            for cid in call_ids:
+                try:
+                    results.append(_wait_pending(cid))
+                except BorgError as error:
+                    if return_exceptions:
+                        results.append(error)
+                    elif first_error is None:
+                        first_error = error
+            if first_error is not None:
+                raise first_error
+        return results
 
     def exec(self, command=None, **kwargs):
         # Preserve the string shorthand, while accepting the exact exec schema
@@ -910,8 +1312,8 @@ class Borg:
         if not callable(retrieve):
             raise RuntimeError(f"retrieval adapter {adapter_id!r} has no retrieve(query) entrypoint")
         value = retrieve(query)
-        if inspect.iscoroutine(value):
-            value = asyncio.run(value)
+        if isinstance(value, _CORO_TYPE):
+            value = _run_async(value)
         return _json_safe(value)
 
     def test_retrieval_adapter(self, adapter_id):
@@ -927,8 +1329,8 @@ class Borg:
         if not callable(retrieve) or not callable(test):
             raise RuntimeError(f"retrieval adapter {adapter_id!r} must define retrieve and test")
         value = test(retrieve, self)
-        if inspect.iscoroutine(value):
-            value = asyncio.run(value)
+        if isinstance(value, _CORO_TYPE):
+            value = _run_async(value)
         return {"id": adapter_id, "tested": True, "passed": True, "result": _json_safe(value)}
 
     def runtime_status(self):
@@ -1158,7 +1560,7 @@ class Rlm:
         self.borg = borg
 
     def __call__(self, message, task_name=None, **options):
-        task_name = task_name or f"runtime-{uuid.uuid4().hex[:12]}"
+        task_name = task_name or f"runtime-{os.urandom(6).hex()}"
         arguments = {"task_name": task_name, "message": str(message)}
         for key in ("provider", "model", "reasoning_effort"):
             if key in options and options[key] is not None:
@@ -1234,7 +1636,9 @@ NAMESPACE["cua"] = ComputerUse()
 def _run_code(source, stdout, stderr):
     tree = ast.parse(source, filename="<borg-runtime>", mode="exec")
     value = None
-    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+    prev_out, prev_err = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = stdout, stderr
+    try:
         if tree.body and isinstance(tree.body[-1], ast.Expr):
             prefix = ast.Module(body=tree.body[:-1], type_ignores=[])
             if prefix.body:
@@ -1245,23 +1649,27 @@ def _run_code(source, stdout, stderr):
                     flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT,
                 )
                 prefix_value = eval(prefix_code, NAMESPACE, NAMESPACE)
-                if inspect.iscoroutine(prefix_value):
-                    asyncio.run(prefix_value)
+                if isinstance(prefix_value, _CORO_TYPE):
+                    _run_async(prefix_value)
             expression = ast.Expression(tree.body[-1].value)
             compiled = compile(expression, "<borg-runtime>", "eval", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
             value = eval(compiled, NAMESPACE, NAMESPACE)
         else:
             compiled = compile(tree, "<borg-runtime>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
             value = eval(compiled, NAMESPACE, NAMESPACE)
-        if inspect.iscoroutine(value):
-            value = asyncio.run(value)
-        value = _json_safe(value)
+        if isinstance(value, _CORO_TYPE):
+            value = _run_async(value)
+    finally:
+        sys.stdout, sys.stderr = prev_out, prev_err
     return value
 
 
-for line in PROTOCOL_IN:
+while True:
+    raw_line = _read_line_sync()
+    if raw_line is None:
+        break
     try:
-        message = json.loads(line)
+        message = json.loads(raw_line)
         if message.get("type") != "execute":
             continue
         stdout = io.StringIO()
@@ -1283,27 +1691,27 @@ for line in PROTOCOL_IN:
                 "type": "result",
                 "id": message.get("id"),
                 "ok": False,
-                "error": "".join(traceback.format_exception(error)),
+                "error": _format_exception(error),
                 "stdout": stdout.getvalue(),
                 "stderr": stderr.getvalue(),
             }
-        PROTOCOL_OUT.write(json.dumps(response, default=_json_safe) + "\n")
-        PROTOCOL_OUT.flush()
+        with _WRITE_LOCK:
+            _write_raw(_encode_response(response))
     except BaseException as error:
-        PROTOCOL_OUT.write(json.dumps({
-            "type": "result",
-            "id": None,
-            "ok": False,
-            "error": "".join(traceback.format_exception(error)),
-        }) + "\n")
-        PROTOCOL_OUT.flush()
+        with _WRITE_LOCK:
+            _write_raw(_encode_response({
+                "type": "result",
+                "id": None,
+                "ok": False,
+                "error": _format_exception(error),
+            }))
 "#;
 
 // Bun is optional. The worker uses one persistent VM context and the same
 // JSON-lines host protocol as Python. Synchronous top-level declarations and
 // assignments survive requests; code that needs an async block can use an
 // explicit `return` from the worker's async wrapper. TypeScript is transpiled
-// by Bun when its loader is available, while JavaScript is passed through.
+// by a cached Bun.Transpiler when available, while JavaScript is passed through.
 const BUN_WORKER_SOURCE: &str = r#"
 const readline = require("node:readline");
 const vm = require("node:vm");
@@ -1311,11 +1719,22 @@ const vm = require("node:vm");
 const protocolOut = process.stdout;
 const pending = new Map();
 const context = vm.createContext({});
+let tsTranspiler = null;
+let nextCallId = 0;
 let stdout = "";
 let stderr = "";
 
 function send(message) {
   protocolOut.write(JSON.stringify(message) + "\n");
+}
+
+function sendResult(id, value) {
+  const normalized = value === undefined ? null : value;
+  try {
+    protocolOut.write(JSON.stringify({type: "result", id, ok: true, value: normalized, stdout, stderr}) + "\n");
+  } catch (_) {
+    protocolOut.write(JSON.stringify({type: "result", id, ok: true, value: String(normalized), stdout, stderr}) + "\n");
+  }
 }
 
 function jsonSafe(value) {
@@ -1340,7 +1759,8 @@ function restoreNamespace(state) {
 
 function format(value) {
   if (typeof value === "string") return value;
-  return JSON.stringify(jsonSafe(value));
+  if (typeof value === "number") return String(value);
+  try { return JSON.stringify(value); } catch (_) { return String(value); }
 }
 
 const runtimeConsole = {
@@ -1363,7 +1783,7 @@ function toolArguments(arguments_ = {}) {
 }
 
 function hostCall(operation, arguments_) {
-  const id = crypto.randomUUID();
+  const id = String(++nextCallId);
   send({type: "host_call", id, operation, arguments: arguments_ ?? {}});
   return new Promise((resolve, reject) => pending.set(id, {resolve, reject}));
 }
@@ -1557,12 +1977,13 @@ async function execute(source, runtime) {
   context.resultSlot = null;
   let compiled = source;
   if (runtime === "typescript" && typeof Bun !== "undefined" && Bun.Transpiler) {
+    if (!tsTranspiler) tsTranspiler = new Bun.Transpiler({loader: "tsx"});
     // Bun can remove a bare final identifier/property read as unused code.
     // Make the completion value observable before transpilation, just as it
     // is in JavaScript mode, so discovery/data expressions retain their value.
     const parts = finalExpressionParts(source);
     const observable = parts ? `${parts.body}\n;resultSlot = (${parts.expression});` : source;
-    compiled = new Bun.Transpiler({loader: "tsx"}).transformSync(observable);
+    compiled = tsTranspiler.transformSync(observable);
   }
   const parts = finalExpressionParts(compiled);
   const synchronous = parts ? `${parts.body}\n;(${parts.expression})` : compiled;
@@ -1577,7 +1998,7 @@ async function execute(source, runtime) {
     script = new vm.Script(asynchronous);
   }
   context.resultSlot = await script.runInContext(context);
-  return {value: jsonSafe(context.resultSlot), stdout, stderr};
+  return context.resultSlot;
 }
 
 const input = readline.createInterface({input: process.stdin, crlfDelay: Infinity});
@@ -1597,8 +2018,8 @@ input.on("line", async (line) => {
     stdout = "";
     stderr = "";
     if (message.bootstrap !== undefined && message.bootstrap !== null) restoreNamespace(message.bootstrap);
-    const output = await execute(message.code || "", message.runtime || "javascript");
-    send({type: "result", id: message.id, ok: true, ...output});
+    const value = await execute(message.code || "", message.runtime || "javascript");
+    sendResult(message.id, value);
   } catch (error) {
     send({type: "result", id: message.id, ok: false, error: String(error && error.stack || error), stdout, stderr});
   }
@@ -3032,6 +3453,159 @@ borg = _sdk_module"#
                 "memory_count": 1
             })
         );
+        runtime.stop().await;
+    }
+
+    // A barrier equal to the fan-out proves all host calls enter the host
+    // simultaneously rather than running one-by-one behind a serialized loop.
+    #[tokio::test]
+    async fn parallel_host_calls_execute_concurrently_in_python_and_bun() {
+        if !python_available().await {
+            return;
+        }
+        struct BarrierHost {
+            barrier: Arc<tokio::sync::Barrier>,
+        }
+        #[async_trait]
+        impl RuntimeHost for BarrierHost {
+            async fn call(&self, operation: &str, arguments: Value) -> Result<Value> {
+                ensure!(operation == "sync", "unexpected operation {operation}");
+                self.barrier.wait().await;
+                Ok(arguments)
+            }
+        }
+        let root = tempdir().unwrap();
+        let python = PersistentRuntimeWorker::new(root.path().to_path_buf());
+        let expected = json!([{"i": 0}, {"i": 1}, {"i": 2}, {"i": 3}]);
+
+        // 1. ThreadPoolExecutor with borg.call
+        let host = Arc::new(BarrierHost {
+            barrier: Arc::new(tokio::sync::Barrier::new(4)),
+        });
+        let threads = python
+            .execute(
+                "from concurrent.futures import ThreadPoolExecutor
+with ThreadPoolExecutor(max_workers=4) as pool:
+    out = list(pool.map(lambda i: borg.call('sync', {'i': i}), range(4)))
+out",
+                Some(5_000),
+                host,
+            )
+            .await
+            .expect("ThreadPoolExecutor calls must reach host concurrently");
+        assert_eq!(threads.value, expected);
+
+        // 2. Pipelined borg.batch with no threads
+        let host = Arc::new(BarrierHost {
+            barrier: Arc::new(tokio::sync::Barrier::new(4)),
+        });
+        let batch = python
+            .execute(
+                "borg.batch([('sync', {'i': i}) for i in range(4)])",
+                Some(5_000),
+                host,
+            )
+            .await
+            .expect("borg.batch calls must reach host concurrently");
+        assert_eq!(batch.value, expected);
+
+        // 3. Async borg.aio with asyncio.gather (and persistent event loop reuse)
+        for _ in 0..2 {
+            let host = Arc::new(BarrierHost {
+                barrier: Arc::new(tokio::sync::Barrier::new(4)),
+            });
+            let aio = python
+                .execute(
+                    "import asyncio
+await asyncio.gather(*(borg.aio.call('sync', {'i': i}) for i in range(4)))",
+                    Some(5_000),
+                    host,
+                )
+                .await
+                .expect("borg.aio calls must reach host concurrently");
+            assert_eq!(aio.value, expected);
+        }
+
+        // 4. Child stdout noise on raw fd 1 cannot corrupt the JSON protocol
+        let isolated = python
+            .execute(
+                r#"import subprocess, sys
+subprocess.run([sys.executable, '-c', 'print("raw stdout noise")'], check=True)
+borg.call('echo', {'ok': True})"#,
+                Some(5_000),
+                Arc::new(TestHost),
+            )
+            .await
+            .expect("child fd 1 output must not break JSON protocol");
+        assert_eq!(isolated.value, json!({"ok": true}));
+        python.stop().await;
+
+        // 5. Bun Promise.all reaches host concurrently
+        if bun_available().await {
+            let bun = PersistentRuntimeWorker::for_bun(
+                Uuid::new_v4(),
+                root.path().to_path_buf(),
+                None,
+            );
+            let host = Arc::new(BarrierHost {
+                barrier: Arc::new(tokio::sync::Barrier::new(4)),
+            });
+            let js = bun
+                .execute(
+                    "await Promise.all([0, 1, 2, 3].map(i => borg.call('sync', {i})))",
+                    Some(5_000),
+                    host,
+                )
+                .await
+                .expect("Bun Promise.all calls must reach host concurrently");
+            assert_eq!(js.value, expected);
+            bun.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn shipped_python_sdk_reuses_persistent_socket_across_calls() {
+        if !python_available().await {
+            return;
+        }
+        let root = tempdir().unwrap();
+        let runtime = PersistentRuntimeWorker::new(root.path().to_path_buf());
+        let source = serde_json::to_string(include_str!("clients/python/borg.py")).unwrap();
+        let code = format!(
+            r#"import json, os, socket, threading, types
+sdk = types.ModuleType('borg_keepalive_test')
+exec({source}, sdk.__dict__)
+listener = socket.socket()
+listener.bind(('127.0.0.1', 0))
+listener.listen()
+accepts = [0]
+def serve():
+    while True:
+        try:
+            conn, _ = listener.accept()
+        except OSError:
+            return
+        accepts[0] += 1
+        with conn, conn.makefile('rb') as reader:
+            while True:
+                line = reader.readline()
+                if not line:
+                    break
+                req = json.loads(line)
+                conn.sendall(json.dumps({{'result': req['arguments']}}).encode() + b'\n')
+threading.Thread(target=serve, daemon=True).start()
+os.environ.pop('BORG_AGENT_TOOL_SOCKET', None)
+os.environ['BORG_AGENT_TOOL_TCP'] = '127.0.0.1:' + str(listener.getsockname()[1])
+os.environ['BORG_AGENT_TOOL_TOKEN'] = 'tok'
+results = [sdk.call('echo', i=i) for i in range(10)]
+listener.close()
+{{'count': len(results), 'accepts': accepts[0], 'last': results[-1]['i']}}"#
+        );
+        let output = runtime
+            .execute(&code, Some(5_000), Arc::new(TestHost))
+            .await
+            .unwrap();
+        assert_eq!(output.value, json!({"count": 10, "accepts": 1, "last": 9}));
         runtime.stop().await;
     }
 

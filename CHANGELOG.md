@@ -5,6 +5,17 @@ Git comparison.
 
 ## Unreleased (since 0.23.0)
 
+- Faster `runtime_exec` and Python `borg` tool calls: the persistent Python
+  worker defers heavy stdlib imports (`asyncio`, `traceback`) and isolates its
+  stdout control pipe so cold starts drop from ~83 ms to ~27 ms without child
+  stdout noise corrupting the protocol. Host calls inside `runtime_exec` now
+  execute concurrently on the Rust host instead of serializing one-by-one,
+  unlocking real parallelism for Python `borg.batch([...])`, `borg.aio`
+  (`await asyncio.gather(...)` on a reused event loop), `ThreadPoolExecutor`,
+  and Bun `Promise.all`. Results avoid redundant JSON round-trips across
+  Python, Bun, and Rust, and the shipped `borg.py` client reuses a persistent
+  thread-local tool socket across calls.
+
 ## 0.23.0 (2026-11-26)
 
 - Automatic context compaction on OpenAI-compatible gateways such as
