@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.23.1)
+## Unreleased (since 0.23.2)
+
+## 0.23.2 (2026-11-27)
 
 - Re-cut release with rustfmt formatting fixes so CI release validation
   passes and publishes the 0.23.1 latency and streaming improvements.
