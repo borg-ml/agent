@@ -3168,7 +3168,10 @@ mod tests {
 
         assert_eq!(effective.active, vec![SessionCapability::Subagents]);
         assert_eq!(effective.inactive.len(), 1);
-        assert_eq!(effective.inactive[0].capability, SessionCapability::WebRelay);
+        assert_eq!(
+            effective.inactive[0].capability,
+            SessionCapability::WebRelay
+        );
     }
 
     #[test]
