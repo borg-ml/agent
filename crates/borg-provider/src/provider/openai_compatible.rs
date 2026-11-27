@@ -1984,7 +1984,9 @@ fn compatible_provider_error_kind(body: &str, status: u16) -> ProviderErrorKind 
     // already knows how to do that, so this routes there instead of to the
     // connection-retry path. The status decides, because the body is the gateway
     // own wording and does not name the size.
-    if status == 413 {
+    // A context refusal arrives as a plain 400 whose only signal is its prose.
+    // Callers read this recorded kind directly, so it must be decided here.
+    if status == 413 || super::chat_stream::provider_error_is_context_length(body) {
         return ProviderErrorKind::ContextLength;
     }
     let compact = body
@@ -3532,6 +3534,15 @@ mod tests {
                 400
             ),
             ProviderErrorKind::Unknown
+        );
+        // Verbatim from a failed compaction on opencode-go: unclassified, the
+        // in-place compaction gave up instead of folding history in chunks.
+        assert_eq!(
+            compatible_provider_error_kind(
+                r#"{"error":{"type":"invalid_request_error","message":"Upstream request failed: [400003] Input tokens exceed the model context limit."}}"#,
+                400
+            ),
+            ProviderErrorKind::ContextLength
         );
         assert_eq!(
             compatible_provider_error_kind("403 Forbidden", 403),

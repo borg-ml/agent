@@ -176,7 +176,7 @@ pub fn classify_provider_error(error: &anyhow::Error) -> ProviderErrorKind {
 /// Whether a rendered provider error reports that the request exceeded the
 /// model's context window. Phrasing varies across vendors, so match the
 /// established spellings rather than one vendor's wording.
-fn provider_error_is_context_length(text: &str) -> bool {
+pub(super) fn provider_error_is_context_length(text: &str) -> bool {
     let text = text.to_ascii_lowercase();
     [
         "context length",
