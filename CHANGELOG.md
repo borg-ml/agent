@@ -5,6 +5,9 @@ Git comparison.
 
 ## Unreleased (since 0.23.1)
 
+- Re-cut release with rustfmt formatting fixes so CI release validation
+  passes and publishes the 0.23.1 latency and streaming improvements.
+
 ## 0.23.1 (2026-11-27)
 
 - Lower TTFT and inter-round latency across providers and the native harness:
