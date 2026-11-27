@@ -10566,21 +10566,25 @@ fn retire_superseded_live_events(live: &mut LiveEventQueue, durable: &SessionEve
     match durable {
         SessionEventKind::ReasoningBlockCompleted { reasoning_id } => {
             let completed = *reasoning_id;
-            live.retain(|event| !matches!(
-                &event.kind,
-                SessionEventKind::ReasoningBlockDelta { reasoning_id, .. }
-                    | SessionEventKind::ReasoningBlockSnapshot { reasoning_id, .. }
-                    if *reasoning_id == completed
-            ));
+            live.retain(|event| {
+                !matches!(
+                    &event.kind,
+                    SessionEventKind::ReasoningBlockDelta { reasoning_id, .. }
+                        | SessionEventKind::ReasoningBlockSnapshot { reasoning_id, .. }
+                        if *reasoning_id == completed
+                )
+            });
         }
         SessionEventKind::ReasoningCompleted | SessionEventKind::ToolStarted { .. } => {
-            live.retain(|event| !matches!(
-                &event.kind,
-                SessionEventKind::ReasoningDelta { .. }
-                    | SessionEventKind::ReasoningTextDelta { .. }
-                    | SessionEventKind::ReasoningBlockDelta { .. }
-                    | SessionEventKind::ReasoningBlockSnapshot { .. }
-            ));
+            live.retain(|event| {
+                !matches!(
+                    &event.kind,
+                    SessionEventKind::ReasoningDelta { .. }
+                        | SessionEventKind::ReasoningTextDelta { .. }
+                        | SessionEventKind::ReasoningBlockDelta { .. }
+                        | SessionEventKind::ReasoningBlockSnapshot { .. }
+                )
+            });
         }
         SessionEventKind::Message {
             message_id,
@@ -10589,12 +10593,14 @@ fn retire_superseded_live_events(live: &mut LiveEventQueue, durable: &SessionEve
             ..
         } => {
             let completed = *message_id;
-            live.retain(|event| !matches!(
-                &event.kind,
-                SessionEventKind::MessageDelta { message_id, .. }
-                    | SessionEventKind::Message { message_id, .. }
-                    if *message_id == completed
-            ));
+            live.retain(|event| {
+                !matches!(
+                    &event.kind,
+                    SessionEventKind::MessageDelta { message_id, .. }
+                        | SessionEventKind::Message { message_id, .. }
+                        if *message_id == completed
+                )
+            });
         }
         _ => {}
     }

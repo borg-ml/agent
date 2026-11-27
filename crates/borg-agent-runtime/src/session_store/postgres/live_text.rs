@@ -19,11 +19,13 @@ pub async fn append_with_offset(
     let offset = match known_offset {
         Some(offset) => offset,
         None => {
-            sqlx::query("insert into session_live_text_heads values($1,$2,0) on conflict do nothing")
-                .bind(event.session_id)
-                .bind(key)
-                .execute(&mut **tx)
-                .await?;
+            sqlx::query(
+                "insert into session_live_text_heads values($1,$2,0) on conflict do nothing",
+            )
+            .bind(event.session_id)
+            .bind(key)
+            .execute(&mut **tx)
+            .await?;
             sqlx::query_scalar("select text_bytes from session_live_text_heads where session_id=$1 and live_key=$2 for update")
                 .bind(event.session_id)
                 .bind(key)

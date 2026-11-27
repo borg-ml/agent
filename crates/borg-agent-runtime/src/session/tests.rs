@@ -27281,12 +27281,11 @@ async fn streaming_reasoning_deltas_coalesce_live_store_writes_and_archive_full_
     .expect("turn completes");
 
     assert_eq!(live_reasoning, expected_reasoning);
-    let live_revision: i64 =
-        sqlx::query_scalar("select live_revision from sessions where id = $1")
-            .bind(session_id)
-            .fetch_one(store.pool())
-            .await
-            .unwrap();
+    let live_revision: i64 = sqlx::query_scalar("select live_revision from sessions where id = $1")
+        .bind(session_id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
     // 200 deltas + 40 snapshots used to produce ~240 live_revision bumps;
     // coalescing keeps Postgres live writes to a handful (start + anchor + tail).
     assert!(

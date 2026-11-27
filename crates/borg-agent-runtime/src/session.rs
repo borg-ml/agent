@@ -1180,7 +1180,8 @@ impl RuntimeSessionStore {
                 }
             }
             SessionEventKind::ReasoningBlockCompleted { reasoning_id } => {
-                self.reasoning_nonblank_anchored.remove(&Some(*reasoning_id));
+                self.reasoning_nonblank_anchored
+                    .remove(&Some(*reasoning_id));
                 self.delta_backed_streams
                     .remove(&LiveDeltaStream::ReasoningBlock(*reasoning_id));
             }
@@ -1225,9 +1226,9 @@ impl RuntimeSessionStore {
                         delta: entry.delta,
                     }
                 }
-                LiveDeltaStream::ReasoningText => SessionEventKind::ReasoningTextDelta {
-                    delta: entry.delta,
-                },
+                LiveDeltaStream::ReasoningText => {
+                    SessionEventKind::ReasoningTextDelta { delta: entry.delta }
+                }
             };
             let mut event = SessionEvent::new(entry.session_id, 0, kind);
             event.created_at = entry.created_at;

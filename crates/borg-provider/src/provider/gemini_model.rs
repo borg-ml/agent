@@ -94,7 +94,8 @@ impl GeminiModelProvider {
                 ProviderErrorKind::Fatal,
             ));
         }
-        let wire_model = wire_model(&self.model, self.effort.as_deref(), &mut access, &auth_file).await;
+        let wire_model =
+            wire_model(&self.model, self.effort.as_deref(), &mut access, &auth_file).await;
         trace.invocation.args = vec![wire_model.clone()];
         let inner = request_body(&wire_model, self.effort.as_deref(), &request, account);
         let user_agent = gemini_subscription::user_agent().await;
@@ -246,7 +247,8 @@ async fn wire_model(
         .map(|(_, ids)| ids);
     let ids = match cached {
         Some(ids) => ids,
-        None => match gemini_subscription::available_model_ids_with_access(access, auth_file).await {
+        None => match gemini_subscription::available_model_ids_with_access(access, auth_file).await
+        {
             Ok(ids) => {
                 if let Ok(mut cache) = CACHE.lock() {
                     *cache = Some((Instant::now(), ids.clone()));

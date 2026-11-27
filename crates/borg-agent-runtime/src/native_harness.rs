@@ -3379,8 +3379,9 @@ impl ProviderModelClient {
 /// subsequent compaction or an explicit revisit can still refer to it.
 fn cached_image_piece_count(data_base64: &str) -> usize {
     use std::hash::{Hash, Hasher};
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<(usize, u64), usize>>> =
-        std::sync::OnceLock::new();
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(usize, u64), usize>>,
+    > = std::sync::OnceLock::new();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     data_base64.hash(&mut hasher);
     let key = (data_base64.len(), hasher.finish());

@@ -677,7 +677,12 @@ impl PostgresSessionStore {
         );
         let provider = provider_str
             .as_deref()
-            .and_then(|value| serde_json::from_value::<CodingProvider>(serde_json::Value::String(value.to_owned())).ok())
+            .and_then(|value| {
+                serde_json::from_value::<CodingProvider>(serde_json::Value::String(
+                    value.to_owned(),
+                ))
+                .ok()
+            })
             .unwrap_or(CodingProvider::Codex);
         if !turn_live_allowed {
             // A provider task can finish after the actor published its terminal

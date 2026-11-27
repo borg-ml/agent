@@ -731,11 +731,7 @@ async fn execute_request(
     }
 }
 
-async fn write_json_line(
-    writer: &mut ChildStdin,
-    buf: &mut Vec<u8>,
-    value: &Value,
-) -> Result<()> {
+async fn write_json_line(writer: &mut ChildStdin, buf: &mut Vec<u8>, value: &Value) -> Result<()> {
     buf.clear();
     serde_json::to_writer(&mut *buf, value)?;
     buf.push(b'\n');
@@ -3542,11 +3538,8 @@ borg.call('echo', {'ok': True})"#,
 
         // 5. Bun Promise.all reaches host concurrently
         if bun_available().await {
-            let bun = PersistentRuntimeWorker::for_bun(
-                Uuid::new_v4(),
-                root.path().to_path_buf(),
-                None,
-            );
+            let bun =
+                PersistentRuntimeWorker::for_bun(Uuid::new_v4(), root.path().to_path_buf(), None);
             let host = Arc::new(BarrierHost {
                 barrier: Arc::new(tokio::sync::Barrier::new(4)),
             });

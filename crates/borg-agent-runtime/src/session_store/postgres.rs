@@ -119,7 +119,11 @@ pub(super) struct LiveAnchorCache {
 }
 
 impl LiveAnchorCache {
-    pub(super) fn has_message_anchor(&self, session_id: uuid::Uuid, message_id: uuid::Uuid) -> bool {
+    pub(super) fn has_message_anchor(
+        &self,
+        session_id: uuid::Uuid,
+        message_id: uuid::Uuid,
+    ) -> bool {
         self.message_anchors.contains(&(session_id, message_id))
     }
 

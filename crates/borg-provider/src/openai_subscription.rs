@@ -144,7 +144,8 @@ struct CachedSubscriptionAccess {
     access: SubscriptionAccess,
 }
 
-static ACCESS_CACHE: std::sync::Mutex<Vec<CachedSubscriptionAccess>> = std::sync::Mutex::new(Vec::new());
+static ACCESS_CACHE: std::sync::Mutex<Vec<CachedSubscriptionAccess>> =
+    std::sync::Mutex::new(Vec::new());
 
 async fn access_at(
     path: PathBuf,
