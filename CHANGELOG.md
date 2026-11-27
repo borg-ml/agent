@@ -5,14 +5,13 @@ Git comparison.
 
 ## Unreleased (since 0.23.0)
 
+## 0.23.0 (2026-11-26)
+
 - Automatic context compaction on OpenAI-compatible gateways such as
   OpenCode Go no longer fails with "Input tokens exceed the model context
   limit". That plain HTTP 400 refusal is now recognised as a context-length
   error, so compaction falls back to summarising the history in smaller
   chunks instead of giving up.
-
-## 0.23.0 (2026-11-26)
-
 - The sign-in view shows its QR code whenever the terminal can physically fit
   it. It used to require the code to fit inside the 96-column text column
   together with the fully wrapped sign-in link, so a long sign-in link said
